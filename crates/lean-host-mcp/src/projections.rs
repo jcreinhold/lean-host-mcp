@@ -234,8 +234,8 @@ pub enum DeclarationInspectionResult {
     /// name could not be resolved against a complete environment. Distinct from
     /// `not_found` (which would falsely claim the declaration does not exist):
     /// it may resolve once the project is built. The envelope carries the
-    /// `lake build` warning. Shares the `needs_build` status token with the
-    /// other resolution-bearing tools.
+    /// build warning and its `lean_build` next action. Shares the
+    /// `needs_build` status token with the other resolution-bearing tools.
     NeedsBuild,
     Unsupported,
 }

@@ -801,9 +801,6 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
             .warn("lean_verify received no target groups; no declarations were checked")
             .hint("Provide at least one target group, for example `{\"kind\":\"explicit\",\"file\":\"...\",\"declarations\":[\"...\"]}`.");
     }
-    response
-        .next_actions
-        .push("source files were not modified by verification".to_owned());
     for cause in build_causes {
         response = warn_needs_build(response, &cause);
     }
@@ -1330,7 +1327,7 @@ fn summarize_rows(requested: usize, truncated: bool, rows: &[LeanVerifyRow]) -> 
 /// `true` if it relabeled. Leaves `verified` (still trustworthy — verification
 /// is monotone) and the already-honest `needs_build` / `ambiguous` verdicts
 /// unchanged, and only touches the `Ok` variant — a `MissingImports` verdict's
-/// honest action is `lake build`, not a recycle notice. Pure, for unit testing.
+/// honest action is a build, not a recycle notice. Pure, for unit testing.
 fn relabel_recycled_verdict(result: &mut DeclarationVerificationResult) -> bool {
     if !verdict_is_non_positive(result) {
         return false;
@@ -2130,7 +2127,7 @@ mod tests {
 
     #[test]
     fn recycled_does_not_touch_missing_imports_verdict() {
-        // A MissingImports verdict's honest action is `lake build`, owned by the
+        // A MissingImports verdict's honest action is a build, owned by the
         // needs_build path — not a recycle notice.
         let mut verdict = needs_build_verification_result(vec!["Foo.Bar".to_owned()]);
         assert!(!relabel_recycled_verdict(&mut verdict));
@@ -2188,7 +2185,7 @@ mod tests {
                 "{status} must not be retried"
             );
         }
-        // A MissingImports verdict's honest action is `lake build` — not retriable.
+        // A MissingImports verdict's honest action is a build — not retriable.
         assert!(!verdict_is_non_positive(&needs_build_verification_result(vec![
             "Foo.Bar".to_owned()
         ])));
@@ -2271,7 +2268,7 @@ mod tests {
             LeanWorkerDeclarationVerificationStatus::NeedsBuild,
             LeanWorkerDeclarationVerificationStatus::Ambiguous,
         ])));
-        // A MissingImports batch's honest action is `lake build` — not retriable.
+        // A MissingImports batch's honest action is a build — not retriable.
         assert!(!worker_batch_is_non_positive(
             &LeanWorkerDeclarationVerificationBatchResult::MissingImports {
                 results: vec![row(LeanWorkerDeclarationVerificationStatus::Rejected)],

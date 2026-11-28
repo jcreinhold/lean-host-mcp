@@ -17,8 +17,24 @@ pub enum TrustStatus {
     BuildFresh,
     StaleBuild,
     MissingBuild,
+    /// An import names no module: Lake finds none by that name, so no build
+    /// can supply its `.olean`.
+    UnknownImport,
     Unknown,
     NotApplicable,
+}
+
+/// The next action that builds `modules` with `lean_build`, then retries, or
+/// that builds the project's default targets when `modules` is empty. Each
+/// module is a `+NAME` target, so Lake reads it as a module and not as a
+/// library or package of the same name.
+pub(crate) fn build_action<S: AsRef<str>>(modules: &[S]) -> String {
+    if modules.is_empty() {
+        return "run lean_build() to build the default targets, then retry".to_owned();
+    }
+    let targets: Vec<String> = modules.iter().map(|module| format!("+{}", module.as_ref())).collect();
+    let targets = serde_json::to_string(&targets).unwrap_or_default();
+    format!("run lean_build(targets={targets}), then retry")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -143,13 +159,13 @@ impl ArtifactTrust {
     pub fn ilean_project_stale_build(detail: impl Into<String>) -> Self {
         Self::new(ArtifactKind::Ilean, TrustScope::Project, TrustStatus::StaleBuild)
             .detail(detail)
-            .next_action("lake build # refresh stale .ilean files, then retry")
+            .next_action(build_action::<&str>(&[]))
     }
 
     pub fn ilean_project_missing_build() -> Self {
         Self::new(ArtifactKind::Ilean, TrustScope::Project, TrustStatus::MissingBuild)
             .detail(".lake/build/lib/lean is absent")
-            .next_action("lake build # produce .ilean files, then retry")
+            .next_action(build_action::<&str>(&[]))
     }
 
     pub fn ilean_module_build_fresh(module: impl Into<String>, path: impl Into<String>) -> Self {
@@ -170,7 +186,7 @@ impl ArtifactTrust {
             .detail(format!(
                 "module `{module}` source is newer than its .ilean declaration index"
             ))
-            .next_action(format!("lake build {module} # refresh stale .ilean, then retry"))
+            .next_action(build_action(&[&module]))
     }
 
     pub fn ilean_module_missing_build(module: impl Into<String>) -> Self {
@@ -178,19 +194,19 @@ impl ArtifactTrust {
         Self::new(ArtifactKind::Ilean, TrustScope::Module, TrustStatus::MissingBuild)
             .module(module.clone())
             .detail(format!("module `{module}` has no built .ilean declaration index"))
-            .next_action(format!("lake build {module} # produce .ilean, then retry"))
+            .next_action(build_action(&[&module]))
     }
 
     pub fn olean_project_missing_build(detail: impl Into<String>) -> Self {
         Self::new(ArtifactKind::Olean, TrustScope::Project, TrustStatus::MissingBuild)
             .detail(detail)
-            .next_action("lake build # complete the project environment, then retry")
+            .next_action(build_action::<&str>(&[]))
     }
 
     pub fn olean_project_stale_build(detail: impl Into<String>) -> Self {
         Self::new(ArtifactKind::Olean, TrustScope::Project, TrustStatus::StaleBuild)
             .detail(detail)
-            .next_action("lake build # rebuild what is out of date, then retry")
+            .next_action(build_action::<&str>(&[]))
     }
 
     pub fn olean_module_stale_build(module: impl Into<String>) -> Self {
@@ -198,7 +214,7 @@ impl ArtifactTrust {
         Self::new(ArtifactKind::Olean, TrustScope::Module, TrustStatus::StaleBuild)
             .module(module.clone())
             .detail(format!("Lake reports module `{module}` out of date"))
-            .next_action(format!("lake build {module} # then retry"))
+            .next_action(build_action(&[&module]))
     }
 
     pub fn olean_module_missing_build(module: impl Into<String>) -> Self {
@@ -206,7 +222,18 @@ impl ArtifactTrust {
         Self::new(ArtifactKind::Olean, TrustScope::Module, TrustStatus::MissingBuild)
             .module(module.clone())
             .detail(format!("module `{module}` is missing a built .olean"))
-            .next_action(format!("lake build {module} # then retry"))
+            .next_action(build_action(&[&module]))
+    }
+
+    /// The row for an import that names no module ([`TrustStatus::UnknownImport`]).
+    pub fn olean_module_unknown_import(module: impl Into<String>) -> Self {
+        let module = module.into();
+        Self::new(ArtifactKind::Olean, TrustScope::Module, TrustStatus::UnknownImport)
+            .module(module.clone())
+            .detail(format!(
+                "Lake finds no module `{module}`, so no build can supply its .olean"
+            ))
+            .next_action(format!("fix the import of `{module}`, then retry"))
     }
 
     pub fn worker_toolchain_unknown(detail: impl Into<String>) -> Self {
@@ -221,7 +248,7 @@ impl ArtifactTrust {
         Self::new(artifact, TrustScope::Project, TrustStatus::Unknown)
             .path(path)
             .detail("build tree exists; lean_status does not compare source mtimes")
-            .next_action("run lean_lookup(kind=\"references\" or kind=\"declarations\") for semantic freshness, or `lake build` to refresh artifacts")
+            .next_action("run lean_lookup(kind=\"references\" or kind=\"declarations\") for semantic freshness, or lean_build() to refresh artifacts")
     }
 }
 
@@ -289,6 +316,7 @@ mod tests {
             (TrustStatus::BuildFresh, "build_fresh"),
             (TrustStatus::StaleBuild, "stale_build"),
             (TrustStatus::MissingBuild, "missing_build"),
+            (TrustStatus::UnknownImport, "unknown_import"),
             (TrustStatus::Unknown, "unknown"),
             (TrustStatus::NotApplicable, "not_applicable"),
         ];
@@ -297,6 +325,30 @@ mod tests {
             assert_eq!(json, format!("\"{token}\""));
             assert_eq!(serde_json::from_str::<TrustStatus>(&json).unwrap(), status);
         }
+    }
+
+    #[test]
+    fn build_rows_name_lean_build_with_module_targets() {
+        assert_eq!(
+            ArtifactTrust::olean_module_missing_build("Chain.D")
+                .next_action
+                .as_deref(),
+            Some(r#"run lean_build(targets=["+Chain.D"]), then retry"#)
+        );
+        assert_eq!(
+            build_action(&["A", "B.C"]),
+            r#"run lean_build(targets=["+A","+B.C"]), then retry"#
+        );
+        assert_eq!(
+            build_action::<&str>(&[]),
+            "run lean_build() to build the default targets, then retry"
+        );
+        let typo = ArtifactTrust::olean_module_unknown_import("Chain.Typo");
+        assert_eq!(
+            (typo.status, typo.module.as_deref()),
+            (TrustStatus::UnknownImport, Some("Chain.Typo"))
+        );
+        assert!(!typo.next_action.unwrap_or_default().contains("lean_build"));
     }
 
     #[test]

@@ -251,8 +251,10 @@ fn index_declarations(
         crate::ilean::ModuleDeclarationIndexStatus::ProjectNotBuilt
     ) {
         response = response
-            .warn("project build tree is absent; run `lake build` to produce .ilean declaration indices")
-            .hint("lake build # produce .ilean declaration indices, then retry");
+            .warn(
+                "project build tree is absent; build the project with lean_build to produce .ilean declaration indices",
+            )
+            .hint(crate::trust::build_action::<&str>(&[]));
     }
     Ok(response)
 }

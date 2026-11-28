@@ -225,7 +225,8 @@ server.
 `lean_imports` lists, for each file, its whole transitive import closure as `lake setup-file --no-build` reports it
 (`importArts`), not only its direct imports: each module, its `.olean`, and, when Lake built it under the project's
 `.lake/build`, the source `lake query +MODULE:lean` names under the library's `srcDir`. It builds nothing: a missing or
-stale import fails the call with `setup_file_failed`, naming the file and quoting Lake.
+stale import fails the call with `setup_file_failed`, naming the file and quoting Lake, and an import that names no
+module Lake knows fails it with `unknown_import`.
 
 ## Concurrency and admission
 
@@ -740,8 +741,10 @@ declaration, for example:
 Under the request's read turn, the server runs the selected toolchain's `lake --no-build --no-cache setup-file <file>`
 as a short run and checks the current source using that file's options, imports, plugins and dynamic libraries. Lake
 builds nothing here, so keep the project built: when an import is missing or stale, Lake exits 3 and the reply is
-`needs_build`, with a `stale_build` row naming each module Lake lists. This route requires the setup-aware verification
-shim. File-backed `lean_lookup` with `kind="proof_search"` uses the same setup for goal elaboration.
+`needs_build`, with a `stale_build` row naming each module Lake lists and the `lean_build` call that builds it. When
+Lake exits 1 because an import names no module, the reply is `needs_build` with an `unknown_import` row for that import
+instead, which says to fix it. This route requires the setup-aware verification shim. File-backed `lean_lookup` with
+`kind="proof_search"` uses the same setup for goal elaboration.
 
 Lake writes its own config cache under `.lake/config/` when the lakefile changed, under Lake's own lock, so a file check
 right after a lakefile edit can write there. When two checks start that write at the same moment, Lake fails one with

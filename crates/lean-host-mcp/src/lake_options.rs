@@ -225,6 +225,25 @@ pub(crate) struct ReaderOutput {
     pub(crate) stderr: String,
 }
 
+impl ReaderOutput {
+    /// The error for a run of `label` that ended with this exit code when its
+    /// caller wanted another: the code and everything the program printed.
+    pub(crate) fn exit_error(&self, label: &str) -> ServerError {
+        reader_error(
+            label,
+            with_note(
+                label,
+                format!(
+                    "the program exited with code {}: {}{}",
+                    self.exit_code,
+                    String::from_utf8_lossy(&self.stdout),
+                    self.stderr
+                ),
+            ),
+        )
+    }
+}
+
 /// [`reader_output`] for a program whose exit codes in `accepted` all carry a
 /// result, such as `lean`, which exits 1 when the file it checks has errors.
 ///
@@ -300,25 +319,15 @@ async fn run_permit(
 /// The output of a program that exited on its own, if `accepted` lists its
 /// exit code.
 fn accepted_exit(label: &str, exit: lean_run::Exit, accepted: &[i32]) -> PreparationResult<ReaderOutput> {
-    if accepted.contains(&exit.code) {
-        return Ok(ReaderOutput {
-            exit_code: exit.code,
-            stdout: exit.stdout,
-            stderr: exit.stderr,
-        });
+    let output = ReaderOutput {
+        exit_code: exit.code,
+        stdout: exit.stdout,
+        stderr: exit.stderr,
+    };
+    if accepted.contains(&output.exit_code) {
+        return Ok(output);
     }
-    Err(PreparationFailure::stopped(reader_error(
-        label,
-        with_note(
-            label,
-            format!(
-                "the program exited with code {}: {}{}",
-                exit.code,
-                String::from_utf8_lossy(&exit.stdout),
-                exit.stderr
-            ),
-        ),
-    )))
+    Err(PreparationFailure::stopped(output.exit_error(label)))
 }
 
 /// `detail`, with the note that option discovery ran no proof check.

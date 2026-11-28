@@ -196,8 +196,8 @@ async fn kanproofs_unbuilt_import_degrades_to_build_warning() {
             .warnings
             .iter()
             .chain(result.warnings.iter())
-            .any(|warning| warning.contains("lake build") || warning.contains("consumer project imports are not built")),
-        "unbuilt import should report lake build guidance, response={:?}, result={:?}",
+            .any(|warning| warning.contains("lean_build")),
+        "unbuilt import should report lean_build guidance, response={:?}, result={:?}",
         response.warnings,
         result.warnings
     );

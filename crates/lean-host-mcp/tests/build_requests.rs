@@ -15,9 +15,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lean_host_mcp::build::{BuildOutcome, BuildRequest, BuildState};
 use lean_host_mcp::tools::build::{ImportsError, ImportsReply, ImportsRequest, lean_build, lean_imports};
-use lean_host_mcp::tools::semantic::{SemanticResponse, SemanticToolRequest, lean_status};
+use lean_host_mcp::tools::semantic::{SemanticResponse, SemanticToolRequest, lean_status, lean_trial, lean_verify};
 use lean_host_mcp::tools::{ToolConfig, ToolContext, as_call};
-use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectRuntimeConfig};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectRuntimeConfig, TrustStatus};
 use serde_json::{Value, json};
 use support::TestResult;
 use support::chain::{Chain, chain_project};
@@ -97,6 +97,31 @@ async fn diagnostics(ctx: &ToolContext, file: &str) -> TestResult<SemanticRespon
         args: std::iter::once(("file".to_owned(), json!(file))).collect(),
     };
     Ok(as_call(lean_status(ctx, request)).await?)
+}
+
+/// Run `#check Nat` after `imports` with `lean_trial`.
+async fn trial(ctx: &ToolContext, imports: &[&str]) -> TestResult<SemanticResponse<Value>> {
+    let request = SemanticToolRequest {
+        kind: Some("command".to_owned()),
+        args: [
+            ("imports".to_owned(), json!(imports)),
+            ("commands".to_owned(), json!("#check Nat")),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    Ok(Box::pin(as_call(lean_trial(ctx, request))).await?)
+}
+
+/// The module and next action of each trust row of `response` with `status`.
+fn rows(response: &SemanticResponse<Value>, status: TrustStatus) -> Vec<(Option<&str>, Option<&str>)> {
+    response
+        .trust
+        .artifacts
+        .iter()
+        .filter(|row| row.status == status)
+        .map(|row| (row.module.as_deref(), row.next_action.as_deref()))
+        .collect()
 }
 
 /// Fail unless Lean checked the file of `response` without an error.
@@ -387,7 +412,8 @@ async fn imports_of_a_file_with_a_stale_import_are_an_error_naming_the_file() ->
 }
 
 /// A file check builds nothing, so a stale import makes it a needs-build reply
-/// whose `stale_build` row names the module Lake reported.
+/// whose `stale_build` row names the module Lake reported and the
+/// `lean_build` call that builds it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_file_check_with_a_stale_import_names_the_module_to_build() -> TestResult {
@@ -397,14 +423,15 @@ async fn a_file_check_with_a_stale_import_names_the_module_to_build() -> TestRes
         "import Chain.A\nimport Dep\n\ndef b : Nat := a + dep\ndef extra : Nat := 0\n",
     )?;
     let response = diagnostics(&ctx, "Chain/C.lean").await?;
-    let stale = response
-        .trust
-        .artifacts
-        .iter()
-        .filter(|row| row.status == lean_host_mcp::TrustStatus::StaleBuild)
-        .map(|row| row.module.as_deref())
-        .collect::<Vec<_>>();
-    assert_eq!(stale, [Some("Chain.B")], "{:?}", response.trust.artifacts);
+    assert_eq!(
+        rows(&response, TrustStatus::StaleBuild),
+        [(
+            Some("Chain.B"),
+            Some(r#"run lean_build(targets=["+Chain.B"]), then retry"#)
+        )],
+        "{:?}",
+        response.trust.artifacts
+    );
     Ok(())
 }
 
@@ -432,6 +459,84 @@ async fn a_check_sent_during_a_build_waits_and_sees_what_it_built() -> TestResul
     assert_clean(&check)?;
     let built_at = build.steps.last().ok_or("the build ran steps")?.finished_at_ms;
     assert!(checked_at >= built_at, "the check ended before the build did");
+    ctx.broker.shutdown_all();
+    Ok(())
+}
+
+/// An import that names no module is no build's to fix. A file check still
+/// replies, with an `unknown_import` row and a warning that say to fix the
+/// import, and `lean_imports` gives the file its own code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
+async fn a_file_check_of_an_import_that_names_no_module_says_to_fix_it() -> TestResult {
+    let (chain, ctx) = project()?;
+    // `Chain` is a library root, so Lake reads this as its module and finds
+    // no source for it.
+    chain.write("Typo.lean", "import Chain.Typo\n\ntheorem t : 1 = 1 := rfl\n")?;
+    let fix = "fix the import of `Chain.Typo`, then retry";
+    let verify = SemanticToolRequest {
+        kind: None,
+        args: std::iter::once((
+            "targets".to_owned(),
+            json!([{"kind": "explicit", "file": "Typo.lean", "declarations": ["t"]}]),
+        ))
+        .collect(),
+    };
+    for response in [
+        diagnostics(&ctx, "Typo.lean").await?,
+        Box::pin(as_call(lean_verify(&ctx, verify))).await?,
+    ] {
+        assert_eq!(
+            rows(&response, TrustStatus::UnknownImport),
+            [(Some("Chain.Typo"), Some(fix))],
+            "{:?}",
+            response.trust.artifacts
+        );
+        let warning = response
+            .errors
+            .iter()
+            .find(|issue| issue.message.contains("no module named `Chain.Typo`"))
+            .ok_or_else(|| format!("no warning names the import: {:?}", response.errors))?;
+        assert_eq!(warning.next_action.as_deref(), Some(fix), "{:?}", response.errors);
+    }
+    let result = imports(&ctx, &["Typo.lean"]).await;
+    let Err(ImportsError::File(failure)) = &result else {
+        return Err(format!("expected a failure for the file: {result:?}").into());
+    };
+    assert_eq!(failure.error.code, "unknown_import", "{}", failure.error.message);
+    Ok(())
+}
+
+/// The worker says only that it cannot load an `.olean`. Lake then tells a
+/// name no library holds, or one whose source is missing, from a module it
+/// has not built.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT and a matching installed worker"]
+async fn a_trial_tells_an_import_that_names_no_module_from_an_unbuilt_one() -> TestResult {
+    let (chain, ctx) = project()?;
+    chain.write("Chain/D.lean", "def d : Nat := 4\n")?;
+    for module in ["Chain.Typo", "Nope.Typo"] {
+        let response = trial(&ctx, &[module]).await?;
+        let fix = format!("fix the import of `{module}`, then retry");
+        assert_eq!(
+            rows(&response, TrustStatus::UnknownImport),
+            [(Some(module), Some(fix.as_str()))],
+            "{:?}",
+            response.trust.artifacts
+        );
+        assert!(rows(&response, TrustStatus::MissingBuild).is_empty());
+    }
+    let response = trial(&ctx, &["Chain.D"]).await?;
+    assert_eq!(
+        rows(&response, TrustStatus::MissingBuild),
+        [(
+            Some("Chain.D"),
+            Some(r#"run lean_build(targets=["+Chain.D"]), then retry"#)
+        )],
+        "{:?}",
+        response.trust.artifacts
+    );
+    assert!(rows(&response, TrustStatus::UnknownImport).is_empty());
     ctx.broker.shutdown_all();
     Ok(())
 }

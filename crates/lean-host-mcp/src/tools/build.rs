@@ -133,10 +133,11 @@ pub struct ToolFailure {
 /// What failed.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct FailureDetail {
-    /// `invalid_request` for a file the server cannot read,
-    /// `setup_file_failed` when Lake gave no setup for it, for example
-    /// because an import is missing or stale, or `module_sources_failed` when
-    /// Lake named no source for a module the root built.
+    /// `invalid_request` for a file the server cannot read, `unknown_import`
+    /// when an import names no module Lake knows, `setup_file_failed` when
+    /// Lake gave no setup for it for another reason, for example because an
+    /// import is stale, or `module_sources_failed` when Lake named no source
+    /// for a module the root built.
     pub code: String,
     /// Names the file, if one failed, and quotes Lake's own output.
     pub message: String,
@@ -197,6 +198,9 @@ pub async fn lean_imports(ctx: &ToolContext, request: ImportsRequest) -> Result<
             Ok((module, imports)) => closures.push((file, module, imports)),
             // A wait or a cancellation is the call's, not the file's.
             Err(error @ ServerError::WorkerUnavailable(_)) => return Err(McpError::from(error).into()),
+            Err(error @ ServerError::UnknownImports { .. }) => {
+                return Err(ImportsError::file("unknown_import", &file, &error));
+            }
             Err(error) => return Err(ImportsError::file("setup_file_failed", &file, &error)),
         }
     }

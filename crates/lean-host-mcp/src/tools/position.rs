@@ -365,8 +365,8 @@ pub enum ProofStateResult {
         unavailable: Vec<SelectorMessage>,
         /// Selectors that could not resolve because the project environment is
         /// incomplete. Separated from `unavailable` so the agent sees a
-        /// `lake build` cue rather than a generic "unavailable"; the envelope
-        /// also carries the canonical warning.
+        /// build cue rather than a generic "unavailable"; the envelope also
+        /// carries the canonical warning.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         needs_build: Vec<SelectorMessage>,
         /// Competing declarations when the requested name is genuinely
@@ -612,7 +612,7 @@ fn proof_state_response(
 
 /// Build the degraded proof-state context when the declaration's import
 /// closure hit an unbuilt `.olean`: the batch could not run, so report a
-/// `needs_build` selector plus the canonical `lake build` warning — the same
+/// `needs_build` selector plus the canonical build warning — the same
 /// honest verdict the worker-typed `NeedsBuild` routing produces, rather than a
 /// raw transport error. Freshness/runtime come from the non-spawning broker
 /// identity path, paid only on this rare arm.
@@ -1061,7 +1061,7 @@ async fn find_references_in_file(
     let mut source_fact = None;
     // An unbuilt transitive dependency surfaces as a missing-`.olean` error; the
     // file is skipped and the call degrades to the `needs_build` verdict (with
-    // the `lake build` cue) rather than hard-erroring.
+    // its build cue) rather than hard-erroring.
     let mut needs_build: Option<ServerError> = None;
 
     // A read failure lands in the same `Err` arms below that it reached through
@@ -1325,10 +1325,10 @@ async fn find_references_in_project(
         )))
         .warn(format!(
             "reference index is build-fresh, not edit-fresh: {} contributing module(s) have source newer than \
-             their .ilean ({names}{suffix}); results reflect the last `lake build`.",
+             their .ilean ({names}{suffix}); results come from the last build.",
             index.stale_sources.len()
         ))
-        .hint("re-run `lake build` to refresh the reference index for edited modules"))
+        .hint("run lean_build() to refresh the reference index for edited modules"))
 }
 
 /// An empty `Ok` reference result, used for the `needs_build` degrade where the
@@ -2259,8 +2259,8 @@ import Init -- comment
         let result = needs_build_context("object file 'Dep.olean' ... does not exist".to_owned());
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["status"], "context");
-        // The blocking condition lands in `needs_build` (with the `lake build`
-        // envelope warning), never silently in `unavailable` or as goals.
+        // The blocking condition lands in `needs_build` (with the build
+        // warning in the envelope), never silently in `unavailable` or as goals.
         assert_eq!(value["needs_build"][0]["id"], "proof_state");
         assert!(value["needs_build"][0]["message"].as_str().unwrap().contains(".olean"));
         assert!(value.get("unavailable").is_none());

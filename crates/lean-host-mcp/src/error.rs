@@ -110,6 +110,12 @@ pub enum ServerError {
     #[error("Lake must rebuild {} first, and a check builds nothing. Lake printed: {output}", listed(.targets))]
     OutOfDate { targets: Vec<String>, output: String },
 
+    /// An import names no module: Lake knows no library that holds any of
+    /// `modules`, or finds no source file for it, so no build can supply it.
+    /// `output` is the failure that named them.
+    #[error("Lake finds no module named {}, so no build can supply it. The failure: {output}", listed(.modules))]
+    UnknownImports { modules: Vec<String>, output: String },
+
     #[error("incompatible Lean worker: {message}")]
     IncompatibleWorker { message: String, recovery_command: String },
 
@@ -182,6 +188,7 @@ impl From<ServerError> for McpError {
             | ServerError::SessionGone
             | ServerError::BadProject(_)
             | ServerError::OutOfDate { .. }
+            | ServerError::UnknownImports { .. }
             | ServerError::IncompatibleWorker { .. }
             | ServerError::Io(_)
             | ServerError::Internal(_)) => Self::internal_error(other.to_string(), None),

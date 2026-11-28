@@ -271,8 +271,9 @@ turn, so it waits for a running build. It builds nothing.
 - `olean` is the absolute path Lake loads. `source` is the absolute source path Lake names, under the module's library
   `srcDir`, when the `.olean` lies under the root's own `.lake/build`; for a dependency's module it is null.
 - When an import of a file is missing or stale, the call fails as a whole: the result sets MCP `isError` and holds
-  `{"error":{"code":"setup_file_failed","message":…}}`, whose message names the file and quotes Lake. A file the server
-  cannot read fails the same way with code `invalid_request`, and a source query Lake cannot answer with code
+  `{"error":{"code":"setup_file_failed","message":…}}`, whose message names the file and quotes Lake. The code is
+  `unknown_import` when an import names no module Lake knows, so no build can supply it. A file the server cannot read
+  fails the same way with code `invalid_request`, and a source query Lake cannot answer with code
   `module_sources_failed`. The reply never holds a partial list.
 
 ## Response Shape
@@ -307,7 +308,7 @@ when a worker did.
 
 - `artifact`: `source`, `olean`, `ilean`, `worker`
 - `scope`: `file`, `module`, `project`, `toolchain`
-- `status`: `edit_fresh`, `build_fresh`, `stale_build`, `missing_build`, `unknown`, `not_applicable`
+- `status`: `edit_fresh`, `build_fresh`, `stale_build`, `missing_build`, `unknown_import`, `unknown`, `not_applicable`
 
 Rows may also carry `path`, `module`, `detail`, `next_action`, and a source `content_sha256`. Paths are rendered
 project-relative when the file is inside the resolved Lake root, and absolute only for files outside that root.
@@ -316,6 +317,18 @@ Source-overlay tools and source-backed declaration inventory report the source f
 missing/stale build state; `needs_build` degradations report missing `.olean` artifacts, or a `stale_build` row for each
 module Lake lists as out of date when it sets up a file. Duplicate trust rows are collapsed while preserving first
 occurrence order. Runtime counters, cache timings, and import lists remain telemetry, not trust.
+
+A `needs_build` reply tells an import that names no module from one that is not built. When Lake fails to set up a file,
+or Lean cannot load a module's `.olean`, the server asks `lake query +MODULE:lean` about each module the failure names,
+under the call's read turn; Lake builds nothing. A name no Lake library holds, or one whose source file is missing, gets
+an `olean` / `module` / `unknown_import` row whose `next_action` says to fix the import: no build can supply it. A
+module Lake knows gets a `missing_build` or `stale_build` row, and its `next_action` names the `lean_build` call that
+builds it, such as `run lean_build(targets=["+Chain.B"]), then retry`. A row with no module to name says
+`run lean_build() to build the default targets, then retry`. No reply tells you to run `lake` yourself.
+
+One case still fails in Lean rather than in Lake: a file check whose import lies outside every Lake library. Lake passes
+such an import on to Lean, so `lean_status` with `file_diagnostics` shows Lean's own `unknown module prefix` error, and
+`lean_verify` with a `file_all` target warns that the source header could not be parsed.
 
 Every reply whose result came from a source file's text, including a `needs_build` reply, has a `source` / `file` /
 `edit_fresh` row for that file. Its `content_sha256` is the lowercase SHA-256 of the exact bytes the call read and

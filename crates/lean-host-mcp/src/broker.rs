@@ -413,6 +413,15 @@ impl ProjectBroker {
         Ok(meta)
     }
 
+    /// `result`, with a failure to load an import that names no module told
+    /// as [`ServerError::UnknownImports`]; see `name_unknown_imports`.
+    async fn name_imports<T>(&self, root: &Path, imports: &[String], result: Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(self.name_unknown_imports(root, imports, err).await),
+        }
+    }
+
     /// Process one module query through the project runtime.
     ///
     /// # Errors
@@ -430,7 +439,10 @@ impl ProjectBroker {
         let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .process_module_query(session_imports, source, query, options, admission_deadline)
+            .process_module_query(session_imports.clone(), source, query, options, admission_deadline)
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -478,7 +490,10 @@ impl ProjectBroker {
             });
         }
         let call = project
-            .process_module_query(session_imports, source, query, options, admission_deadline)
+            .process_module_query(session_imports.clone(), source, query, options, admission_deadline)
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let (value, runtime) = call.into_parts();
         if let Some(((key, context), generation)) = key.zip(context).zip(crate::cache::completed_generation(&runtime)) {
@@ -515,7 +530,17 @@ impl ProjectBroker {
         let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .process_module_query_batch(session_imports, source, selectors, budgets, options, admission_deadline)
+            .process_module_query_batch(
+                session_imports.clone(),
+                source,
+                selectors,
+                budgets,
+                options,
+                admission_deadline,
+            )
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -560,7 +585,17 @@ impl ProjectBroker {
             });
         }
         let call = project
-            .process_module_query_batch(session_imports, source, selectors, budgets, options, admission_deadline)
+            .process_module_query_batch(
+                session_imports.clone(),
+                source,
+                selectors,
+                budgets,
+                options,
+                admission_deadline,
+            )
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let (value, runtime) = call.into_parts();
         if let Some(((key, context), generation)) = key.zip(context).zip(crate::cache::completed_generation(&runtime)) {
@@ -593,7 +628,10 @@ impl ProjectBroker {
     ) -> Result<BrokerCall<LeanWorkerDeclarationInspectionResult>> {
         let (project, admission_deadline) = self.project_for(hint).await?;
         let call = project
-            .inspect_declaration(session_imports, request, admission_deadline)
+            .inspect_declaration(session_imports.clone(), request, admission_deadline)
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
@@ -615,7 +653,10 @@ impl ProjectBroker {
     ) -> Result<BrokerCall<Vec<LeanWorkerDeclarationSearchResult>>> {
         let (project, admission_deadline) = self.project_for(hint).await?;
         let call = project
-            .search_declarations(session_imports, requests, admission_deadline)
+            .search_declarations(session_imports.clone(), requests, admission_deadline)
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
@@ -638,7 +679,10 @@ impl ProjectBroker {
         let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .attempt_proof(session_imports, request, options, admission_deadline)
+            .attempt_proof(session_imports.clone(), request, options, admission_deadline)
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -662,7 +706,10 @@ impl ProjectBroker {
         let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .verify_declaration(session_imports, request, options, admission_deadline)
+            .verify_declaration(session_imports.clone(), request, options, admission_deadline)
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -686,7 +733,10 @@ impl ProjectBroker {
         let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .verify_declaration_batch(session_imports, request, options, admission_deadline)
+            .verify_declaration_batch(session_imports.clone(), request, options, admission_deadline)
+            .await;
+        let call = self
+            .name_imports(project.canonical_root(), &session_imports, call)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);

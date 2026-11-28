@@ -14,10 +14,28 @@ use std::{
 
 const SETUP_FILE: &str = "Lake setup-file";
 const MODULE_SOURCES: &str = "Lake module sources";
+const MODULE_LOOKUP: &str = "Lake module lookup";
 
 /// Lake's exit code when `--no-build` meets a target it would have to rebuild
 /// (`noBuildCode`, `Lake/Build/Run.lean`).
 const NO_BUILD_EXIT: i32 = 3;
+
+/// Lake's exit code when a job or a target name fails.
+const FAILURE_EXIT: i32 = 1;
+
+/// The most names one failure looks up, one `lake query` each, before it
+/// gives up on telling a typo from an unbuilt module.
+const LOOKUP_LIMIT: usize = 8;
+
+/// The names of the jobs that failed: `reportResult` (`Lake/Build/Run.lean`)
+/// prints this line, then one `- NAME` line per failed job.
+fn failed_jobs(stderr: &str) -> impl Iterator<Item = &str> {
+    stderr
+        .lines()
+        .skip_while(|line| *line != "Some required targets logged failures:")
+        .skip(1)
+        .map_while(|line| line.strip_prefix("- "))
+}
 
 /// The setup Lake printed, or [`ServerError::OutOfDate`] naming the targets
 /// Lake would have to rebuild first.
@@ -25,20 +43,47 @@ fn setup_output(output: crate::lake_options::ReaderOutput) -> Result<Vec<u8>> {
     if output.exit_code != NO_BUILD_EXIT {
         return Ok(output.stdout);
     }
-    // `reportResult` (`Lake/Build/Run.lean`) prints this line, then one
-    // `- NAME` line per failed job.
-    let targets = output
-        .stderr
-        .lines()
-        .skip_while(|line| *line != "Some required targets logged failures:")
-        .skip(1)
-        .map_while(|line| line.strip_prefix("- "))
-        .map(str::to_owned)
-        .collect();
     Err(ServerError::OutOfDate {
-        targets,
+        targets: failed_jobs(&output.stderr).map(str::to_owned).collect(),
         output: output.stderr,
     })
+}
+
+/// The modules a failed `lake setup-file` names: the module jobs it lists as
+/// failed, then each import it calls bad (`collectImportsAux`,
+/// `Lake/Build/Module.lean`), first mention first. A module job's name is the
+/// module's, so the setup job, whose name holds a space and a path, drops out.
+fn failed_modules(stderr: &str) -> Vec<String> {
+    let bad_imports = stderr.lines().filter_map(|line| {
+        line.split_once(": bad import '")
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(module, _)| module)
+    });
+    let mut modules: Vec<String> = Vec::new();
+    for name in failed_jobs(stderr).chain(bad_imports) {
+        if !name.is_empty()
+            && !name.contains(|c: char| c.is_whitespace() || c == ':' || c == '/')
+            && !modules.iter().any(|known| known == name)
+        {
+            modules.push(name.to_owned());
+        }
+    }
+    modules
+}
+
+/// Whether `lake query +MODULE:lean` failed because no module by that name
+/// exists: no library holds the name (`unknownModule`, `Lake/CLI/Error.lean`),
+/// or a library holds it but its source file is missing. Any other failure,
+/// such as a header that does not parse, says nothing about the name.
+fn names_no_module(module: &str, stderr: &str) -> bool {
+    let source = format!("/{}.lean", module.replace('.', "/"));
+    stderr.contains(&format!("unknown module `{module}`"))
+        || (stderr.contains("no such file or directory")
+            && stderr.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("file: ")
+                    .is_some_and(|path| path.ends_with(&source))
+            }))
 }
 
 #[derive(Deserialize)]
@@ -289,8 +334,81 @@ impl ProjectBroker {
         Ok(parse_sources(&output.stdout, modules.len())?)
     }
 
+    /// Which of `modules` name no module, as `lake query +MODULE:lean` tells
+    /// under this request's read turn. A module Lake knows but has not built
+    /// is not one of them. Lake builds nothing. Only the first
+    /// [`LOOKUP_LIMIT`] names are looked up.
+    async fn unknown_modules(&self, root: &Path, modules: &[String]) -> Result<Vec<String>> {
+        let modules = modules.get(..LOOKUP_LIMIT).unwrap_or(modules);
+        if modules.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_read(root).await?;
+        let query = |modules: &[String]| {
+            let mut args: Vec<OsString> = vec!["query".into()];
+            args.extend(modules.iter().map(|module| format!("+{module}:lean").into()));
+            args
+        };
+        // One name Lake cannot find fails the whole query, so a batch that
+        // passes clears every name at once.
+        if modules.len() > 1 {
+            let (_, output) = self
+                .lake_reader(root, MODULE_LOOKUP, query(modules), &[0, FAILURE_EXIT])
+                .await?;
+            if output.exit_code == 0 {
+                return Ok(Vec::new());
+            }
+        }
+        let mut unknown = Vec::new();
+        for module in modules {
+            let (_, output) = self
+                .lake_reader(
+                    root,
+                    MODULE_LOOKUP,
+                    query(std::slice::from_ref(module)),
+                    &[0, FAILURE_EXIT],
+                )
+                .await?;
+            if output.exit_code == FAILURE_EXIT && names_no_module(module, &output.stderr) {
+                unknown.push(module.clone());
+            }
+        }
+        Ok(unknown)
+    }
+
+    /// `err`, or [`ServerError::UnknownImports`] when the module whose
+    /// `.olean` a check with session imports `imports` could not load names
+    /// no module Lake knows. Lookup failures keep `err`.
+    pub(super) async fn name_unknown_imports(&self, root: &Path, imports: &[String], err: ServerError) -> ServerError {
+        if matches!(err, ServerError::OutOfDate { .. } | ServerError::UnknownImports { .. })
+            || !crate::diagnosis::missing_olean_failure(&err)
+        {
+            return err;
+        }
+        let text = err.to_string();
+        let candidates = crate::diagnosis::unloaded_modules(&text, imports);
+        match self.unknown_modules(root, &candidates).await {
+            Ok(modules) if !modules.is_empty() => ServerError::UnknownImports { modules, output: text },
+            Ok(_) | Err(_) => err,
+        }
+    }
+
+    /// The error for a `lake setup-file` that failed:
+    /// [`ServerError::UnknownImports`] when the modules it names include one
+    /// Lake finds no module for, else what Lake printed.
+    async fn setup_failure(&self, root: &Path, output: crate::lake_options::ReaderOutput) -> ServerError {
+        match self.unknown_modules(root, &failed_modules(&output.stderr)).await {
+            Ok(modules) if !modules.is_empty() => ServerError::UnknownImports {
+                modules,
+                output: output.stderr,
+            },
+            Ok(_) | Err(_) => output.exit_error(SETUP_FILE),
+        }
+    }
+
     /// Run `lake setup-file` as a short run. When an import is out of date,
-    /// Lake builds nothing and this returns [`ServerError::OutOfDate`].
+    /// Lake builds nothing and this returns [`ServerError::OutOfDate`]; when
+    /// an import names no module, [`ServerError::UnknownImports`].
     async fn setup_file(&self, root: &Path, file: &Path, source: &str) -> Result<StagedSetup> {
         if !file.starts_with(root)
             || file.canonicalize()? != file
@@ -303,7 +421,12 @@ impl ProjectBroker {
         }
         let packages = crate::lake_meta::manifest_package_roots(root);
         let args = vec!["setup-file".into(), file.as_os_str().to_owned()];
-        let (sysroot, output) = self.lake_reader(root, SETUP_FILE, args, &[0, NO_BUILD_EXIT]).await?;
+        let (sysroot, output) = self
+            .lake_reader(root, SETUP_FILE, args, &[0, FAILURE_EXIT, NO_BUILD_EXIT])
+            .await?;
+        if output.exit_code == FAILURE_EXIT {
+            return Err(self.setup_failure(root, output).await);
+        }
         Ok(stage(setup_output(output)?, &packages, &sysroot, root, file)?)
     }
 
@@ -410,6 +533,38 @@ mod tests {
             Err(ServerError::OutOfDate { targets, output }) if targets == ["A"] && output == stderr
         ));
         assert!(matches!(setup_output(output(0)), Ok(bytes) if bytes == b"{}"));
+    }
+
+    #[test]
+    fn a_failed_setup_names_its_module_jobs_and_bad_imports_once_each() {
+        // What Lake 4.36 prints for `lake --no-build setup-file T.lean` when
+        // T imports `Chain.Typo`, which has no source file, and `Chain.D`.
+        let stderr = "✖ [2/4] Running Chain.Typo\n\
+                      error: no such file or directory (error code: 2)\n  \
+                      file: /p/Chain/Typo.lean\n\
+                      ✖ [4/4] Running setup-file /p/T.lean\n\
+                      error: /p/T.lean: bad import 'Chain.Typo'\n\
+                      error: /p/T.lean: bad import 'Chain.D'\n\
+                      Some required targets logged failures:\n\
+                      - Chain.Typo\n\
+                      - setup-file /p/T.lean\n\
+                      Failed to build module dependencies.\n";
+        assert_eq!(failed_modules(stderr), ["Chain.Typo", "Chain.D"]);
+        assert!(failed_modules("error: something else\n").is_empty());
+    }
+
+    #[test]
+    fn only_a_missing_name_or_source_names_no_module() {
+        let missing_source = "error: no such file or directory (error code: 2)\n  file: /p/./Chain/Typo.lean\n";
+        assert!(names_no_module("Chain.Typo", missing_source));
+        // The missing file must be this module's source, not some other file.
+        assert!(!names_no_module("Chain.Other", missing_source));
+        assert!(names_no_module("Nope.Typo", "error: unknown module `Nope.Typo`\n"));
+        assert!(!names_no_module("Nope.Typo", "error: unknown module `Nope.Typos`\n"));
+        assert!(!names_no_module(
+            "Chain.B",
+            "error: /p/Chain/B.lean:1:0: unexpected token; expected command\n"
+        ));
     }
 
     #[test]

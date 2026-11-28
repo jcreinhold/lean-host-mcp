@@ -11,13 +11,16 @@
 //! presented differently (a hard error here, a misleading "ambiguous" there).
 //! This module collapses them into one renderer per verdict so every tool
 //! emits the *same* wording. Per ch.10.10 the build-state is deliberately
-//! *exposed* (the agent must learn to run `lake build`), never masked.
+//! *exposed* (the agent must build with `lean_build`), never masked. An import
+//! that names no module is not a build-state problem: no build can supply it,
+//! so its rows and next action say to fix the import instead.
 //!
 //! As of `lean-rs-worker-protocol` 0.1.18 the worker classifies resolution at
 //! its own boundary: `proof_state` and `verify_declaration` return typed
 //! `NeedsBuild` / `Ambiguous { candidates }` verdicts, so the parent no longer
 //! string-matches those. A file check whose imports Lake reports out of date
-//! arrives typed too, as [`ServerError::OutOfDate`]. The one remaining text
+//! arrives typed too, as [`ServerError::OutOfDate`], and an import Lake finds
+//! no module for as [`ServerError::UnknownImports`]. The one remaining text
 //! heuristic, in [`missing_olean_failure`], covers the env-based query path
 //! (`find_references`, `search_for_proof`), where an unbuilt transitive
 //! dependency still surfaces as an infrastructure [`ServerError`].
@@ -27,7 +30,7 @@ use serde::Serialize;
 
 use crate::envelope::{Response, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError};
-use crate::trust::ArtifactTrust;
+use crate::trust::{ArtifactTrust, build_action};
 
 /// Why a query ran against an environment that was not fully built. Each
 /// variant carries only what the renderer needs to name the blocking work.
@@ -40,14 +43,19 @@ pub(crate) enum IncompleteCause {
     /// Targets Lake must rebuild before it can set up the file
     /// ([`ServerError::OutOfDate`]).
     OutOfDate(Vec<String>),
+    /// Imports that name no module ([`ServerError::UnknownImports`]): no build
+    /// can supply them, so the caller must fix the import.
+    UnknownImports(Vec<String>),
 }
 
 impl IncompleteCause {
-    /// The cause a build-state failure names: Lake's out-of-date targets when
-    /// it reported them, else the error text.
+    /// The cause a build-state failure names: Lake's out-of-date targets or
+    /// unknown imports when it reported them, else the error text.
     pub(crate) fn from_error(err: &ServerError) -> Self {
         if let ServerError::OutOfDate { targets, .. } = err {
             Self::OutOfDate(targets.clone())
+        } else if let ServerError::UnknownImports { modules, .. } = err {
+            Self::UnknownImports(modules.clone())
         } else {
             Self::MissingOlean(err.to_string())
         }
@@ -63,12 +71,12 @@ pub(crate) struct CompetingDecl {
 }
 
 /// Recognise an infrastructure failure that is really a missing/stale build
-/// artifact rather than a Lean-domain error: Lake's typed out-of-date verdict,
-/// or text naming a missing `.olean`. The text match is the only heuristic
-/// left, for the env-based query path the worker does not type. See module
-/// docs.
+/// artifact rather than a Lean-domain error: Lake's typed out-of-date or
+/// unknown-import verdict, or text naming a missing `.olean`. The text match
+/// is the only heuristic left, for the env-based query path the worker does
+/// not type. See module docs.
 pub(crate) fn missing_olean_failure(err: &ServerError) -> bool {
-    if matches!(err, ServerError::OutOfDate { .. }) {
+    if matches!(err, ServerError::OutOfDate { .. } | ServerError::UnknownImports { .. }) {
         return true;
     }
     let text = err.to_string().to_lowercase();
@@ -79,15 +87,46 @@ pub(crate) fn missing_olean_failure(err: &ServerError) -> bool {
         || text.contains("module not found")
 }
 
+/// The modules a missing-`.olean` failure names, for a check whose own
+/// imports are `imports`: the module of Lean's "object file ... of module M
+/// does not exist", or each import under the root of Lean's "unknown module
+/// prefix 'P'". Lake can then tell which of them name no module at all.
+pub(crate) fn unloaded_modules(text: &str, imports: &[String]) -> Vec<String> {
+    if let Some(module) = olean_module(text) {
+        return vec![module.to_owned()];
+    }
+    let Some(prefix) = text
+        .split_once("unknown module prefix '")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(prefix, _)| prefix)
+    else {
+        return Vec::new();
+    };
+    imports
+        .iter()
+        .filter(|import| import.split('.').next() == Some(prefix))
+        .cloned()
+        .collect()
+}
+
+/// The module of Lean's "object file 'PATH' of module M does not exist"
+/// (`Lean/Environment.lean`), when `text` holds that message.
+fn olean_module(text: &str) -> Option<&str> {
+    let (_, rest) = text.split_once("' of module ")?;
+    let (module, _) = rest.split_once(" does not exist")?;
+    (!module.is_empty() && !module.contains(char::is_whitespace)).then_some(module)
+}
+
 /// The wire status token for a degraded, incomplete-build verdict. One producer
 /// so every tool agrees on the spelling.
 pub(crate) const NEEDS_BUILD_STATUS: &str = "needs_build";
 
 /// A worker call either produced its value, or it hit an unbuilt dependency
 /// while assembling the environment. The second case is recoverable and
-/// agent-actionable (run `lake build`), not an infrastructure failure, so the
-/// tools degrade it into a `needs_build` verdict rather than letting it
-/// propagate as an MCP transport error.
+/// agent-actionable (build with `lean_build`, or fix an import that names no
+/// module), not an infrastructure failure, so the tools degrade it into a
+/// `needs_build` verdict rather than letting it propagate as an MCP transport
+/// error.
 pub(crate) enum CallOutcome<T> {
     Ready(T),
     NeedsBuild(ServerError),
@@ -118,33 +157,59 @@ pub(crate) fn classify_missing_olean<T>(outcome: Result<T>) -> Result<CallOutcom
 /// it can be unit-tested without a [`Response`]. `project_root` comes from the
 /// response freshness.
 pub(crate) fn needs_build_text(project_root: &str, cause: &IncompleteCause) -> (String, String) {
-    let detail = match cause {
-        IncompleteCause::MissingImports(missing) if !missing.is_empty() => {
-            format!(" (missing imports: {})", missing.join(", "))
-        }
-        IncompleteCause::OutOfDate(targets) if !targets.is_empty() => {
-            format!(" (out of date: {})", targets.join(", "))
-        }
-        IncompleteCause::MissingImports(_) | IncompleteCause::OutOfDate(_) => String::new(),
-        IncompleteCause::MissingOlean(text) => format!(" (blocked: {})", first_line(text)),
+    let (detail, modules): (String, Vec<&str>) = match cause {
+        IncompleteCause::UnknownImports(modules) => return unknown_import_text(project_root, modules),
+        IncompleteCause::MissingImports(missing) if !missing.is_empty() => (
+            format!(" (missing imports: {})", missing.join(", ")),
+            missing.iter().map(String::as_str).collect(),
+        ),
+        IncompleteCause::OutOfDate(targets) if !targets.is_empty() => (
+            format!(" (out of date: {})", targets.join(", ")),
+            targets.iter().map(String::as_str).collect(),
+        ),
+        IncompleteCause::MissingImports(_) | IncompleteCause::OutOfDate(_) => (String::new(), Vec::new()),
+        IncompleteCause::MissingOlean(text) => (
+            format!(" (blocked: {})", first_line(text)),
+            olean_module(text).into_iter().collect(),
+        ),
     };
     let warning = format!(
-        "the project may not be fully built, so this query ran against an incomplete environment. \
-         Run `lake build` in {project_root} and resolve errors, then retry.{detail}"
+        "the project at {project_root} may not be fully built, so this query ran against an incomplete \
+         environment. Build it with lean_build, resolve errors, then retry.{detail}"
     );
-    let next_action = match cause {
-        IncompleteCause::MissingImports(missing) | IncompleteCause::OutOfDate(missing) if !missing.is_empty() => {
-            format!("lake build {} # then retry", missing.join(" "))
-        }
-        IncompleteCause::MissingImports(_) | IncompleteCause::OutOfDate(_) | IncompleteCause::MissingOlean(_) => {
-            "lake build # complete the project environment, then retry".to_owned()
-        }
-    };
-    (warning, next_action)
+    (warning, build_action(&modules))
 }
 
-/// Attach the canonical incomplete-build warning + `lake build` next action.
-/// The single rendering point for the condition across all tools.
+/// The `(warning, next_action)` pair for imports that name no module.
+fn unknown_import_text(project_root: &str, modules: &[String]) -> (String, String) {
+    let named = modules
+        .iter()
+        .map(|module| format!("`{module}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (subject, action) = if named.is_empty() {
+        (
+            "for an import".to_owned(),
+            "fix the import Lake finds no module for, then retry".to_owned(),
+        )
+    } else {
+        (
+            format!("named {named}"),
+            format!("fix the import of {named}, then retry"),
+        )
+    };
+    (
+        format!(
+            "Lake finds no module {subject} for the project at {project_root}, so no build can supply it. \
+             Fix the import, then retry."
+        ),
+        action,
+    )
+}
+
+/// Attach the canonical incomplete-build warning and next action: a
+/// `lean_build` call, or an import fix when an import names no module. The
+/// single rendering point for the condition across all tools.
 #[must_use]
 pub(crate) fn warn_needs_build<T>(resp: Response<T>, cause: &IncompleteCause) -> Response<T>
 where
@@ -168,9 +233,15 @@ fn needs_build_trust_artifacts(cause: &IncompleteCause) -> Vec<ArtifactTrust> {
             .cloned()
             .map(ArtifactTrust::olean_module_missing_build)
             .collect(),
-        IncompleteCause::MissingOlean(text) => {
-            vec![ArtifactTrust::olean_project_missing_build(first_line(text))]
-        }
+        IncompleteCause::MissingOlean(text) => vec![olean_module(text).map_or_else(
+            || ArtifactTrust::olean_project_missing_build(first_line(text)),
+            ArtifactTrust::olean_module_missing_build,
+        )],
+        IncompleteCause::UnknownImports(modules) => modules
+            .iter()
+            .cloned()
+            .map(ArtifactTrust::olean_module_unknown_import)
+            .collect(),
         IncompleteCause::OutOfDate(targets) if targets.is_empty() => {
             vec![ArtifactTrust::olean_project_stale_build(
                 "Lake reports an import out of date",
@@ -293,7 +364,9 @@ pub(crate) fn execution_taint_text(event: &RuntimeRestartEvent) -> (String, Stri
         "the worker did not complete this call reliably ({cause}){rss}; its result is not trustworthy.",
         cause = event.cause,
     );
-    let next_action = "retry; if it persists, verify with `lake build <module>` or `lake env lean <file>`".to_owned();
+    let next_action =
+        "retry; if it persists, check the file with lean_status(kind=\"file_diagnostics\") or build its module with lean_build"
+            .to_owned();
     (warning, next_action)
 }
 
@@ -332,12 +405,24 @@ mod tests {
     }
 
     #[test]
-    fn needs_build_text_names_lake_build_and_avoids_the_word_ambiguous() {
+    fn needs_build_text_names_lean_build_not_lake_and_avoids_the_word_ambiguous() {
         let (warning, next_action) = needs_build_text("/work/proj", &IncompleteCause::MissingImports(Vec::new()));
-        assert!(warning.contains("lake build"));
+        assert!(warning.contains("lean_build"));
         assert!(warning.contains("/work/proj"));
         assert!(!warning.to_lowercase().contains("ambiguous"));
-        assert!(next_action.contains("lake build"));
+        assert_eq!(next_action, "run lean_build() to build the default targets, then retry");
+        for cause in [
+            IncompleteCause::MissingImports(vec!["A".to_owned()]),
+            IncompleteCause::OutOfDate(Vec::new()),
+            IncompleteCause::MissingOlean("unknown module prefix 'P'".to_owned()),
+            IncompleteCause::UnknownImports(vec!["A".to_owned()]),
+        ] {
+            let (warning, next_action) = needs_build_text("/work/proj", &cause);
+            assert!(
+                !format!("{warning} {next_action}").contains("lake "),
+                "{warning} {next_action}"
+            );
+        }
     }
 
     #[test]
@@ -346,7 +431,10 @@ mod tests {
         let (warning, next_action) = needs_build_text("/work/proj", &cause);
         assert!(warning.contains("Foo.Bar"));
         assert!(warning.contains("missing imports"));
-        assert!(next_action.contains("lake build Foo.Bar Baz"));
+        assert_eq!(
+            next_action,
+            r#"run lean_build(targets=["+Foo.Bar","+Baz"]), then retry"#
+        );
     }
 
     #[test]
@@ -355,6 +443,79 @@ mod tests {
         let (warning, _) = needs_build_text("/work/proj", &cause);
         assert!(warning.contains("Foo.olean"));
         assert!(!warning.contains("second line"));
+    }
+
+    #[test]
+    fn a_missing_olean_that_names_its_module_builds_that_module() {
+        use crate::trust::{TrustScope, TrustStatus};
+        let text = "worker unavailable: worker returned lean_rs.lean_exception: lean-rs: Lean threw UserError: \
+                    object file '/p/.lake/build/lib/lean/Chain/D.olean' of module Chain.D does not exist";
+        let cause = IncompleteCause::MissingOlean(text.to_owned());
+        assert_eq!(
+            needs_build_text("/p", &cause).1,
+            r#"run lean_build(targets=["+Chain.D"]), then retry"#
+        );
+        let rows = needs_build_trust_artifacts(&cause);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.scope, row.status, row.module.as_deref()))
+                .collect::<Vec<_>>(),
+            [(TrustScope::Module, TrustStatus::MissingBuild, Some("Chain.D"))]
+        );
+    }
+
+    #[test]
+    fn unknown_imports_say_to_fix_the_import_with_one_row_each() {
+        use crate::trust::{ArtifactKind, TrustScope, TrustStatus};
+        let err = ServerError::UnknownImports {
+            modules: vec!["Chain.Typo".to_owned(), "Nope.Typo".to_owned()],
+            output: "error: unknown module `Nope.Typo`".to_owned(),
+        };
+        assert!(missing_olean_failure(&err));
+        let cause = IncompleteCause::from_error(&err);
+        let (warning, next_action) = needs_build_text("/work/proj", &cause);
+        assert!(
+            warning.contains("no module named `Chain.Typo`, `Nope.Typo`"),
+            "{warning}"
+        );
+        assert!(!warning.contains("lean_build"), "{warning}");
+        assert_eq!(next_action, "fix the import of `Chain.Typo`, `Nope.Typo`, then retry");
+        assert_eq!(
+            needs_build_trust_artifacts(&cause)
+                .into_iter()
+                .map(|row| (row.artifact, row.scope, row.status, row.module))
+                .collect::<Vec<_>>(),
+            ["Chain.Typo", "Nope.Typo"].map(|module| (
+                ArtifactKind::Olean,
+                TrustScope::Module,
+                TrustStatus::UnknownImport,
+                Some(module.to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn unloaded_modules_read_the_module_lean_could_not_load() {
+        let imports = ["Nope.Typo", "Nope", "Nopes.X", "Chain.A"].map(str::to_owned);
+        // `Lean/Environment.lean`: an import under a known search-path root.
+        assert_eq!(
+            unloaded_modules(
+                "lean-rs: Lean threw UserError: object file '/p/Chain/Typo.olean' of module Chain.Typo does not exist",
+                &imports
+            ),
+            ["Chain.Typo"]
+        );
+        // `Lean/Util/Path.lean`: only the root is named, so every import under
+        // it is a candidate, and no other.
+        assert_eq!(
+            unloaded_modules(
+                "unknown module prefix 'Nope'\n\nNo directory 'Nope' or file 'Nope.olean' in the search path entries:\n/p",
+                &imports
+            ),
+            ["Nope.Typo", "Nope"]
+        );
+        assert!(unloaded_modules("worker thread gone", &imports).is_empty());
+        assert_eq!(olean_module("object file 'x' of module  does not exist"), None);
     }
 
     #[test]
@@ -386,7 +547,7 @@ mod tests {
         assert_eq!(rows(&cause), [stale_module("A"), stale_module("B.C")]);
         let (warning, next_action) = needs_build_text("/work/proj", &cause);
         assert!(warning.contains("out of date: A, B.C"), "{warning}");
-        assert_eq!(next_action, "lake build A B.C # then retry");
+        assert_eq!(next_action, r#"run lean_build(targets=["+A","+B.C"]), then retry"#);
 
         assert_eq!(
             rows(&IncompleteCause::OutOfDate(Vec::new())),
@@ -507,6 +668,7 @@ mod tests {
         assert!(warning.contains("5242880"));
         assert!(warning.contains("not trustworthy"));
         assert!(next_action.contains("retry"));
+        assert!(!next_action.contains("lake "), "{next_action}");
     }
 
     #[test]

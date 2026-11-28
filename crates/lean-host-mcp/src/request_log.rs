@@ -89,6 +89,7 @@ impl RequestLog {
                     ServerError::IncompatibleWorker { .. } => "incompatible_worker",
                     ServerError::BadProject(_) | ServerError::PreparationFailed { .. } => "bad_project",
                     ServerError::OutOfDate { .. } => "needs_build",
+                    ServerError::UnknownImports { .. } => "unknown_import",
                     ServerError::SessionGone => "session_gone",
                     ServerError::Lean(_) => "lean_error",
                     ServerError::Io(_) => "io_error",

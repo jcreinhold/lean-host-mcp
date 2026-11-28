@@ -29,8 +29,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `current-generation`. In the library, `WorkerBinary::resolve_ready` and `resolve_ready_with` lose their `fix` argument
   and `Readiness::Ready` loses its `note`.
 
+### Added
+
+- An import that names no module gets its own trust status, `unknown_import`, on an `olean` / `module` row whose next
+  action says to fix the import. The server asks `lake query +MODULE:lean` about each module a failed file setup or a
+  failed `.olean` load names: a name no Lake library holds, or one whose source file is missing, is an unknown import,
+  and a module Lake knows but has not built keeps its `missing_build` or `stale_build` row. Before, a file check that
+  imported a missing module under a library root failed with Lake's raw error, and a trial told you to build the
+  project. `lean_imports` reports such a file with code `unknown_import`, and the request log with outcome
+  `unknown_import`. A client that lists trust statuses should add the new one.
+
 ### Changed
 
+- Replies no longer tell agents to run `lake build` or `lake env lean`. A build row's next action names the `lean_build`
+  call that builds its module, such as `run lean_build(targets=["+Chain.B"]), then retry`, or
+  `run lean_build() to build the default targets, then retry` when no module is known. A `needs_build` reply whose
+  worker names the `.olean` it could not load now has a `missing_build` row for that module, not one for the project.
+- A `lean_verify` warning carries its own next action. Before, the reply added the note "source files were not modified
+  by verification" with no warning, so each warning after it showed the action meant for the one before.
 - An environment variable that is empty or holds only spaces counts as unset for every setting. Before, an empty broker
   or runtime variable stopped startup while the others counted as unset. `ToolConfig::from_env_with_file` resolves the
   presentation settings in the library.

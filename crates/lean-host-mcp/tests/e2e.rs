@@ -1598,8 +1598,8 @@ async fn find_references_project_scope_unbuilt_degrades_to_needs_build() {
         "an unbuilt project must not invent references, got {references:?}"
     );
     assert!(
-        warnings.iter().any(|warning| warning.contains("lake build")),
-        "unbuilt project should ride a needs_build/`lake build` warning, got {warnings:?}"
+        warnings.iter().any(|warning| warning.contains("lean_build")),
+        "unbuilt project should ride a needs_build/lean_build warning, got {warnings:?}"
     );
 }
 
