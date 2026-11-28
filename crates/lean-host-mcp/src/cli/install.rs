@@ -23,6 +23,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
@@ -122,6 +123,9 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
     // Nothing recorded the elan home in this process, so this is `ELAN_HOME`,
     // else `$HOME/.elan`: the elan of the shell that runs install.
     let plan = Plan::resolve(args, &config_file::process_env, toolchain::elan_home())?;
+    // Read the build tables before install changes anything, so a broken one
+    // stops it first. Their `timeout_secs` limits the runtime build.
+    let timeout = crate::project::runtime_timeout(&plan.root)?;
     // Install writes what a server reads, so it holds the store as a server
     // does: it refuses while one serves, and waits for the processes a dead
     // one started.
@@ -130,7 +134,7 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
         let source = install_worker::resolve_worker_source(args.source_dir.as_deref())?;
         install_worker::install_one(workers, id, &source).map(drop)
     })?;
-    let semantic = build_semantic_runtime(&plan, held.dir())?;
+    let semantic = build_semantic_runtime(&plan, held.dir(), timeout)?;
     let binary = plan.binary();
     println!(
         "installed lean-host-mcp for {} (leanprover/lean4:{})",
@@ -151,13 +155,18 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
 }
 
 /// Build the semantic search runtime for the toolchain of `plan`'s root, keyed
-/// as the server opens it, into the cache of the held store `store`. Returns
-/// the runtime's package directory.
-fn build_semantic_runtime(plan: &Plan, store: &Path) -> anyhow::Result<PathBuf> {
+/// as the server opens it, into the cache of the held store `store`, waiting
+/// at most `timeout` for the cache's lock and then for Lake. Returns the
+/// runtime's package directory.
+fn build_semantic_runtime(plan: &Plan, store: &Path, timeout: Duration) -> anyhow::Result<PathBuf> {
     let meta = crate::lake_meta::LakeProjectMeta::from_explicit(&plan.root)?;
     let (_, sysroot, _) = crate::project::resolve_worker(&meta)?;
-    let runtime =
-        crate::project::build_semantic_runtime(&store.join(store::SEMANTIC_CACHE_DIR_NAME), &meta.toolchain, &sysroot)?;
+    let runtime = crate::project::build_semantic_runtime(
+        &store.join(store::SEMANTIC_CACHE_DIR_NAME),
+        &meta.toolchain,
+        &sysroot,
+        timeout,
+    )?;
     Ok(runtime.package_root().to_owned())
 }
 

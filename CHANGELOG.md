@@ -44,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `lake --no-build --no-cache query --json +MODULE:lean +MODULE:header` answers them all, plus one more run for each
   name no library matches. A module Lake cannot answer for, such as `Init`, gets its own `error`, code `unknown_module`
   or `module_header_failed`, and the rest still answer. `files` may now be empty, and the reply always holds `modules`.
+- In the library, `build::DEFAULT_TIMEOUT_SECS` names the default `[build] timeout_secs`.
 
 ### Changed
 
@@ -105,6 +106,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   start during a build, whichever caller asks. Before, each caller took the turn first. Replies are the same, except
   that during a build a check now fails at once, not after the build, when its worker is missing or unusable or when its
   file does not match the source it sent.
+- Proof search from a file runs lean-semantic-search's own driver, `LeanSemanticSearchDriver.lean` in the runtime
+  package, and checks its reply with the contract crate's `DriverReply::parse`. The server's generated driver is gone. A
+  reply from another contract version fails the search with a message that names the field that differs. A request over
+  16 MiB now fails in the driver, which names the request file, rather than in the server before Lean starts.
+- A `search_for_proof` candidate that semantic search found carries the kind and module of its declaration, such as
+  `definition` or `instance`; before, its kind always read `theorem`. Only a theorem gets a `suggested_snippet` and the
+  ranking's theorem bonus, as with the other searches.
+- `[build] timeout_secs` also limits the semantic search runtime: install's build and a server's open each wait at most
+  that long for the cache entry's lock, and then for Lake. Install reads the build tables before it changes anything, so
+  a broken one stops it first, and a server's semantic search that must open the runtime fails with the problems they
+  name.
 
 ## [0.18.0] - 2026-11-27
 

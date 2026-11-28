@@ -1,17 +1,13 @@
 //! Semantic proof search for a goal in one source file. A short run
-//! ([`crate::lean_run`]) runs the semantic feature driver with the module
-//! setup that `lake setup-file` prints for that file.
+//! ([`crate::lean_run`]) runs search's driver with the module setup that
+//! `lake setup-file` prints for that file.
 use super::verify_file::PreparedReader;
 use super::{BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, short_run_freshness};
 use crate::cancellation::CallCancellation;
 use crate::error::invalid;
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{fs, io, time::Duration};
 
 impl ProjectBroker {
     /// Rank declarations that may close the goal at one proof position.
@@ -23,7 +19,7 @@ impl ProjectBroker {
     /// # Errors
     ///
     /// Returns resolution, `lake setup-file`, semantic runtime, or short-run
-    /// failures.
+    /// failures, and the contract's refusal of the driver's reply.
     pub(crate) async fn semantic_proof_search(
         &self,
         hint: ProjectHint,
@@ -51,43 +47,39 @@ impl ProjectBroker {
         let cancellation = CallCancellation::current();
         let label = meta.toolchain.clone();
         let prefix = sysroot.clone();
+        let project = root.clone();
         // Opening asks Lake whether install built the runtime; it builds
         // nothing.
-        let runtime = tokio::task::spawn_blocking(move || crate::project::semantic_runtime(&label, &prefix))
+        let runtime = tokio::task::spawn_blocking(move || crate::project::semantic_runtime(&label, &prefix, &project))
             .await
             .map_err(invalid)??;
-        let bootstrap = select_semantic_runtime(runtime.package_root(), runtime.module_dir())?;
-        let body = request.reader_input(&roots)?;
-        let bytes = super::reader::reader_output(
-            "Lean semantic feature reader",
+        let limit = request.limit;
+        let body = serde_json::to_vec(&request.into_driver_request(roots)).map_err(invalid)?;
+        let driver = runtime.driver().to_owned();
+        let modules = runtime.module_dir().to_owned();
+        let stdout = super::reader::reader_output(
+            "Lean semantic search driver",
             &root,
             cancellation.remaining_or(Duration::from_millis(self.request_timeout_millis())),
             self.lean_runs(),
             Some(Box::new(activity)),
             move |assets| {
-                let driver = assets.join("SemanticFeatures.lean");
-                fs::write(assets.join("module.setup.json"), setup.bytes)?;
-                fs::write(
-                    &driver,
-                    [
-                        include_str!("../lake/SemanticFeatures.lean"),
-                        include_str!("../lake/SemanticSetup.lean"),
-                    ]
-                    .concat(),
-                )?;
-                let data = assets.join("semantic.json");
-                fs::write(&data, body)?;
+                let setup_file = assets.join("module.setup.json");
+                fs::write(&setup_file, setup.bytes)?;
+                let request_file = assets.join("request.json");
+                fs::write(&request_file, body)?;
                 Ok(crate::lean_run::Program {
                     command: vec![
                         sysroot.join("bin/lean").into_os_string(),
                         "--run".into(),
                         driver.into_os_string(),
-                        data.into_os_string(),
+                        setup_file.into_os_string(),
+                        request_file.into_os_string(),
                     ],
                     environment: vec![
                         (
                             "LEAN_PATH".into(),
-                            std::env::join_paths([bootstrap]).map_err(io::Error::other)?,
+                            std::env::join_paths([modules]).map_err(io::Error::other)?,
                         ),
                         ("LEAN_SYSROOT".into(), sysroot.into_os_string()),
                     ],
@@ -100,21 +92,9 @@ impl ProjectBroker {
         .await
         .map_err(|e| e.error)?;
         Ok(BrokerCall {
-            value: request.reader_result(&bytes)?,
+            value: crate::semantic_search::rank_driver_reply(&stdout, limit)?,
             runtime: RuntimeFacts::default(),
             freshness: short_run_freshness(&meta, freshness),
         })
     }
-}
-
-/// Return the directory that holds the semantic runtime's compiled Lean
-/// modules, checking that it lies in the runtime's package.
-fn select_semantic_runtime(package: &Path, modules: &Path) -> Result<PathBuf> {
-    if !modules.starts_with(package) {
-        return Err(invalid("semantic runtime modules outside their package"));
-    }
-    if !modules.join("LeanSemanticSearch/Capability.olean").is_file() {
-        return Err(invalid("missing compiled semantic capability"));
-    }
-    Ok(modules.to_owned())
 }

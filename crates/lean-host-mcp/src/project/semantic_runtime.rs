@@ -7,10 +7,12 @@
 //! builds nothing, and keeps what it opened.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use lean_semantic_search_runtime::{SemanticSearchRuntime, SemanticSearchRuntimeBuild};
 use parking_lot::Mutex;
 
+use crate::build::config::BuildConfig;
 use crate::config_file;
 use crate::error::{Result, ServerError};
 
@@ -27,12 +29,18 @@ static SEMANTIC_RUNTIMES: std::sync::LazyLock<
 
 /// The runtime for `toolchain_label` and `lean_sysroot`, opened once per
 /// process. Failures are not kept, so a later call after an install opens it.
+/// The open waits for the cache's lock, and then for Lake, at most the
+/// `[build] timeout_secs` of the Lake root `project` each.
 ///
 /// # Errors
 ///
 /// When the runtime is not built, tells the operator to rerun install;
-/// otherwise returns the cache or Lake failure.
-pub(crate) fn semantic_runtime(toolchain_label: &str, lean_sysroot: &Path) -> Result<SemanticSearchRuntime> {
+/// otherwise returns the build table, cache or Lake failure.
+pub(crate) fn semantic_runtime(
+    toolchain_label: &str,
+    lean_sysroot: &Path,
+    project: &Path,
+) -> Result<SemanticSearchRuntime> {
     let key = (toolchain_label.to_owned(), lean_sysroot.to_path_buf());
     // Bound the guard to a statement so the lock is released before the open
     // below, rather than living to the end of an `if let`.
@@ -40,17 +48,36 @@ pub(crate) fn semantic_runtime(toolchain_label: &str, lean_sysroot: &Path) -> Re
     if let Some(runtime) = cached {
         return Ok(runtime);
     }
-    let runtime = open_runtime(semantic_runtime_cache_root()?, toolchain_label, lean_sysroot)?;
+    let timeout = runtime_timeout(project)?;
+    let runtime = open_runtime(semantic_runtime_cache_root()?, toolchain_label, lean_sysroot, timeout)?;
     SEMANTIC_RUNTIMES.lock().insert(key, runtime.clone());
     Ok(runtime)
 }
 
+/// How long each wait of a runtime open or build may take for the Lake root
+/// `root`: its `[build] timeout_secs`, the limit of a build.
+///
+/// # Errors
+///
+/// Names every problem in the root's build tables.
+pub(crate) fn runtime_timeout(root: &Path) -> Result<Duration> {
+    BuildConfig::load(root)
+        .map(|config| Duration::from_secs(config.build.timeout_secs))
+        .map_err(|errors| ServerError::BadProject(errors.join("; ")))
+}
+
 /// Open the runtime built in `cache_root`, without building it.
-fn open_runtime(cache_root: PathBuf, toolchain_label: &str, lean_sysroot: &Path) -> Result<SemanticSearchRuntime> {
+fn open_runtime(
+    cache_root: PathBuf,
+    toolchain_label: &str,
+    lean_sysroot: &Path,
+    timeout: Duration,
+) -> Result<SemanticSearchRuntime> {
     lean_semantic_search_runtime::open(SemanticSearchRuntimeBuild {
         cache_root,
         toolchain_label: toolchain_label.to_owned(),
         lean_sysroot: lean_sysroot.to_path_buf(),
+        timeout,
     })
     .map_err(|error| {
         if error.needs_build() {
@@ -68,7 +95,9 @@ fn open_runtime(cache_root: PathBuf, toolchain_label: &str, lean_sysroot: &Path)
 
 /// Build the runtime for `toolchain_label` and `lean_sysroot` into
 /// `cache_root`, or the cache that `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` names.
-/// Install calls this while it holds the store.
+/// Install calls this while it holds the store, with its project's
+/// `[build] timeout_secs` as `timeout`: the most the build waits for the
+/// cache's lock, and then for Lake.
 ///
 /// # Errors
 ///
@@ -77,6 +106,7 @@ pub(crate) fn build_semantic_runtime(
     cache_root: &Path,
     toolchain_label: &str,
     lean_sysroot: &Path,
+    timeout: Duration,
 ) -> Result<SemanticSearchRuntime> {
     let cache_root = match config_file::env_value(&config_file::process_env, CACHE_DIR_ENV) {
         Some(dir) => env_cache_dir(PathBuf::from(dir))?,
@@ -87,6 +117,7 @@ pub(crate) fn build_semantic_runtime(
             cache_root,
             toolchain_label: toolchain_label.to_owned(),
             lean_sysroot: lean_sysroot.to_path_buf(),
+            timeout,
         },
         || false,
     )

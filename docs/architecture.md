@@ -30,7 +30,7 @@ crates/lean-host-mcp/src/
   broker/host_artifacts.rs the installed shims a worker reads before it opens
   broker/module_setup.rs lake setup-file and lake query as short runs; a file's options and module, the import closure, module sources and headers
   broker/reader.rs       reader runs: the permit, read share and exit codes of each short run a check starts
-  broker/semantic_file.rs file-backed semantic proof search through a short run
+  broker/semantic_file.rs file-backed semantic proof search: a short run of lean-semantic-search's driver
   broker/verify_file.rs  file checks through one-shot Lean programs
   project.rs             LeanProject actor: one serialized controller and worker
   project/runtime_config.rs the actor's memory budget, Lean heap ceiling, deadline, mailbox and restart limits
@@ -46,7 +46,7 @@ crates/lean-host-mcp/src/
   tools/                 semantic.rs facade; declaration/proof_search/proof_action/position internals; build.rs
   projections.rs         stable MCP projections from lean-rs worker types
   lake_meta.rs           minimal Lake-project metadata
-  lake/                  the Lean drivers that file checks and semantic file runs load
+  lake/                  the Lean drivers that file checks and file outlines load
   toolchain.rs           the project's lean-toolchain pin, its elan toolchain and its worker
   cache.rs               bounded module-query cache, valid while the worker that computed an entry lives
   envelope.rs            internal operation envelope adapted to { data, errors, trust } at the public boundary
@@ -187,9 +187,12 @@ tainted or interrupted final attempt remains unusable and uncacheable. Runtime f
 listed in [operations](operations.md#internal-runtime-facts).
 
 The worker loads the bundled `lean_rs_host_*` shim capabilities from `lean-rs-host`. The source-backed proof-search lane
-uses `lean-semantic-search-runtime`, which owns its Lean payload, provenance, materialization, and build. The host
-selects cache roots and toolchain/sysroot: `install` builds the runtime into the store, and a server only opens it.
-Consumers do not declare, link, or import either support package.
+uses `lean-semantic-search-runtime`, which owns its Lean payload, provenance, materialization, and build, and the driver
+that answers a search. The host selects cache roots and toolchain/sysroot: `install` builds the runtime into the store,
+and a server only opens it. A search runs the runtime's driver, `LeanSemanticSearchDriver.lean`, as a short run like
+every `lean` program the server starts, so it takes a `max_lean_runs` permit and has a file in `children/`. The contract
+crate's `DriverReply::parse` checks the reply before the server reads a row. Consumers do not declare, link, or import
+either support package.
 
 ### Toolchain-Readiness Gate
 
@@ -588,3 +591,11 @@ group number can name another group by the time the signal goes. Recovery steps 
 `install` and `install-worker --lake-root` hold the store as a server does, so each refuses while a server serves the
 root. `install` builds the semantic runtime into `<store>/semantic-runtimes`; a serving server only opens it, and a
 runtime that needs a build fails the call with the install command.
+
+Opening is the one Lake run of the search crate while a server serves: `lake build --no-build LeanSemanticSearch` in the
+runtime's package, once per toolchain and sysroot in each server process, at the first semantic search that needs it. A
+failed open runs again at the next search. It builds nothing and writes no module the driver loads; the package has no
+dependencies to fetch, and when the cache entry is missing, the open writes the package's sources and Lake then reports
+that the modules need a build. The run takes no `max_lean_runs` permit and has no file in `children/`, but it holds
+`children.lock`, so a server that starts after a killed one waits for it. `[build] timeout_secs` limits its wait for the
+cache entry's lock, and then its run, as it limits install's build.

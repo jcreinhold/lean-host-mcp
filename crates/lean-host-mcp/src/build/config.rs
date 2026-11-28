@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Default `[build] timeout_secs`: four hours.
-pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 14_400;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 14_400;
 /// Default `[build] log_limit_mib`.
 pub(crate) const DEFAULT_LOG_LIMIT_MIB: u64 = 16;
 

@@ -19,7 +19,7 @@ fn an_unbuilt_runtime_tells_the_operator_to_rerun_install() -> std::io::Result<(
     let cache = root.join("cache");
     fs::create_dir(&cache)?;
 
-    let error = open_runtime(cache, "semantic-unbuilt-test", &sysroot).err();
+    let error = open_runtime(cache, "semantic-unbuilt-test", &sysroot, Duration::from_secs(60)).err();
 
     let message = error.map(|error| error.to_string()).unwrap_or_default();
     assert!(

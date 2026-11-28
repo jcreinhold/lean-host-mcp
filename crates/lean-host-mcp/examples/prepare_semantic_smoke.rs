@@ -1,8 +1,12 @@
 //! Prepare the exact released semantic-runtime cache for the installed-package smoke.
 
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result};
+use lean_host_mcp::build::DEFAULT_TIMEOUT_SECS;
 use lean_semantic_search_runtime::SemanticSearchRuntimeBuild;
 
 fn main() -> Result<()> {
@@ -17,6 +21,9 @@ fn main() -> Result<()> {
             .into_string()
             .map_err(|_| anyhow::anyhow!("toolchain label is not UTF-8"))?,
         lean_sysroot: PathBuf::from(sysroot).canonicalize()?,
+        // The smoke's fixture has no `[build]` table, so install would pass
+        // the default `[build] timeout_secs`.
+        timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
     };
     let started = Instant::now();
     lean_semantic_search_runtime::build(input.clone(), || false)

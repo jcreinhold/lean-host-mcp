@@ -1765,6 +1765,17 @@ async fn search_for_proof_prefers_relevant_fixture_lemmas() {
         response.result.as_ref().expect("search result").diagnostics,
         response.result.as_ref().expect("search result").candidates
     );
+    // A semantic candidate takes its name, module and kind from its row.
+    let candidates = &response.result.as_ref().expect("search result").candidates;
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate.match_reason.contains("semantic:")
+                && candidate.name == "LeanRsFixture.ProofSearchFacts.cast_num_den_helper"
+                && candidate.module.as_deref() == Some("LeanRsFixture.ProofSearchFacts")
+                && candidate.kind == "theorem"
+        }),
+        "the fixture helper comes back from semantic search with its module and kind: {candidates:?}"
+    );
 }
 
 #[tokio::test]

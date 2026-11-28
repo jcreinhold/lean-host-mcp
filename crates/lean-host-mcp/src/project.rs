@@ -48,7 +48,7 @@ use restart::{
 };
 pub use runtime_config::ProjectRuntimeConfig;
 use runtime_config::RESTART_WINDOW;
-pub(crate) use semantic_runtime::{build_semantic_runtime, semantic_runtime};
+pub(crate) use semantic_runtime::{build_semantic_runtime, runtime_timeout, semantic_runtime};
 
 /// LRU capacity for exact bounded module-query results, applied to the single
 /// and batch caches separately.

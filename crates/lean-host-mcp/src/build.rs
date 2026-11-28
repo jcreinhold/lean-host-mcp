@@ -23,6 +23,8 @@ mod log;
 #[cfg(test)]
 mod tests;
 
+pub use config::DEFAULT_TIMEOUT_SECS;
+
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::os::fd::BorrowedFd;

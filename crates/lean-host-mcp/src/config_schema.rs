@@ -272,7 +272,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "14400",
         commented: false,
         overrides: "",
-        description: "Deadline for one build, counted from its request: the wait for the project's write turn and every step count. Default 4 hours.",
+        description: "Deadline for one build, counted from its request: the wait for the project's write turn and every step count. It also limits install's build of the semantic search runtime and a server's open of it: each waits at most this long for the cache's lock, and then for Lake. Default 4 hours.",
     },
     FieldDoc {
         key: "build.log_limit_mib",

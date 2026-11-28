@@ -83,7 +83,7 @@ descriptions are explanatory, not literal setting values.
 | `requests.max_rows` | integer | `10000` | none | Most rows the request table keeps. Past this, pruning deletes the ended rows that finished first. Default 10000. |
 | `requests.wait_max_secs` | integer (s) | `300` | none | Longest wait_seconds one lean_get may ask for. Default 300 s. |
 | `build.guard` | array of Lake targets | `[]` | none | Targets that must already be built. A guard step runs lake build --no-build on them, which fails without building anything when one is out of date. It runs before a build of targets; a recipe's guard key places it. A project on Mathlib can use ["@mathlib/+Mathlib:olean"]. Empty runs no guard. |
-| `build.timeout_secs` | integer (s) | `14400` | none | Deadline for one build, counted from its request: the wait for the project's write turn and every step count. Default 4 hours. |
+| `build.timeout_secs` | integer (s) | `14400` | none | Deadline for one build, counted from its request: the wait for the project's write turn and every step count. It also limits install's build of the semantic search runtime and a server's open of it: each waits at most this long for the cache's lock, and then for Lake. Default 4 hours. |
 | `build.log_limit_mib` | integer (MiB) | `16` | none | Cap on one build's log, which lives in the store's logs directory. Output past the cap is dropped, and the reply says so. Default 16 MiB. |
 | `recipes.<name>.steps` | array of arrays of strings | unset | none | The Lake runs of one recipe, in order. Each is the words after lake and may not be empty; Lake reports its own errors in them. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name. |
 | `recipes.<name>.append` | string (none, last, each) | `"none"` | none | Which steps get the request's args at their end: none refuses args, last gives them to the last step, each to every step. An arg may not be empty or start with -. Default none. |
@@ -259,9 +259,8 @@ project-scope `.ilean` reference reads answer from the Lake files directly. A re
 is answered from the per-project result cache and likewise never enters the mailbox, so a warm call does not queue
 behind in-flight Lean work.
 
-Semantic proof ranking briefly opens a companion child in addition to the elaboration worker. Include that peak in
-memory planning. The server shuts it down after the call; it does not keep a separate resident ranking pool.
-Measurements in `project.rs::open_semantic_capability` found no significant improvement from keeping it resident.
+Semantic proof ranking runs one more `lean` process beside the elaboration worker: lean-semantic-search's driver, as a
+short run that exits after the call. Include that peak in memory planning.
 
 ### Request table
 
@@ -544,6 +543,8 @@ PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
   server serves the project. Stop the server, install, then start it again.
 - Install builds the semantic search runtime for the project's toolchain into the store's `semantic-runtimes/`. A server
   only opens it; a semantic call that finds it unbuilt fails and says to rerun `lean-host-mcp install --lake-root`.
+  `[build] timeout_secs` limits the build's wait for the cache's lock, and then its Lake run, and the same for a
+  server's open.
 
 Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
 file that is not valid TOML before it builds anything. It records `elan_home` as `ELAN_HOME`, else `$HOME/.elan`, so a

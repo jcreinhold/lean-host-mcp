@@ -644,11 +644,9 @@ fn rank_results(
             }
             let row = DeclarationSummary {
                 name: candidate.name,
-                kind: "theorem".to_owned(),
-                module: candidate.module,
-                source: candidate
-                    .source
-                    .and_then(|source| (!source.file.is_empty()).then_some(source)),
+                kind: candidate.kind.as_str().to_owned(),
+                module: Some(candidate.module),
+                source: None,
                 match_reason: "semantic".to_owned(),
                 score: candidate.score,
                 rank: 0,
@@ -1735,8 +1733,8 @@ mod tests {
         let semantic = SemanticProofSearchResult {
             candidates: vec![crate::semantic_search::SemanticProofCandidate {
                 name: "LeanRsFixture.ProofSearchFacts.cast_num_den_helper".to_owned(),
-                module: Some("LeanRsFixture.ProofSearchFacts".to_owned()),
-                source: None,
+                module: "LeanRsFixture.ProofSearchFacts".to_owned(),
+                kind: lean_semantic_search_contract::DeclarationKind::Theorem,
                 score: 130,
                 evidence: vec!["semantic:role_conclusion_const:2".to_owned()],
             }],
@@ -1773,8 +1771,8 @@ mod tests {
         let semantic = SemanticProofSearchResult {
             candidates: vec![crate::semantic_search::SemanticProofCandidate {
                 name: "Eq.generic_noise".to_owned(),
-                module: None,
-                source: None,
+                module: "Fixture".to_owned(),
+                kind: lean_semantic_search_contract::DeclarationKind::Theorem,
                 score: 180,
                 evidence: vec!["semantic:role_head:1".to_owned()],
             }],
