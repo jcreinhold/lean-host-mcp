@@ -819,9 +819,9 @@ impl ProjectBroker {
         meta: &LakeProjectMeta,
         options: LeanWorkerElabOptions,
     ) -> Result<LeanWorkerElabOptions> {
-        self.ensure_read(&meta.canonical_root).await?;
         // Find the worker before Lake runs the project's configuration. This
-        // reads metadata only, so a missing worker still comes first.
+        // reads metadata only, so a missing worker comes first. The lookup
+        // takes the request's read turn.
         let _worker = crate::project::resolve_worker(meta)?;
         let lean_options = self.module_options(&meta.canonical_root, &options.file_label).await?;
         Ok(options.lean_options(lean_options))

@@ -32,7 +32,6 @@ impl ProjectBroker {
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
         let root = self.resolve(&hint)?;
         let meta = self.meta(&root)?;
-        self.ensure_read(&root).await?;
         let file = request
             .goal
             .file_label

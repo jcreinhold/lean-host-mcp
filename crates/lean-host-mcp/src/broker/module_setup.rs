@@ -1,6 +1,10 @@
 //! File setup, module sources and module headers from the selected Lake. Keep
 //! Lake's original frame, including import visibility, plugin entry points
 //! and compiler options.
+//!
+//! Requirement: no Lake run here overlaps a build, and each runs under the
+//! same read turn as the check it serves. Every run goes through
+//! `lake_reader`, which takes the request's read turn on the project first.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
 use crate::cancellation::CallCancellation;
 use crate::envelope::TargetCheckNotStarted;
@@ -457,8 +461,8 @@ impl ProjectBroker {
         if root != meta.canonical_root {
             return Err(ServerError::BadProject("project selection changed".into()));
         }
-        // The read turn holds from setup-file until the check ends.
-        self.ensure_read(&root).await?;
+        // Setup-file takes the request's read turn, which holds until the
+        // check ends.
         let setup = self.setup_file(&root, Path::new(file), source).await?;
         let activity = self.preparation_activity();
         let reader = super::verify_file::PreparedReader::installed(meta)?;
@@ -478,7 +482,6 @@ impl ProjectBroker {
         file: &Path,
         source: &str,
     ) -> Result<(String, Vec<(String, PathBuf)>)> {
-        self.ensure_read(root).await?;
         let setup = parse_setup(&self.setup_file(root, file, source).await?.bytes)?;
         let imports = setup
             .import_arts
@@ -507,8 +510,9 @@ impl ProjectBroker {
     ///
     /// Lake reads [`NO_IMPORTS`] in place of the file's header, so it builds
     /// and checks no import. It returns [`ServerError::OutOfDate`] only when
-    /// the library's own needs, such as a plugin, must be built first. Any
-    /// other failure says that the check of `label` never started.
+    /// the library's own needs, such as a plugin, must be built first, and the
+    /// turn's own error when the request gets no turn. Any other failure says
+    /// that the check of `label` never started.
     pub(super) async fn module_options(&self, root: &Path, label: &str) -> Result<BTreeMap<String, LeanOptionValue>> {
         // Lake resolves a relative path against its working directory, the
         // root. A label in angle brackets names no file there, so Lake takes
@@ -526,7 +530,7 @@ impl ProjectBroker {
                 );
                 Ok(setup.options)
             }
-            Err(error @ ServerError::OutOfDate { .. }) => Err(error),
+            Err(error @ (ServerError::OutOfDate { .. } | ServerError::WorkerUnavailable(_))) => Err(error),
             Err(error) => Err(options_failed(label, error)),
         }
     }
@@ -547,7 +551,6 @@ impl ProjectBroker {
     /// What `lake setup-file FILE` prints with [`NO_IMPORTS`] in place of the
     /// file's header, under this request's read turn.
     async fn setup_without_imports(&self, root: &Path, label: &'static str, file: OsString) -> Result<ModuleSetup> {
-        self.ensure_read(root).await?;
         let args = vec!["setup-file".into(), file, NO_IMPORTS.into()];
         let (_, output) = self.lake_reader(root, label, args, &[0, NO_BUILD_EXIT]).await?;
         Ok(parse_setup(&setup_output(output)?)?)
@@ -631,9 +634,6 @@ impl ProjectBroker {
         }
         let mut answers: BTreeMap<String, Answer<Vec<String>>> = BTreeMap::new();
         // `lake query` with no target queries the default targets.
-        if !pending.is_empty() && !facets.is_empty() {
-            self.ensure_read(root).await?;
-        }
         while !pending.is_empty() && !facets.is_empty() {
             let mut args: Vec<OsString> = vec!["query".into(), "--json".into()];
             for module in &pending {
@@ -716,8 +716,13 @@ impl ProjectBroker {
 
     /// Run the project's `lake --no-build --no-cache ARGS` in `root` as a
     /// short run, with Lake's caches pointed at the run's private inputs, and
-    /// return the toolchain prefix with Lake's output. The run holds a share
-    /// of the request's read turn, so no build starts while Lake reads.
+    /// return the toolchain prefix with Lake's output.
+    ///
+    /// Every Lake run that reads the project for a request starts here, so
+    /// this is where it takes the request's read turn on `root`: Lake waits
+    /// for a running or queued build, and the check that follows in the same
+    /// request keeps the same turn. The run holds a share of the turn until
+    /// its process group has exited.
     async fn lake_reader(
         &self,
         root: &Path,
@@ -725,6 +730,7 @@ impl ProjectBroker {
         args: Vec<OsString>,
         accepted: &'static [i32],
     ) -> Result<(PathBuf, super::reader::ReaderOutput)> {
+        self.ensure_read(root).await?;
         let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(invalid)?;
         if id.window_verdict() != crate::toolchain::WindowVerdict::Supported {
             return Err(ServerError::BadProject(format!(
@@ -963,6 +969,104 @@ mod tests {
         );
         let stage = error.data.as_ref().and_then(|data| data.pointer("/target_check/stage"));
         assert_eq!(stage, Some(&serde_json::json!("lake_option_discovery")));
+        Ok(())
+    }
+
+    /// Run `lookup` as one request that waits at most `patience`, and keep
+    /// only how it failed. The lookup comes boxed, since some are large.
+    async fn as_request<T>(
+        patience: Duration,
+        lookup: std::pin::Pin<Box<impl std::future::Future<Output = Result<T>>>>,
+    ) -> Result<()> {
+        let request = tokio_util::sync::CancellationToken::new();
+        crate::cancellation::with_cancellation(&request, crate::cancellation::with_deadline(patience, lookup))
+            .await
+            .map(|_| ())
+    }
+
+    /// Each Lake lookup the server runs, on `file` in `root`, as its own
+    /// request that waits at most `patience`.
+    async fn lake_lookups(
+        broker: &ProjectBroker,
+        root: &Path,
+        file: &Path,
+        patience: Duration,
+    ) -> Vec<(&'static str, Result<()>)> {
+        let version = vec![OsString::from("--version")];
+        let modules = ["A".to_owned()];
+        vec![
+            (
+                "lake",
+                as_request(patience, Box::pin(broker.lake_reader(root, "Lake", version, &[0]))).await,
+            ),
+            (
+                "options",
+                as_request(patience, Box::pin(broker.module_options(root, "A.lean"))).await,
+            ),
+            (
+                "file module",
+                as_request(patience, Box::pin(broker.file_module(root, file))).await,
+            ),
+            (
+                "imports",
+                as_request(patience, Box::pin(broker.module_imports(root, file, ""))).await,
+            ),
+            (
+                "sources",
+                as_request(patience, Box::pin(broker.module_sources(root, &["A"]))).await,
+            ),
+            (
+                "inputs",
+                as_request(patience, Box::pin(broker.module_inputs(root, &["A"]))).await,
+            ),
+            (
+                "lookup",
+                as_request(patience, Box::pin(broker.unknown_modules(root, &modules))).await,
+            ),
+        ]
+    }
+
+    /// No Lake run overlaps a build. While a build holds the write turn, each
+    /// lookup waits until its deadline and names the build. Once the build
+    /// ends, each goes on to run Lake, which fails here since the root has no
+    /// `lean-toolchain`.
+    #[tokio::test]
+    async fn every_lake_run_waits_for_a_build() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let file = root.join("A.lean");
+        fs::write(&file, "")?;
+        let broker = ProjectBroker::new(super::super::BrokerConfig {
+            lake_root: Some(root.clone()),
+            ..super::super::BrokerConfig::unserved()
+        });
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or("deadline out of range")?;
+        let lock = broker.project_lock(&root);
+        let build = crate::project_lock::ensure_write(&lock, "build-1", deadline, &CallCancellation::default())
+            .await
+            .map_err(|refused| format!("the build got no turn: {refused:?}"))?;
+        for (lookup, result) in lake_lookups(&broker, &root, &file, Duration::from_millis(100)).await {
+            let Err(ServerError::WorkerUnavailable(info)) = result else {
+                return Err(format!("{lookup} did not wait for the build: {result:?}").into());
+            };
+            assert_eq!(
+                (info.reason.as_str(), info.blocked_by.as_deref()),
+                ("project_admission_timeout", Some("build-1")),
+                "{lookup}"
+            );
+        }
+        drop(build);
+        for (lookup, result) in lake_lookups(&broker, &root, &file, Duration::from_secs(5)).await {
+            let Err(error) = result else {
+                return Err(format!("{lookup} passed in a root with no toolchain").into());
+            };
+            assert!(
+                error.to_string().contains("lean-toolchain file not found"),
+                "{lookup}: {error}"
+            );
+        }
         Ok(())
     }
 

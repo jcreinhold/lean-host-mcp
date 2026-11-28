@@ -153,7 +153,6 @@ impl ProjectBroker {
         {
             return Err(invalid("unapproved verification path"));
         }
-        self.ensure_read(&root).await?;
         let (setup, reader, activity) = self
             .file_reader_with_setup(&hint, &meta, &options.file_label, &request.source)
             .await?;

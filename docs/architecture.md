@@ -438,7 +438,8 @@ reads does not refresh it.
 Lake still fetches what the library itself needs: its `extraDep` target, dynlibs and plugins. When one of them needs a
 build, Lake exits 3 under `--no-build`, and the check replies `needs_build` with Lake's targets. Any other failure stops
 the check before it starts: the error's `target_check.stage` is `lake_option_discovery`, and the message says no proof
-check ran. The server never retries with default options.
+check ran. A lookup that gets no read turn by its deadline replies `project_admission_timeout` instead, naming the build
+ahead of it. The server never retries with default options.
 
 The lookup is a short run (`broker/reader.rs`), like a file check: one program in its own process group, with capped
 output and Lake's cache directory pointed at the run's private directory under the store's `runs/`. Every short run
@@ -484,10 +485,12 @@ a call without an id keeps the old rule and is cancelled when its connection dro
 `project_lock.rs` gives each canonical Lake root one fair `tokio::sync::RwLock`. A request takes at most one turn and
 keeps it in a task-local slot, so a nested check in the same request reuses its read turn instead of queueing behind a
 waiting build. A check takes its read turn before it pins an actor or starts a short run, and holds it until the request
-ends. A short run whose group outlives its request keeps a share of that turn (`project_lock::read_share`) until the
-group exits. A build takes the write turn; a request that holds a read turn cannot take it. Tokio grants turns in
-arrival order, so a queued build holds back later checks, and each waiter keeps its place until its deadline. Each
-finished write turn adds one to the root's finished-build count.
+ends. Every Lake run that reads the project starts in one function, `lake_reader` (`broker/module_setup.rs`), which
+takes the request's read turn first, so no such run overlaps a build and the check it serves keeps the same turn. A
+short run whose group outlives its request keeps a share of that turn (`project_lock::read_share`) until the group
+exits. A build takes the write turn; a request that holds a read turn cannot take it. Tokio grants turns in arrival
+order, so a queued build holds back later checks, and each waiter keeps its place until its deadline. Each finished
+write turn adds one to the root's finished-build count.
 
 `lean_build` (`build.rs`, `tools/build.rs`) plans the run from the `[build]` and `[recipes]` config, takes the write
 turn, stops the project's workers and waits until each has exited (`ProjectBroker::stop_workers`), then runs the guard
@@ -532,6 +535,7 @@ that checks the code. "None yet" marks a gap.
 | At most `broker.max_lean_runs` short runs at once; a run that gets no permit by its deadline never starts. | `broker/reader.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `with_one_lean_run_two_file_checks_take_turns`, and `two_file_checks_run_lean_at_once` for the default of two |
 | A short run stops its whole group on cancel, at its time limit, past its output cap, or when its leader leaves members running, and its reply never waits on a process outside the group. | `lean_run.rs`: `a_cancelled_run_writes_no_inputs_and_never_starts`, `a_run_past_its_limit_stops_the_group`, `output_past_the_cap_stops_the_group`, `a_leftover_member_holding_stdout_open_is_stopped_without_waiting_for_eof` |
 | No build starts between a check's `setup-file` and its use of the imports. | `project_lock/tests.rs`: `a_nested_read_reuses_the_turn_while_a_writer_waits` |
+| No Lake run that reads the project overlaps a build: each takes the request's read turn first and waits behind a build. | `broker/module_setup.rs`: `every_lake_run_waits_for_a_build` |
 | The next server serves only after the last one's children exit: it stops each recorded group whose file lock is held, then waits for `children.lock`. | `children.rs`: `a_held_child_file_gets_its_group_stopped_and_the_lock_frees`, `a_free_children_lock_clears_stale_files_and_passes_to_children`; `tests/requests.rs`: `the_next_server_serves_only_after_a_killed_servers_build_exits`, `a_killed_servers_workers_exit_and_the_next_build_runs` |
 | A server never signals a group whose file lock is free. | `children.rs`: `a_child_file_whose_lock_is_free_is_never_signalled`, `stop_group_kills_members_a_leader_left_only_while_one_holds_the_lock` |
 | No worker slot returns while its worker may live, and a server killed while a worker starts takes no slot from the next server. | `tests/project_workers.rs`: `after_a_kill_during_worker_start_the_next_server_has_every_slot`; SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` tests reaping and slot counts in one server |

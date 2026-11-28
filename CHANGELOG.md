@@ -101,6 +101,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `findOLean` rule: the first shim root with a directory or `.olean` named for the module's first component holds it.
   Before, it called `lean_toolchain::olean_candidate`, which used the same rule. An entry the server cannot inspect
   still stops the check, now with the message `cannot inspect shim module prefix PATH`.
+- The one function that starts a Lake run to read a project now takes the request's read turn itself, so no such run can
+  start during a build, whichever caller asks. Before, each caller took the turn first. Replies are the same, except
+  that during a build a check now fails at once, not after the build, when its worker is missing or unusable or when its
+  file does not match the source it sent.
 
 ## [0.18.0] - 2026-11-27
 
