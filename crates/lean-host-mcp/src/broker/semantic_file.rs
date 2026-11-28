@@ -16,6 +16,10 @@ use std::{
 impl ProjectBroker {
     /// Rank declarations that may close the goal at one proof position.
     ///
+    /// The goal's module is the one Lake names for the file, and the search
+    /// reads that module's declarations first unless the file lies outside
+    /// every library.
+    ///
     /// # Errors
     ///
     /// Returns resolution, `lake setup-file`, semantic runtime, or short-run
@@ -24,7 +28,7 @@ impl ProjectBroker {
         &self,
         hint: ProjectHint,
         freshness: Vec<String>,
-        request: SemanticProofSearchRequest,
+        mut request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
         let root = self.resolve(&hint)?;
         let meta = self.meta(&root)?;
@@ -37,6 +41,11 @@ impl ProjectBroker {
         let (setup, mut reader, activity) = self
             .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
             .await?;
+        request.goal.module.clone_from(&setup.module);
+        request.candidate_modules.retain(|module| *module != setup.module);
+        if setup.module != super::module_setup::EXTERNAL_MODULE {
+            request.candidate_modules.insert(0, setup.module.clone());
+        }
         reader.roots = crate::lake_meta::manifest_artifact_roots(&root);
         reader.roots.push(reader.sysroot.join("lib/lean"));
         let PreparedReader { sysroot, roots, .. } = reader;

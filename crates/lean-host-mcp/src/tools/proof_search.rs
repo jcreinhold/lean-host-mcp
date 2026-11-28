@@ -23,14 +23,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::broker::{BrokerCall, ProjectHint};
 use crate::envelope::{Response, RuntimeFacts};
-use crate::error::{Result, ServerError};
+use crate::error::Result;
 use crate::projections::{
     DeclarationFlags, DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange,
     project_declaration_search,
 };
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::tools::position::ProofPositionSelector;
-use crate::tools::source_input::module_name_for_file;
 use crate::tools::{ToolContext, session_imports};
 use crate::trust::ArtifactTrust;
 
@@ -283,7 +282,7 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
         let hint = ProjectHint::from_request(req.project.clone());
         let root = ctx.broker.resolve(&hint)?;
         let input = crate::tools::source_input::read_query_file(&root, &file)?;
-        return source_profile(
+        return Ok(source_profile(
             &root,
             &input,
             &declaration,
@@ -291,7 +290,7 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
             &req.imports,
             explicit_text,
             limit,
-        );
+        ));
     }
 
     Ok(profile_from_text(
@@ -313,15 +312,14 @@ fn source_profile(
     requested_imports: &[String],
     explicit_text: String,
     limit: usize,
-) -> Result<TargetProfile> {
+) -> TargetProfile {
     let mut imports = input.imports.clone();
     for module in requested_imports {
         if !imports.contains(module) {
             imports.push(module.clone());
         }
     }
-    let semantic = semantic_request_for_source(root, input, declaration, position, None, &imports, limit)
-        .ok_or_else(|| ServerError::BadProject("cannot select semantic source module".into()))?;
+    let semantic = semantic_request_for_source(input, declaration, position, None, &imports, limit);
     let mut profile = profile_from_text(
         explicit_text,
         None,
@@ -333,7 +331,7 @@ fn source_profile(
     );
     profile.source_declaration = Some(declaration.to_owned());
     profile.source_fact = Some(ArtifactTrust::source_file_edit_fresh(root, &input.resolved, input.hash));
-    Ok(profile)
+    profile
 }
 
 fn profile_from_text(
@@ -365,31 +363,26 @@ fn profile_from_text(
     }
 }
 
+/// The semantic search for the goal at `proof_position` in `input`. The
+/// goal's module stays empty: the broker sets it to the module Lake names for
+/// the file and puts that module first among the candidates.
 fn semantic_request_for_source(
-    root: &std::path::Path,
     input: &crate::tools::source_input::QueryFile,
     declaration: &str,
     proof_position: &ProofPositionSelector,
     namespace: Option<String>,
     imports: &[String],
     limit: usize,
-) -> Option<SemanticProofSearchRequest> {
-    let module = module_name_for_file(root, &input.resolved)?;
-    let mut candidate_modules = Vec::new();
-    for candidate in std::iter::once(&module)
-        .chain(imports.iter())
-        .chain(input.imports.iter())
-    {
-        if !candidate_modules.iter().any(|existing| existing == candidate) {
+) -> SemanticProofSearchRequest {
+    let mut candidate_modules: Vec<String> = Vec::new();
+    for candidate in imports.iter().chain(input.imports.iter()) {
+        if !candidate_modules.contains(candidate) {
             candidate_modules.push(candidate.clone());
         }
     }
-    if candidate_modules.is_empty() {
-        return None;
-    }
-    Some(SemanticProofSearchRequest {
+    SemanticProofSearchRequest {
         goal: ProofGoalFeatureRequest {
-            module,
+            module: String::new(),
             source_text: input.source.clone(),
             file_label: Some(input.resolved.to_string_lossy().into_owned()),
             declaration: Some(short_declaration_name(declaration).to_owned()),
@@ -398,7 +391,7 @@ fn semantic_request_for_source(
         },
         candidate_modules,
         limit: limit.saturating_mul(3).clamp(10, 60),
-    })
+    }
 }
 
 fn short_declaration_name(declaration: &str) -> &str {
@@ -2023,8 +2016,15 @@ mod tests {
             &[],
             String::new(),
             DEFAULT_LIMIT,
-        )
-        .unwrap();
+        );
+
+        // The broker names the goal's module once Lake has named it.
+        let semantic = profile
+            .semantic
+            .as_ref()
+            .expect("a search from a file asks the semantic search");
+        assert_eq!(semantic.goal.module, "");
+        assert_eq!(semantic.candidate_modules, vec!["Init".to_owned()]);
 
         let fact = profile.source_fact.expect("a search from a file names the file");
         assert_eq!(fact.path.as_deref(), Some("Demo.lean"));

@@ -60,24 +60,6 @@ pub(crate) fn resolve_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-pub(crate) fn module_name_for_file(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    if relative.extension()? != "lean" {
-        return None;
-    }
-    let stemmed = relative.with_extension("");
-    let parts = stemmed
-        .components()
-        .map(|component| component.as_os_str().to_str())
-        .collect::<Option<Vec<_>>>()?;
-    if parts.is_empty() { None } else { Some(parts.join(".")) }
-}
-
-pub(crate) fn source_path_for_module(root: &Path, module: &str) -> PathBuf {
-    let relative: PathBuf = module.split('.').collect();
-    root.join(relative).with_extension("lean")
-}
-
 pub(crate) fn header_imports(source: &str) -> Vec<String> {
     source
         .lines()

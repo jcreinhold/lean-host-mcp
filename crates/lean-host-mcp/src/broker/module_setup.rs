@@ -1,6 +1,6 @@
-//! File setup and module sources from the selected Lake. Keep Lake's original
-//! frame, including import visibility, plugin entry points and compiler
-//! options.
+//! File setup, module sources and module headers from the selected Lake. Keep
+//! Lake's original frame, including import visibility, plugin entry points
+//! and compiler options.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
 use crate::cancellation::CallCancellation;
 use crate::envelope::TargetCheckNotStarted;
@@ -17,8 +17,18 @@ use std::{
 
 const SETUP_FILE: &str = "Lake setup-file";
 const MODULE_SOURCES: &str = "Lake module sources";
+const MODULE_INPUTS: &str = "Lake module inputs";
 const MODULE_LOOKUP: &str = "Lake module lookup";
+const FILE_MODULE: &str = "Lake file module";
 const OPTION_DISCOVERY: &str = "Lake option discovery";
+
+/// The module name Lake gives a file outside every library
+/// (`setupExternalModule`, `Lake/Build/Module.lean`).
+pub(super) const EXTERNAL_MODULE: &str = "_unknown";
+
+/// The line `reportResult` (`Lake/Build/Run.lean`) prints before it lists
+/// the jobs that failed, one `- NAME` line each.
+const FAILURES_HEADER: &str = "Some required targets logged failures:";
 
 /// The header `lake setup-file` reads in place of the file's own when it
 /// looks up options. It imports nothing, so Lake builds and checks no import,
@@ -36,14 +46,45 @@ const FAILURE_EXIT: i32 = 1;
 /// gives up on telling a typo from an unbuilt module.
 const LOOKUP_LIMIT: usize = 8;
 
-/// The names of the jobs that failed: `reportResult` (`Lake/Build/Run.lean`)
-/// prints this line, then one `- NAME` line per failed job.
+/// The names of the jobs that failed, as Lake lists them under
+/// [`FAILURES_HEADER`].
 fn failed_jobs(stderr: &str) -> impl Iterator<Item = &str> {
     stderr
         .lines()
-        .skip_while(|line| *line != "Some required targets logged failures:")
+        .skip_while(|line| *line != FAILURES_HEADER)
         .skip(1)
         .map_while(|line| line.strip_prefix("- "))
+}
+
+/// Whether `line` opens a job's report, `{icon} [{done}/{total}] {verb}
+/// {caption}` (`reportJob`, `Lake/Build/Run.lean`).
+fn opens_job_report(line: &str) -> bool {
+    let is_count = |count: &str| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit());
+    line.split_once(" [").is_some_and(|(icon, rest)| {
+        icon.chars().count() == 1
+            && rest
+                .split_once(']')
+                .and_then(|(counts, _)| counts.split_once('/'))
+                .is_some_and(|(done, total)| is_count(done) && is_count(total))
+    })
+}
+
+/// What Lake logged for the job named `job`: the lines under its report, up
+/// to the next report or the list of failed jobs.
+fn job_log(stderr: &str, job: &str) -> Option<String> {
+    let caption = format!(" {job}");
+    let mut lines = stderr.lines();
+    // A report may end with the job's time, as ` (12ms)`.
+    lines.find(|line| {
+        opens_job_report(line)
+            && line
+                .split_once(&caption)
+                .is_some_and(|(_, rest)| rest.is_empty() || rest.starts_with(" ("))
+    })?;
+    let log: Vec<&str> = lines
+        .take_while(|line| !opens_job_report(line) && *line != FAILURES_HEADER)
+        .collect();
+    Some(log.join("\n"))
 }
 
 /// The setup Lake printed, or [`ServerError::OutOfDate`] naming the targets
@@ -93,6 +134,66 @@ fn names_no_module(module: &str, stderr: &str) -> bool {
                     .strip_prefix("file: ")
                     .is_some_and(|path| path.ends_with(&source))
             }))
+}
+
+/// Why Lake gave no answer for a module a query named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NoAnswer {
+    /// No package in the workspace holds a module by this name, or the
+    /// library whose roots cover the name has no source file for it. Holds
+    /// what Lake printed.
+    Unknown(String),
+    /// Lake knows the module but could not answer, for example because its
+    /// header does not parse. Holds what Lake printed about the module.
+    Failed(String),
+}
+
+impl NoAnswer {
+    /// What Lake printed.
+    pub(crate) fn output(&self) -> &str {
+        match self {
+            Self::Unknown(output) | Self::Failed(output) => output,
+        }
+    }
+}
+
+/// Lake's answer for one module, or why it gave none.
+pub(crate) type Answer<T> = std::result::Result<T, NoAnswer>;
+
+/// The modules of `pending` that a failed `lake query` of `facets` names,
+/// each with why Lake gave no answer. Lake stops at the first name no
+/// package holds (`parseTargetSpecs`, `Lake/CLI/Build.lean`), so that name
+/// comes alone; otherwise each failed job names its module, and the job's
+/// log says whether the module's source is missing.
+fn missing_modules(pending: &[&str], facets: &[&str], stderr: &str) -> Vec<(String, NoAnswer)> {
+    if let Some(module) = pending
+        .iter()
+        .find(|module| stderr.contains(&format!("unknown module `{module}`")))
+    {
+        return vec![((*module).to_owned(), NoAnswer::Unknown(stderr.trim().to_owned()))];
+    }
+    let mut settled: Vec<(String, NoAnswer)> = Vec::new();
+    for job in failed_jobs(stderr) {
+        let Some(module) = pending.iter().find(|module| {
+            facets.iter().any(|facet| {
+                let spec = format!("{module}:{facet}");
+                job == spec || job.ends_with(&format!("/{spec}"))
+            })
+        }) else {
+            continue;
+        };
+        if settled.iter().any(|(known, _)| known == *module) {
+            continue;
+        }
+        let log = job_log(stderr, job).unwrap_or_else(|| stderr.trim().to_owned());
+        let why = if names_no_module(module, &log) {
+            NoAnswer::Unknown(log)
+        } else {
+            NoAnswer::Failed(log)
+        };
+        settled.push(((*module).to_owned(), why));
+    }
+    settled
 }
 
 /// The error for an option lookup for `file_label` that failed with `error`.
@@ -161,6 +262,9 @@ impl Identity {
 /// file it names, taken when Lake answered.
 pub(crate) struct StagedSetup {
     pub(crate) bytes: Vec<u8>,
+    /// The module Lake names for the file: [`EXTERNAL_MODULE`] for a file
+    /// outside every library.
+    pub(crate) module: String,
     pub(crate) options: BTreeMap<String, LeanOptionValue>,
     sysroot: PathBuf,
     /// The project's package roots ([`crate::lake_meta::manifest_package_roots`]).
@@ -193,24 +297,69 @@ impl StagedSetup {
     }
 }
 
-/// The `count` paths `lake query --json` printed, one JSON string a line, as
-/// canonical paths.
-fn parse_sources(stdout: &[u8], count: usize) -> io::Result<Vec<PathBuf>> {
-    let text = std::str::from_utf8(stdout).map_err(|_| invalid_data("Lake module sources are not UTF-8"))?;
-    let sources = text
-        .lines()
-        .map(|line| {
-            let path: PathBuf = serde_json::from_str(line)
-                .map_err(|error| invalid_data(format!("invalid Lake module source: {error}")))?;
-            path.canonicalize()
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    if sources.len() != count {
-        return Err(invalid_data(
-            "Lake named a different number of module sources than asked",
-        ));
+/// The `count` results `lake query --json` printed, one line of JSON each.
+fn query_lines(stdout: &[u8], count: usize) -> io::Result<Vec<String>> {
+    let text = std::str::from_utf8(stdout).map_err(|_| invalid_data("Lake query output is not UTF-8"))?;
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    if lines.len() != count {
+        return Err(invalid_data("Lake printed a different number of results than asked"));
     }
-    Ok(sources)
+    Ok(lines)
+}
+
+/// The source path `lake query --json +MODULE:lean` printed, made canonical.
+fn parse_source(line: &str) -> io::Result<PathBuf> {
+    let path: PathBuf =
+        serde_json::from_str(line).map_err(|error| invalid_data(format!("invalid Lake module source: {error}")))?;
+    path.canonicalize()
+}
+
+/// One import a module's header lists (`Lean.Import`).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HeaderImport {
+    pub(crate) module: String,
+    /// `import all`: the import exposes the module's private data too.
+    pub(crate) import_all: bool,
+    /// `public import`: files that import this module see the import too.
+    /// True for every import of a file outside the module system.
+    pub(crate) is_exported: bool,
+    /// `meta import`: Lean also imports the compiled code of every
+    /// definition the import reaches.
+    pub(crate) is_meta: bool,
+}
+
+/// A module's header as `lake query --json +MODULE:header` prints it
+/// (`Lean.ModuleHeader`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Header {
+    imports: Vec<HeaderImport>,
+    #[serde(rename = "isModule")]
+    _is_module: bool,
+}
+
+/// A module's source file and the imports its header lists, as Lake reads
+/// them.
+pub(crate) struct ModuleInputs {
+    pub(crate) source: PathBuf,
+    /// In header order, with the `Init` that every file without `prelude`
+    /// imports: Lean lists it twice, once as a `meta` import.
+    pub(crate) imports: Vec<HeaderImport>,
+}
+
+/// The source and header `lake query --json +MODULE:lean +MODULE:header`
+/// printed for one module.
+fn parse_inputs(lines: &[String]) -> io::Result<ModuleInputs> {
+    let [source, header] = lines else {
+        return Err(invalid_data("Lake printed the wrong number of module facets"));
+    };
+    let header: Header =
+        serde_json::from_str(header).map_err(|error| invalid_data(format!("invalid Lake module header: {error}")))?;
+    Ok(ModuleInputs {
+        source: parse_source(source)?,
+        imports: header.imports,
+    })
 }
 
 fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
@@ -284,6 +433,7 @@ pub(crate) fn stage(
     }
     Ok(StagedSetup {
         bytes,
+        module: setup.name,
         options: setup.options,
         inputs,
         packages: packages.to_vec(),
@@ -360,7 +510,6 @@ impl ProjectBroker {
     /// the library's own needs, such as a plugin, must be built first. Any
     /// other failure says that the check of `label` never started.
     pub(super) async fn module_options(&self, root: &Path, label: &str) -> Result<BTreeMap<String, LeanOptionValue>> {
-        self.ensure_read(root).await?;
         // Lake resolves a relative path against its working directory, the
         // root. A label in angle brackets names no file there, so Lake takes
         // it for a file outside every library.
@@ -369,15 +518,7 @@ impl ProjectBroker {
         } else {
             root.join(label).into_os_string()
         };
-        let args = vec!["setup-file".into(), file, NO_IMPORTS.into()];
-        let lookup: Result<ModuleSetup> = async {
-            let (_, output) = self
-                .lake_reader(root, OPTION_DISCOVERY, args, &[0, NO_BUILD_EXIT])
-                .await?;
-            Ok(parse_setup(&setup_output(output)?)?)
-        }
-        .await;
-        match lookup {
+        match self.setup_without_imports(root, OPTION_DISCOVERY, file).await {
             Ok(setup) => {
                 tracing::debug!(
                     root = %root.display(), module = %setup.name, lean_options = ?setup.options,
@@ -390,19 +531,65 @@ impl ProjectBroker {
         }
     }
 
+    /// The module Lake names for `file`, or `None` for a file outside every
+    /// library, as `lake setup-file` reports it under this request's read
+    /// turn. Lake reads [`NO_IMPORTS`] in place of the file's header, so it
+    /// builds and checks no import; it returns [`ServerError::OutOfDate`]
+    /// only when the library's own needs, such as a plugin, must be built
+    /// first.
+    pub(crate) async fn file_module(&self, root: &Path, file: &Path) -> Result<Option<String>> {
+        let setup = self
+            .setup_without_imports(root, FILE_MODULE, file.as_os_str().to_owned())
+            .await?;
+        Ok((setup.name != EXTERNAL_MODULE).then_some(setup.name))
+    }
+
+    /// What `lake setup-file FILE` prints with [`NO_IMPORTS`] in place of the
+    /// file's header, under this request's read turn.
+    async fn setup_without_imports(&self, root: &Path, label: &'static str, file: OsString) -> Result<ModuleSetup> {
+        self.ensure_read(root).await?;
+        let args = vec!["setup-file".into(), file, NO_IMPORTS.into()];
+        let (_, output) = self.lake_reader(root, label, args, &[0, NO_BUILD_EXIT]).await?;
+        Ok(parse_setup(&setup_output(output)?)?)
+    }
+
     /// The source file Lake reads for each of `modules`, in order, as
     /// `lake query +MODULE:lean` reports it under this request's read turn:
-    /// the module's path under its library's `srcDir`. Lake builds nothing.
-    pub(crate) async fn module_sources(&self, root: &Path, modules: &[&str]) -> Result<Vec<PathBuf>> {
-        if modules.is_empty() {
-            // `lake query` with no target queries the default targets.
-            return Ok(Vec::new());
+    /// the module's path under its library's `srcDir`, or why Lake named
+    /// none. Lake builds nothing.
+    pub(crate) async fn module_sources(&self, root: &Path, modules: &[&str]) -> Result<Vec<Answer<PathBuf>>> {
+        let answers = self.query_modules(root, MODULE_SOURCES, modules, &["lean"]).await?;
+        let mut sources = Vec::with_capacity(answers.len());
+        for answer in answers {
+            sources.push(match answer {
+                Ok(lines) => {
+                    let [source] = lines.as_slice() else {
+                        return Err(invalid_data("Lake printed the wrong number of module facets").into());
+                    };
+                    Ok(parse_source(source)?)
+                }
+                Err(why) => Err(why),
+            });
         }
-        self.ensure_read(root).await?;
-        let mut args: Vec<OsString> = vec!["query".into(), "--json".into()];
-        args.extend(modules.iter().map(|module| format!("+{module}:lean").into()));
-        let (_, output) = self.lake_reader(root, MODULE_SOURCES, args, &[0]).await?;
-        Ok(parse_sources(&output.stdout, modules.len())?)
+        Ok(sources)
+    }
+
+    /// The source file of each of `modules` and the imports its header
+    /// lists, in order, as `lake query +MODULE:lean +MODULE:header` reports
+    /// them under this request's read turn, or why Lake gave none. Lake reads
+    /// each header and builds nothing.
+    pub(crate) async fn module_inputs(&self, root: &Path, modules: &[&str]) -> Result<Vec<Answer<ModuleInputs>>> {
+        let answers = self
+            .query_modules(root, MODULE_INPUTS, modules, &["lean", "header"])
+            .await?;
+        let mut inputs = Vec::with_capacity(answers.len());
+        for answer in answers {
+            inputs.push(match answer {
+                Ok(lines) => Ok(parse_inputs(&lines)?),
+                Err(why) => Err(why),
+            });
+        }
+        Ok(inputs)
     }
 
     /// Which of `modules` name no module, as `lake query +MODULE:lean` tells
@@ -410,41 +597,67 @@ impl ProjectBroker {
     /// is not one of them. Lake builds nothing. Only the first
     /// [`LOOKUP_LIMIT`] names are looked up.
     async fn unknown_modules(&self, root: &Path, modules: &[String]) -> Result<Vec<String>> {
-        let modules = modules.get(..LOOKUP_LIMIT).unwrap_or(modules);
-        if modules.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.ensure_read(root).await?;
-        let query = |modules: &[String]| {
-            let mut args: Vec<OsString> = vec!["query".into()];
-            args.extend(modules.iter().map(|module| format!("+{module}:lean").into()));
-            args
-        };
-        // One name Lake cannot find fails the whole query, so a batch that
-        // passes clears every name at once.
-        if modules.len() > 1 {
-            let (_, output) = self
-                .lake_reader(root, MODULE_LOOKUP, query(modules), &[0, FAILURE_EXIT])
-                .await?;
-            if output.exit_code == 0 {
-                return Ok(Vec::new());
-            }
-        }
-        let mut unknown = Vec::new();
+        let modules: Vec<&str> = modules.iter().take(LOOKUP_LIMIT).map(String::as_str).collect();
+        let answers = self.query_modules(root, MODULE_LOOKUP, &modules, &["lean"]).await?;
+        Ok(modules
+            .iter()
+            .zip(answers)
+            .filter(|(_, answer)| matches!(answer, Err(NoAnswer::Unknown(_))))
+            .map(|(module, _)| (*module).to_owned())
+            .collect())
+    }
+
+    /// Lake's answers to `lake query --json +MODULE:FACET` for each of
+    /// `facets` and each of `modules`, in order, under this request's read
+    /// turn: one line of JSON per facet, or why Lake gave none. Lake builds
+    /// nothing.
+    ///
+    /// One name Lake cannot answer fails the whole query, which then prints
+    /// nothing, so the names a failed run settles leave the batch and the
+    /// rest run again. Lake stops at the first name no package holds, so each
+    /// such name costs a run of its own; one run settles every failed job.
+    async fn query_modules(
+        &self,
+        root: &Path,
+        label: &'static str,
+        modules: &[&str],
+        facets: &[&str],
+    ) -> Result<Vec<Answer<Vec<String>>>> {
+        let mut pending: Vec<&str> = Vec::new();
         for module in modules {
-            let (_, output) = self
-                .lake_reader(
-                    root,
-                    MODULE_LOOKUP,
-                    query(std::slice::from_ref(module)),
-                    &[0, FAILURE_EXIT],
-                )
-                .await?;
-            if output.exit_code == FAILURE_EXIT && names_no_module(module, &output.stderr) {
-                unknown.push(module.clone());
+            if !pending.contains(module) {
+                pending.push(module);
             }
         }
-        Ok(unknown)
+        let mut answers: BTreeMap<String, Answer<Vec<String>>> = BTreeMap::new();
+        // `lake query` with no target queries the default targets.
+        if !pending.is_empty() && !facets.is_empty() {
+            self.ensure_read(root).await?;
+        }
+        while !pending.is_empty() && !facets.is_empty() {
+            let mut args: Vec<OsString> = vec!["query".into(), "--json".into()];
+            for module in &pending {
+                args.extend(facets.iter().map(|facet| OsString::from(format!("+{module}:{facet}"))));
+            }
+            let (_, output) = self.lake_reader(root, label, args, &[0, FAILURE_EXIT]).await?;
+            if output.exit_code == 0 {
+                let lines = query_lines(&output.stdout, pending.len().saturating_mul(facets.len()))?;
+                for (module, values) in pending.iter().zip(lines.chunks(facets.len())) {
+                    answers.insert((*module).to_owned(), Ok(values.to_vec()));
+                }
+                break;
+            }
+            let settled = missing_modules(&pending, facets, &output.stderr);
+            if settled.is_empty() {
+                return Err(output.exit_error(label));
+            }
+            answers.extend(settled.into_iter().map(|(module, why)| (module, Err(why))));
+            pending.retain(|module| !answers.contains_key(*module));
+        }
+        Ok(modules
+            .iter()
+            .map(|module| answers.get(*module).cloned().unwrap_or_else(|| Ok(Vec::new())))
+            .collect())
     }
 
     /// `err`, or [`ServerError::UnknownImports`] when the module whose
@@ -565,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn sources_parse_one_json_path_a_line_and_must_all_be_there() -> io::Result<()> {
+    fn query_results_are_one_line_each_and_must_all_be_there() -> io::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
         fs::create_dir_all(root.join("src/Inner"))?;
@@ -576,13 +789,97 @@ mod tests {
             + "\n"
             + &serde_json::to_string(&root.join("././A.lean"))?
             + "\n";
-        assert_eq!(
-            parse_sources(stdout.as_bytes(), 2)?,
-            [root.join("src/Inner/X.lean"), root.join("A.lean")]
-        );
-        assert!(parse_sources(stdout.as_bytes(), 3).is_err());
-        assert!(parse_sources(b"null\n", 1).is_err());
+        let lines = query_lines(stdout.as_bytes(), 2)?;
+        let sources = lines
+            .iter()
+            .map(|line| parse_source(line))
+            .collect::<io::Result<Vec<_>>>()?;
+        assert_eq!(sources, [root.join("src/Inner/X.lean"), root.join("A.lean")]);
+        assert!(query_lines(stdout.as_bytes(), 3).is_err());
+        assert!(parse_source("null").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_header_parses_as_lake_prints_it() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().canonicalize()?.join("Strict.lean");
+        fs::write(&source, "import Loose\n")?;
+        // What Lake 4.36 prints for `+Strict:lean +Strict:header`.
+        let header = r#"{"imports":[{"importAll":false,"isExported":true,"isMeta":false,"module":"Init"},{"importAll":false,"isExported":true,"isMeta":true,"module":"Init"},{"importAll":false,"isExported":true,"isMeta":false,"module":"Loose"}],"isModule":false}"#;
+        let inputs = parse_inputs(&[serde_json::to_string(&source)?, header.to_owned()])?;
+        assert_eq!(inputs.source, source);
+        let imports: Vec<(&str, bool)> = inputs
+            .imports
+            .iter()
+            .map(|import| (import.module.as_str(), import.is_meta))
+            .collect();
+        assert_eq!(imports, [("Init", false), ("Init", true), ("Loose", false)]);
+        assert!(parse_inputs(&[serde_json::to_string(&source)?]).is_err());
+        assert!(parse_inputs(&[serde_json::to_string(&source)?, r#"{"imports":[]}"#.to_owned()]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_query_settles_the_unknown_name_lake_stopped_at() {
+        // What Lake 4.36 prints for `+Strict:lean +Init:lean +Loose:lean`.
+        let stderr = "error: unknown module `Init`\n";
+        assert_eq!(
+            missing_modules(&["Strict", "Init", "Loose"], &["lean"], stderr),
+            [(
+                "Init".to_owned(),
+                NoAnswer::Unknown("error: unknown module `Init`".to_owned())
+            )]
+        );
+        assert!(missing_modules(&["Strict", "Ini"], &["lean"], stderr).is_empty());
+    }
+
+    #[test]
+    fn a_failed_query_settles_each_failed_job_from_its_own_log() {
+        // What Lake 4.36 prints for `+Strict.Missing:lean +Strict.Bad:header
+        // +Loose:lean`, where `Strict.Missing` has no source file and
+        // `Strict/Bad.lean` holds a bare `import`.
+        let stderr = "✖ [1/3] Running options_test/Strict.Missing:lean\n\
+                      error: no such file or directory (error code: 2)\n  \
+                      file: /p/./Strict/Missing.lean\n\
+                      ✖ [2/3] Running options_test/Strict.Bad:header\n\
+                      error: /p/./Strict/Bad.lean:2:0: unexpected end of input\n\
+                      Some required targets logged failures:\n\
+                      - options_test/Strict.Missing:lean\n\
+                      - options_test/Strict.Bad:header\n\
+                      error: build failed\n";
+        assert_eq!(
+            job_log(stderr, "options_test/Strict.Bad:header").as_deref(),
+            Some("error: /p/./Strict/Bad.lean:2:0: unexpected end of input")
+        );
+        assert_eq!(job_log(stderr, "options_test/Strict:header"), None);
+        assert_eq!(
+            missing_modules(&["Strict.Missing", "Strict.Bad", "Loose"], &["lean", "header"], stderr),
+            [
+                (
+                    "Strict.Missing".to_owned(),
+                    NoAnswer::Unknown(
+                        "error: no such file or directory (error code: 2)\n  file: /p/./Strict/Missing.lean".to_owned()
+                    )
+                ),
+                (
+                    "Strict.Bad".to_owned(),
+                    NoAnswer::Failed("error: /p/./Strict/Bad.lean:2:0: unexpected end of input".to_owned())
+                ),
+            ]
+        );
+        // A failure that names no pending module settles nothing.
+        assert!(missing_modules(&["Loose"], &["lean", "header"], stderr).is_empty());
+        assert!(missing_modules(&["Loose"], &["lean"], "error: could not load the workspace\n").is_empty());
+    }
+
+    #[test]
+    fn job_reports_have_an_icon_and_counts() {
+        assert!(opens_job_report("✖ [2/3] Running options_test/Strict.Missing:lean"));
+        assert!(opens_job_report("⚠ [10/12] Built Demo.A (1.2s)"));
+        assert!(!opens_job_report("error: [2/3] not a report"));
+        assert!(!opens_job_report("✖ [2/] Running A"));
+        assert!(!opens_job_report("- options_test/Strict.Missing:lean"));
     }
 
     #[test]
@@ -743,6 +1040,73 @@ mod tests {
         Ok(())
     }
 
+    /// Lake names each module's source under its library's `srcDir` and
+    /// reads its header; a name no package holds, a name with no source file
+    /// and a header that does not parse each get their own answer, and the
+    /// other names still get Lake's. Lake builds nothing.
+    #[tokio::test]
+    #[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE"]
+    async fn module_inputs_are_what_lake_reads() -> TestResult {
+        let (_dir, root) = options_project()?;
+        fs::create_dir_all(root.join("Strict"))?;
+        fs::write(root.join("Strict/Bad.lean"), "import\n")?;
+        let broker = ProjectBroker::new(super::super::BrokerConfig {
+            lake_root: Some(root.clone()),
+            ..super::super::BrokerConfig::unserved()
+        });
+        let names = ["Strict", "Init", "Loose", "Strict.Missing", "Strict.Bad", "Strict"];
+        let started = std::time::Instant::now();
+        let inputs = broker.module_inputs(&root, &names).await?;
+        // Three runs: `Init` stops the first, two failed jobs the second.
+        eprintln!("Lake's module inputs took {:?}", started.elapsed());
+        let [strict, init, loose, missing, bad, again] = inputs.as_slice() else {
+            return Err("one answer per name".into());
+        };
+        let imports = |answer: &Answer<ModuleInputs>| -> TestResult<(PathBuf, Vec<String>)> {
+            let inputs = answer.as_ref().map_err(|why| format!("no answer: {why:?}"))?;
+            Ok((
+                inputs.source.clone(),
+                inputs.imports.iter().map(|import| import.module.clone()).collect(),
+            ))
+        };
+        assert_eq!(
+            imports(strict)?,
+            (
+                root.join("Strict.lean"),
+                vec!["Init".into(), "Init".into(), "Loose".into()]
+            )
+        );
+        assert_eq!(imports(again)?, imports(strict)?);
+        assert_eq!(
+            imports(loose)?,
+            (root.join("src/Loose.lean"), vec!["Init".into(), "Init".into()])
+        );
+        assert!(matches!(init, Err(NoAnswer::Unknown(output)) if output.contains("unknown module `Init`")));
+        assert!(matches!(missing, Err(NoAnswer::Unknown(output)) if output.contains("Strict/Missing.lean")));
+        assert!(matches!(bad, Err(NoAnswer::Failed(output)) if output.contains("unexpected end of input")));
+
+        let sources = broker.module_sources(&root, &["Loose"]).await?;
+        assert!(matches!(sources.as_slice(), [Ok(path)] if *path == root.join("src/Loose.lean")));
+        assert_eq!(
+            broker
+                .unknown_modules(&root, &["Strict.Missing".into(), "Loose".into(), "Init".into()])
+                .await?,
+            ["Strict.Missing", "Init"]
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            broker
+                .file_module(&root, &root.join("src/Loose.lean"))
+                .await?
+                .as_deref(),
+            Some("Loose")
+        );
+        eprintln!("Lake's file module took {:?}", started.elapsed());
+        assert_eq!(broker.file_module(&root, &root.join("Outside.lean")).await?, None);
+        assert!(!root.join(".lake/build").exists(), "Lake built something");
+        Ok(())
+    }
+
     #[test]
     fn reader_refuses_replaced_artifact_even_with_identical_bytes() -> io::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -753,6 +1117,7 @@ mod tests {
         fs::write(&leaf, b"same bytes")?;
         let setup = StagedSetup {
             bytes: Vec::new(),
+            module: "Dep".to_owned(),
             options: BTreeMap::new(),
             sysroot: root.join("release"),
             packages: crate::lake_meta::manifest_package_roots(&root),

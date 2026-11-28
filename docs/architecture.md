@@ -28,7 +28,7 @@ crates/lean-host-mcp/src/
   broker.rs              ProjectBroker: the served root, worker slots, short-run permits, idle retirement, the reaper
   broker/control.rs      worker activity snapshots for lean_runtime, and the activity count
   broker/host_artifacts.rs the installed shims a worker reads before it opens
-  broker/module_setup.rs lake setup-file and lake query as short runs; a file's options, the import closure and module sources
+  broker/module_setup.rs lake setup-file and lake query as short runs; a file's options and module, the import closure, module sources and headers
   broker/reader.rs       reader runs: the permit, read share and exit codes of each short run a check starts
   broker/semantic_file.rs file-backed semantic proof search through a short run
   broker/verify_file.rs  file checks through one-shot Lean programs
@@ -306,23 +306,25 @@ usage sites within that module's source. Project-scope `lean_lookup(kind="refere
 re-elaborating every source file; the former worker scan took about 3 s/file, or 27 minutes for 500 modules.
 
 `references_to` and `declarations_in_module` use `serde_json` and `walkdir`, adding no Lean linkage or worker
-capability. Raw JSON types and path mapping stay private.
+capability. Raw JSON types stay private. The reader maps no module to a file: each index names its module, and the
+caller asks Lake for the module's source with `lake query +MODULE:lean`, which knows each library's `srcDir`.
 
 Callers hold the project's read turn, so no build writes an index while it is read. Reference scans return `NotBuilt`
 when the build directory is absent, or `Present` after a scan. Declaration queries distinguish an absent project build
 tree, an absent/unreadable module index, and a parsed index. Callers translate these outcomes into public statuses,
 warnings, and artifact trust facts.
 
-`ReferenceIndex` carries hits, parsed/skipped module counts, and `stale_sources`. An unreadable, malformed, unsupported,
-or uncovered individual index is skipped and counted. Staleness checks compare source/index mtimes only for modules that
-contributed hits; missing metadata is treated as not stale. This is a limited build-freshness observation, not an exact
-source-content binding. `ReferenceLocation` carries the source file, definition/reference kind, and 0-based LSP
-coordinates.
+`ReferenceIndex` groups hits by module, each group with its index path, and counts parsed and skipped modules. An
+unreadable, malformed, or unsupported individual index is skipped and counted. `ReferenceLocation` carries the
+definition/reference kind and 0-based LSP coordinates.
 
-A `files` restriction narrows reads only when every source path maps unambiguously to an existing index. Paths outside
-the project, dotted components, non-`.lean` extensions, and missing computed indices trigger a full walk. The caller
-still filters the returned hits to the requested files, so uncertain filename mapping cannot silently omit a match. The
-recursive walk covers the project's build directory, excluding dependency indices under `.lake/packages/`.
+The caller asks Lake for the source of every module with hits in one `lake query`, which runs only when there are hits.
+Staleness checks compare source/index mtimes only for those modules; missing metadata is treated as not stale. This is a
+limited build-freshness observation, not an exact source-content binding. A module Lake names no source for, as one a
+deleted or renamed file leaves, contributes no hits, and a warning names it.
+
+A `files` restriction filters hits by the source Lake names; every index is still read. The recursive walk covers the
+project's build directory, excluding dependency indices under `.lake/packages/`.
 
 ### Scan performance evidence
 
@@ -333,16 +335,20 @@ hot name with 9095 hits before the result cap:
 | --- | --- | --- |
 | Whole project, hot name | 427 ms | ~120 ms |
 | Whole project, no hits | 478 ms | ~136 ms |
-| One requested file | 271 ms | ~0.5 ms |
 
 A phase split on the same corpus measured `stat` at 0.010 s, reads at 0.066 s, and parsing at 1.32 s: about 95% of the
-original cost was parsing. The reader therefore parses once, projects `references` and `decls` separately, filters
-reference-map entries during deserialization, and narrows index reads for file-restricted queries. Allocation scales
-with matching entries rather than all ~400k entries in that corpus. It retains no cache between calls.
+original cost was parsing. The reader therefore parses once, projects `references` and `decls` separately, and filters
+reference-map entries during deserialization. Allocation scales with matching entries rather than all ~400k entries in
+that corpus. It retains no cache between calls.
 
-The scan remains serial and runs under `spawn_blocking` to keep file I/O and parsing off tokio workers. Serial order
-also keeps the user-visible stale-source warning order stable. Revisit parallelism if a real whole-project scan exceeds
-about one second. These figures are historical measurements, not checks rerun during this documentation cleanup.
+A request for one file once read only that file's index, in about 0.5 ms. That narrowing turned paths into module names
+by hand, which fails for a library with its own `srcDir`, so it is gone: such a request now reads every index, then runs
+one `lake query` for the sources, about 0.4 s on the test projects.
+
+The scan remains serial and runs under `spawn_blocking` to keep file I/O and parsing off tokio workers. The reply sorts
+hits and the names in its warnings, so their order does not depend on the walk. Revisit parallelism if a real
+whole-project scan exceeds about one second. These figures are historical measurements, not checks rerun during this
+documentation cleanup.
 
 ### Supported v5 schema
 
@@ -368,9 +374,8 @@ Each module is one JSON object:
 ```
 
 For a requested name `N`, reference parsing keeps constant keys with `n == N`, emits a non-null `definition` as `def`
-and each usage as `ref`, and resolves all locations against that index's module source (`Demo.A` becomes
-`<root>/Demo/A.lean`). Definition and usage ranges accept four coordinates plus an optional fifth parent-declaration
-string. Declaration ranges require exactly eight coordinates.
+and each usage as `ref`, and groups the locations under the index's `module`. Definition and usage ranges accept four
+coordinates plus an optional fifth parent-declaration string. Declaration ranges require exactly eight coordinates.
 
 In the measured corpus, `references` occupied about 97% of bytes and `decls` about 3%. Separate projections skip the
 unneeded subtree, so a valid JSON document with an unexpected `decls` shape does not break reference lookup, and the
@@ -381,8 +386,8 @@ JSON sorts object keys, placing `version` last: in one sample it began at byte 1
 probe would therefore scan nearly every byte twice. Only a parse failure triggers a second, version-only probe, which
 can still classify an unfamiliar future shape as `UnsupportedVersion` rather than malformed JSON.
 
-Tests in `ilean.rs` cover version-last objects, future versions with unreadable shapes, independent projections,
-narrowing/fallback behavior, exact array arities, and stale-source reporting.
+Tests in `ilean.rs` cover version-last objects, future versions with unreadable shapes, independent projections, hit
+groups by module, exact array arities, and the source/index mtime comparison.
 
 ## Lake compilation options
 
@@ -466,8 +471,9 @@ or the build's deadline stops the running step's whole group. The next check sta
 nothing still stops the workers. The turn ends only after each step's group has exited, so no check starts while a
 process of the build still runs. Lake decides what to build and in which order; the server checks only the words it
 hands to Lake. Do not add an import graph walk or a build scheduler: a test scans the build path for Lake's import-graph
-queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build`, and the sources of the
-modules the root built from one `lake query +MODULE:lean`, under a read turn.
+queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build`, the sources of the
+modules the root built from one `lake query +MODULE:lean`, and each named module's source and direct imports from one
+`lake query +MODULE:lean +MODULE:header`, under a read turn.
 
 Lean writes each `.olean` to a temporary file and renames it into place (`src/library/module.cpp` in Lean), so a reader
 never sees a torn file and a file a worker has mapped never changes under it. The turns prevent the one hazard left: a

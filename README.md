@@ -30,7 +30,7 @@ starts such a request and replies at once; `lean_get` reads its state and result
 
 `lean_build` runs Lake in the project: Lake targets, or a recipe of Lake steps from the project's config. Checks wait
 while it runs and then see what it built. `lean_imports` lists each file's whole transitive import closure from
-`lake setup-file`, and builds nothing.
+`lake setup-file`, and each module's source and direct imports from `lake query`. It builds nothing.
 
 Semantic responses contain `data`, structured `errors`, and project/session `trust`. Lean-domain failures remain in
 `data`; recoverable runtime failures appear in `errors`. See the [tool catalog](docs/tool-catalog.md) for request and

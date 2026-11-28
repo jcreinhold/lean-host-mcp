@@ -21,7 +21,7 @@ use crate::diagnosis::{CallOutcome, IncompleteCause, classify_missing_olean, war
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::projections::{DeclarationInspectionResult, project_declaration_inspection};
-use crate::tools::source_input::{module_name_for_file, read_query_file};
+use crate::tools::source_input::read_query_file;
 use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
 
 const DEFAULT_FIELD_BYTES: u32 = 8 * 1024;
@@ -195,8 +195,11 @@ pub async fn inspect_declaration(
     if let Some(file) = req.file.as_ref() {
         let input = read_query_file(&meta.canonical_root, file)?;
         extend_unique(&mut imports, input.imports);
-        if let Some(module) = module_name_for_file(&meta.canonical_root, &input.resolved) {
-            extend_unique(&mut imports, vec![module]);
+        // The file's own module as Lake names it; a file outside every
+        // library has none to import.
+        match classify_missing_olean(ctx.broker.file_module(&meta.canonical_root, &input.resolved).await)? {
+            CallOutcome::Ready(module) => extend_unique(&mut imports, module.into_iter().collect()),
+            CallOutcome::NeedsBuild(err) => return inspection_needs_build_response(ctx, hint, imports, err),
         }
     }
     let request = LeanWorkerDeclarationInspectionRequest {

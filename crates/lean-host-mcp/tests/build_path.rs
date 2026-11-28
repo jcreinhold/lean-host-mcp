@@ -1,7 +1,8 @@
 //! The build path leaves the import graph to Lake.
 //!
 //! `lean_build` hands Lake its targets and steps and `lean_imports` reads
-//! what `lake setup-file` and `lake query +MODULE:lean` report. Neither may
+//! what `lake setup-file` and `lake query +MODULE:lean +MODULE:header`
+//! report. A header lists only a module's direct imports. Neither tool may
 //! walk Lake's import graph or order modules itself: Lake owns that work.
 //! This test fails when a file on that path names one of Lake's graph
 //! queries or a sorter.

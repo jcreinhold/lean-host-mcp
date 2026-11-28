@@ -3,7 +3,7 @@
 Five semantic tools cover proof context, trials, lookup, verification, and status. `lean_context`, `lean_trial`,
 `lean_lookup`, and `lean_status` select a mode with `kind`; `lean_verify` takes target groups directly. Operational
 coordination uses `lean_runtime`; `lean_run` and `lean_get` start and read named requests. `lean_build` runs Lake, and
-`lean_imports` reads what Lake reports a file imports.
+`lean_imports` reads what Lake reports a file or module imports.
 
 - Semantic tools: [context](#lean_context), [trial](#lean_trial), [verification](#lean_verify), [lookup](#lean_lookup),
   [status](#lean_status).
@@ -11,7 +11,7 @@ coordination uses `lean_runtime`; `lean_run` and `lean_get` start and read named
   [request synonyms](#request-synonyms), [proof workflow](#proof-workflow).
 - Coordination: [native compatibility](#native-compatibility), [named requests](#named-requests),
   [worker activity](#worker-activity).
-- Lake: [builds](#lean_build), [import closures](#lean_imports).
+- Lake: [builds](#lean_build), [imports](#lean_imports).
 
 ```text
 lean_context -> lean_lookup -> lean_trial -> lean_verify
@@ -239,10 +239,12 @@ params before anything runs.
 
 ## `lean_imports`
 
-`lean_imports` lists each file's whole transitive import closure, not only the file's direct imports. It reads the
-closure from `lake --no-build --no-cache setup-file <file>` (the `importArts` Lake reports), and the sources of the
-modules the root built from one `lake --no-build --no-cache query --json +MODULE:lean ...`, under the project's read
-turn, so it waits for a running build. It builds nothing.
+`lean_imports` reports imports as Lake reads them, under the project's read turn, so it waits for a running build. It
+builds nothing. Name at least one of `files` and `modules`.
+
+For each file it lists the whole transitive import closure, not only the file's direct imports. It reads the closure
+from `lake --no-build --no-cache setup-file <file>` (the `importArts` Lake reports), and the sources of the modules the
+root built from one `lake --no-build --no-cache query --json +MODULE:lean ...`.
 
 ```json
 {"name":"lean_imports","arguments":{"files":["Chain/C.lean"]}}
@@ -262,11 +264,12 @@ turn, so it waits for a running build. It builds nothing.
         {"module": "Dep", "olean": "/abs/project/dep/.lake/build/lib/lean/Dep.olean", "source": null}
       ]
     }
-  ]
+  ],
+  "modules": []
 }
 ```
 
-- `files` takes 1 to 16 Lean files, absolute or relative to the Lake root. Each reply entry keeps `file` as the request
+- `files` takes up to 16 Lean files, absolute or relative to the Lake root. Each reply entry keeps `file` as the request
   named it.
 - `olean` is the absolute path Lake loads. `source` is the absolute source path Lake names, under the module's library
   `srcDir`, when the `.olean` lies under the root's own `.lake/build`; for a dependency's module it is null.
@@ -275,6 +278,47 @@ turn, so it waits for a running build. It builds nothing.
   `unknown_import` when an import names no module Lake knows, so no build can supply it. A file the server cannot read
   fails the same way with code `invalid_request`, and a source query Lake cannot answer with code
   `module_sources_failed`. The reply never holds a partial list.
+
+For each module it lists the source file Lake reads and the direct imports the module's header lists, in order, from
+`lake --no-build --no-cache query --json +MODULE:lean +MODULE:header ...`. Lake reads each header and builds nothing.
+
+```json
+{"name":"lean_imports","arguments":{"modules":["Chain.B","Init"]}}
+```
+
+```json
+{
+  "files": [],
+  "modules": [
+    {
+      "module": "Chain.B",
+      "source": "/abs/project/Chain/B.lean",
+      "imports": [
+        {"module": "Init", "all": false, "public": true, "meta": false},
+        {"module": "Init", "all": false, "public": true, "meta": true},
+        {"module": "Chain.A", "all": false, "public": true, "meta": false},
+        {"module": "Dep", "all": false, "public": true, "meta": false}
+      ]
+    },
+    {
+      "module": "Init",
+      "source": null,
+      "imports": [],
+      "error": {"code": "unknown_module", "message": "Init: error: unknown module `Init`"}
+    }
+  ]
+}
+```
+
+- `modules` takes up to 128 module names. Each reply entry keeps `module` as the request named it, in request order.
+- `source` is the absolute path Lake names under the library's `srcDir`, for a dependency's module too.
+- `all` marks `import all`, `public` marks `public import`, and `meta` marks `meta import`. Outside the module system
+  every import is public. Lean adds `Init` to each file that does not start with `prelude`, once plain and once as a
+  `meta` import.
+- A module Lake cannot answer for gets its own `error` and the other modules still answer. The code is `unknown_module`
+  when no package in the workspace holds the name, as for `Init` and the rest of the Lean toolchain, or when its library
+  has no source file for it, and `module_header_failed` when Lake could not read the header. A name no library matches
+  costs one more Lake run. When Lake answers for none of the modules, the call fails with code `module_inputs_failed`.
 
 ## Response Shape
 
@@ -733,13 +777,14 @@ The `data` payload contains a summary and result rows. For one verified declarat
 `has_unresolved_goals`, `has_diagnostics`, `not_found`, `ambiguous`, `needs_build`, `timeout`, `budget_exceeded`,
 `worker_recycled`, `header_parse_failed`, or `unsupported`. `summary.requested` counts expanded targets before host-side
 caps. `summary.truncated` is true when declaration inventory or target expansion was capped. `file_all` and
-source-backed `module_all` use the current source snapshot and report the same project-relative file paths in rows. If a
-module of the project has no source file, `module_all` reads its declarations from the module's `.ilean` index in the
-project's build, with typed artifact freshness facts in `trust`, and a worker imports the module's build to check them.
-That check finds only declarations elaborated from source, so their rows read `not_found`; `lean_trial` with
-`kind: "command"`, the module in `imports` and `#print axioms` checks them instead. `module_all` reads no index from a
-Lake dependency's build. Every source-backed trust fact includes `content_sha256`, the SHA-256 of the exact bytes used
-by the call.
+source-backed `module_all` use the current source snapshot and report the same project-relative file paths in rows.
+`module_all` takes the module's source file from `lake query +MODULE:lean`, under its library's `srcDir`, for a Lake
+dependency's module too. When Lake names no source for the module, as for one whose file was deleted, `module_all` reads
+its declarations from the module's `.ilean` index in the project's build, with a `stale_build` fact in `trust`, and a
+worker imports the module's build to check them; their rows name the file `<lean_verify module M>`. That check finds
+only declarations elaborated from source, so their rows read `not_found`; `lean_trial` with `kind: "command"`, the
+module in `imports` and `#print axioms` checks them instead. `module_all` reads no index from a Lake dependency's build.
+Every source-backed trust fact includes `content_sha256`, the SHA-256 of the exact bytes used by the call.
 
 `detail` defaults to `"compact"`, which keeps declaration names, files, statuses, bounded diagnostics and goal text,
 sorry/admit facts, axiom facts, and trustworthiness flags. It omits target and ambiguous-candidate span blocks. For
@@ -795,8 +840,8 @@ declaration outline, supplementing missing names from a fresh matching `.ilean` 
 }
 ```
 
-Module targets first resolve `<module>.lean` under the project root and use the same source-fresh path when the file
-exists:
+Module targets take the module's source file from `lake query +MODULE:lean`, under its library's `srcDir`, for a Lake
+dependency's module too, and use the same source-fresh path:
 
 ```json
 {
@@ -806,10 +851,12 @@ exists:
 }
 ```
 
-If module source is unavailable, the mode falls back to a matching `.ilean` and reports its build-freshness facts in
-`trust`. Index rows have declaration and name/selection ranges but omit `kind` and `body_span`. A missing file target
-returns `not_found`; an unavailable module index returns `missing_build`. `limit` defaults to 200 and is capped at 1000;
-truncation keeps a deterministic prefix and sets `truncated: true`.
+When Lake names no source for the module, as for one whose file was deleted, the mode falls back to the module's
+`.ilean` in the project's build. Its `trust` fact reads `stale_build` with no `next_action`: an earlier build left the
+index, and no build refreshes it. Index rows have declaration and name/selection ranges but omit `kind` and `body_span`.
+A missing file target returns `not_found`, and so does a module with neither a source nor an index, with a message that
+quotes Lake. `limit` defaults to 200 and is capped at 1000; truncation keeps a deterministic prefix and sets
+`truncated: true`.
 
 ### `kind: "proof_search"`
 
@@ -856,8 +903,10 @@ worker session id plus a `source` / `file` / `edit_fresh` trust fact:
 ```
 
 Project scope reads the on-disk `.ilean` reference index without opening a worker (see
-[reader architecture](architecture.md#reference-indices)). `files` restricts where references occur; omit it to scan all
-project indices. Results reflect the last build, with stale contributing sources reported in `trust` and warnings:
+[reader architecture](architecture.md#reference-indices)), then one `lake query +MODULE:lean` names the source file of
+each module with hits. `files` keeps the references in those files; every index is read either way. Results reflect the
+last build, with stale contributing sources reported in `trust` and warnings. A module Lake names no source for, as one
+a deleted file leaves, contributes no hits, and a warning names it:
 
 ```json
 {

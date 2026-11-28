@@ -87,6 +87,16 @@ async fn imports(ctx: &ToolContext, files: &[&str]) -> Result<ImportsReply, Impo
     let request = ImportsRequest {
         project: None,
         files: files.iter().map(|file| (*file).to_owned()).collect(),
+        modules: Vec::new(),
+    };
+    as_call(lean_imports(ctx, request)).await
+}
+
+async fn module_imports(ctx: &ToolContext, modules: &[&str]) -> Result<ImportsReply, ImportsError> {
+    let request = ImportsRequest {
+        project: None,
+        files: Vec::new(),
+        modules: modules.iter().map(|module| (*module).to_owned()).collect(),
     };
     as_call(lean_imports(ctx, request)).await
 }
@@ -384,6 +394,39 @@ async fn imports_name_sources_under_a_library_src_dir() -> TestResult {
     assert_eq!(source("Inner.X")?, path("src/Inner/X.lean"));
     assert_eq!(source("Chain.A")?, path("Chain/A.lean"));
     assert_eq!(source("Dep")?, None);
+    Ok(())
+}
+
+/// A module's source and header come from Lake, for a dependency's module
+/// too. A name no package holds, such as `Init`, gets its own error, and the
+/// call still answers for the rest.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
+async fn imports_of_modules_list_each_header_and_the_source_lake_reads() -> TestResult {
+    let (chain, ctx) = project()?;
+    let reply = module_imports(&ctx, &["Chain.B", "Dep", "Init"])
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    assert!(reply.files.is_empty());
+    let [b, dep, init] = reply.modules.as_slice() else {
+        return Err(format!("expected three modules: {reply:?}").into());
+    };
+    let path = |relative: &str| Some(chain.root.join(relative).display().to_string());
+    assert_eq!((b.module.as_str(), &b.source), ("Chain.B", &path("Chain/B.lean")));
+    let listed: Vec<(&str, bool, bool, bool)> = b
+        .imports
+        .iter()
+        .filter(|import| import.module != "Init")
+        .map(|import| (import.module.as_str(), import.all, import.public, import.meta))
+        .collect();
+    // Outside the module system every import is public.
+    assert_eq!(listed, [("Chain.A", false, true, false), ("Dep", false, true, false)]);
+    assert!(b.error.is_none(), "{b:?}");
+    assert_eq!(dep.source, path("dep/Dep.lean"));
+    let error = init.error.as_ref().ok_or("Init has no source in the workspace")?;
+    assert_eq!(error.code, "unknown_module");
+    assert!(error.message.starts_with("Init: "), "{}", error.message);
+    assert_eq!((&init.source, init.imports.len()), (&None, 0));
     Ok(())
 }
 

@@ -226,7 +226,14 @@ server.
 (`importArts`), not only its direct imports: each module, its `.olean`, and, when Lake built it under the project's
 `.lake/build`, the source `lake query +MODULE:lean` names under the library's `srcDir`. It builds nothing: a missing or
 stale import fails the call with `setup_file_failed`, naming the file and quoting Lake, and an import that names no
-module Lake knows fails it with `unknown_import`.
+module Lake knows fails it with `unknown_import`. For each module it lists the source and the direct imports that
+`lake query +MODULE:lean +MODULE:header` reports, and a module Lake cannot answer for, such as `Init`, gets its own
+error.
+
+The server asks Lake, never the module name, where a module's source lies: `lake query +MODULE:lean` for the files of
+project-scope references and for a declaration lookup or `module_all` check of a module, and `lake setup-file` for the
+module of a checked file and the goal module of a search. A file outside every library has no module, and an `.ilean`
+whose module Lake names no source for, as one a deleted file leaves, is left over from an earlier build.
 
 ## Concurrency and admission
 

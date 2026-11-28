@@ -7,6 +7,7 @@
 // worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
@@ -23,6 +24,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::ProjectHint;
+use crate::broker::module_setup::Answer;
 use crate::envelope::{Freshness, Response, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
@@ -958,11 +960,9 @@ pub enum FindReferencesResult {
         /// stable prefix of the full answer.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
-        /// Project scope: `.ilean` modules parsed into the index — which a
-        /// `files`-restricted request narrows to just the modules that can
-        /// produce a hit in those files, so it is the work done, not the size
-        /// of the project. File scope: the single anchor file, if it
-        /// elaborated.
+        /// Project scope: `.ilean` modules parsed into the index, every one
+        /// the last build left, whatever `files` names. File scope: the
+        /// single anchor file, if it elaborated.
         files_scanned: usize,
         /// Project scope: `.ilean` modules skipped because they were unreadable,
         /// malformed, or an unsupported version. File scope: the anchor file, if
@@ -1001,13 +1001,14 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     // file under the cursor, so it elaborates that one file through the worker;
     // `project` scope wants the whole-project answer, which the on-disk `.ilean`
     // reference index already holds — *build-fresh* — and reads in milliseconds
-    // with no worker query. The freshness asymmetry is the point, not a bug.
+    // with no worker query; one `lake query` then names each module's source.
+    // The freshness asymmetry is the point, not a bug.
     match req.scope {
         ReferenceScope::File => find_references_in_file(ctx, hint, &root, &req, freshness, runtime, limit).await,
         ReferenceScope::Project => {
             // The scan reads build products, so it takes a read turn first.
             ctx.broker.ensure_read(&root).await?;
-            find_references_in_project(&root, &req, freshness, runtime, limit).await
+            find_references_in_project(ctx, &root, &req, freshness, runtime, limit).await
         }
     }
 }
@@ -1207,7 +1208,8 @@ async fn find_references_in_file(
 }
 
 /// Project scope: read the on-disk `.ilean` reference index for the whole
-/// project (build-fresh) in milliseconds, with no worker query. Returns the
+/// project (build-fresh) in milliseconds, with no worker query, and ask Lake
+/// for the source file of each module that recorded a hit. Returns the
 /// complete answer up to `limit`; an unbuilt project degrades to `needs_build`
 /// and an index stale relative to current source rides a freshness note.
 ///
@@ -1217,6 +1219,7 @@ async fn find_references_in_file(
 /// tokio worker for its whole duration. The request validation above it stays on
 /// the async thread so a rejected request never pays for the hop.
 async fn find_references_in_project(
+    ctx: &ToolContext,
     root: &Path,
     req: &FindReferencesRequest,
     freshness: Freshness,
@@ -1237,15 +1240,35 @@ async fn find_references_in_project(
     let index = {
         let scan_root = root.to_path_buf();
         let scan_name = req.name.clone();
-        let scan_files = req.files.clone();
-        tokio::task::spawn_blocking(move || {
-            let subset = (!scan_files.is_empty()).then_some(scan_files.as_slice());
-            crate::ilean::references_to(&scan_root, &scan_name, subset)
-        })
-        .await
-        .map_err(|err| ServerError::Internal(format!("reference index scan task failed: {err}")))?
+        tokio::task::spawn_blocking(move || crate::ilean::references_to(&scan_root, &scan_name))
+            .await
+            .map_err(|err| ServerError::Internal(format!("reference index scan task failed: {err}")))?
     };
+    // An index names its module; the module's library decides its file. With
+    // no hits, Lake does not run.
+    let modules: Vec<&str> = index.modules.iter().map(|hits| hits.module.as_str()).collect();
+    let sources = ctx.broker.module_sources(root, &modules).await?;
+    // The reply reads the times of each source and index, so it too runs on a
+    // blocking thread.
+    let (root, req) = (root.to_path_buf(), req.clone());
+    tokio::task::spawn_blocking(move || project_references(&root, &req, &index, sources, freshness, runtime, limit))
+        .await
+        .map_err(|err| ServerError::Internal(format!("reference reply task failed: {err}")))
+}
 
+/// The project-scope reply for `index`, given `sources`: Lake's answer for the
+/// source file of each module in [`ReferenceIndex::modules`], in order.
+///
+/// [`ReferenceIndex::modules`]: crate::ilean::ReferenceIndex::modules
+fn project_references(
+    root: &Path,
+    req: &FindReferencesRequest,
+    index: &crate::ilean::ReferenceIndex,
+    sources: Vec<Answer<PathBuf>>,
+    freshness: Freshness,
+    runtime: RuntimeFacts,
+    limit: usize,
+) -> Response<FindReferencesResult> {
     // A wholly-absent build directory is the honest "the project is not built"
     // verdict — degrade to the shared `needs_build` warning, never a silent
     // empty result (which would read as "no references"). A built tree with zero
@@ -1254,30 +1277,40 @@ async fn find_references_in_project(
         let response = Response::ok(empty_references_result(0, 0), freshness)
             .with_runtime(runtime)
             .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_missing_build());
-        return Ok(crate::diagnosis::warn_needs_build(
+        return crate::diagnosis::warn_needs_build(
             response,
             &crate::diagnosis::IncompleteCause::MissingImports(Vec::new()),
-        ));
+        );
     }
 
-    // The reader narrows its walk to the same subset when it can invert the
-    // paths, but it falls back to the whole project when it cannot, so this
-    // filter is what actually enforces the restriction. It stays either way:
-    // narrowing decides which files are *read*, never which hits survive.
-    let restrict: Option<std::collections::HashSet<String>> = (!req.files.is_empty()).then(|| {
+    // Lake's paths are canonical, so the requested ones are made so too. A
+    // file that does not exist keeps its path and matches no module.
+    let restrict: Option<HashSet<PathBuf>> = (!req.files.is_empty()).then(|| {
         req.files
             .iter()
-            .map(|p| display_path(root, &resolve_path(root, p)))
+            .map(|file| {
+                let path = resolve_path(root, file);
+                path.canonicalize().unwrap_or(path)
+            })
             .collect()
     });
 
     let mut hits: Vec<ReferenceHit> = Vec::new();
-    for loc in &index.references {
-        let display = display_path(root, &loc.file);
-        if restrict.as_ref().is_some_and(|set| !set.contains(&display)) {
+    let mut stale: Vec<String> = Vec::new();
+    let mut sourceless: Vec<&str> = Vec::new();
+    for (module, source) in index.modules.iter().zip(sources) {
+        let Ok(source) = source else {
+            sourceless.push(&module.module);
+            continue;
+        };
+        if restrict.as_ref().is_some_and(|files| !files.contains(&source)) {
             continue;
         }
-        hits.push(index_reference(&display, loc));
+        let display = display_path(root, &source);
+        hits.extend(module.references.iter().map(|loc| index_reference(&display, loc)));
+        if crate::ilean::source_newer_than_index(&source, &module.index) {
+            stale.push(display);
+        }
     }
 
     // Sort then cap so the `limit` truncation is deterministic — a stable
@@ -1301,34 +1334,43 @@ async fn find_references_in_project(
         missing_imports_files: Vec::new(),
         semantic_based: true,
     };
-    let response = Response::ok(result, freshness).with_runtime(runtime);
-    if index.stale_sources.is_empty() {
-        return Ok(response.with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_build_fresh()));
-    }
-    let names = index
-        .stale_sources
-        .iter()
-        .take(3)
-        .map(|p| display_path(root, p))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let more = index.stale_sources.len().saturating_sub(3);
-    let suffix = if more > 0 {
-        format!(", … (+{more} more)")
+    let mut response = Response::ok(result, freshness).with_runtime(runtime);
+    if stale.is_empty() {
+        response = response.with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_build_fresh());
     } else {
-        String::new()
-    };
-    Ok(response
-        .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_stale_build(format!(
-            "{} contributing module(s) have source newer than their .ilean ({names}{suffix})",
-            index.stale_sources.len()
-        )))
-        .warn(format!(
-            "reference index is build-fresh, not edit-fresh: {} contributing module(s) have source newer than \
-             their .ilean ({names}{suffix}); results come from the last build.",
-            index.stale_sources.len()
-        ))
-        .hint("run lean_build() to refresh the reference index for edited modules"))
+        stale.sort();
+        let names = first_few(&stale);
+        response = response
+            .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_stale_build(format!(
+                "{} contributing module(s) have source newer than their .ilean ({names})",
+                stale.len()
+            )))
+            .warn(format!(
+                "reference index is build-fresh, not edit-fresh: {} contributing module(s) have source newer than \
+                 their .ilean ({names}); results come from the last build.",
+                stale.len()
+            ))
+            .hint("run lean_build() to refresh the reference index for edited modules");
+    }
+    if !sourceless.is_empty() {
+        sourceless.sort_unstable();
+        response = response.warn(format!(
+            "left out the hits of {} module(s) that Lake names no source for ({}); an earlier build left their \
+             .ilean indexes, as it does for a module since deleted or renamed",
+            sourceless.len(),
+            first_few(&sourceless)
+        ));
+    }
+    response
+}
+
+/// The first three of `names`, joined, with a count of the rest.
+fn first_few<S: AsRef<str>>(names: &[S]) -> String {
+    let shown = names.iter().take(3).map(AsRef::as_ref).collect::<Vec<_>>().join(", ");
+    match names.len().saturating_sub(3) {
+        0 => shown,
+        more => format!("{shown}, … (+{more} more)"),
+    }
 }
 
 /// An empty `Ok` reference result, used for the `needs_build` degrade where the
@@ -1869,9 +1911,10 @@ mod tests {
         BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, FindReferencesRequest, LeanWorkerProofPositionSelector,
         ProofBoundaryCandidate, ProofBoundarySelector, ProofPositionSelector, ProofStateProjection, ProofStateRequest,
         ProofStateResult, ReferenceScope, RenderedText, SourceSpan, cache_status_label, command_result,
-        expert_query_budgets, find_references_in_project, needs_build_context, project_proof_state_result,
-        project_query_facts, proof_agent_budgets, reference_query_budgets, route_batch_outcome, worker_proof_position,
+        expert_query_budgets, needs_build_context, project_proof_state_result, project_query_facts, project_references,
+        proof_agent_budgets, reference_query_budgets, route_batch_outcome, worker_proof_position,
     };
+    use crate::broker::module_setup::NoAnswer;
     use crate::envelope::{Freshness, RuntimeFacts};
     use crate::projections::{Diagnostic, Severity};
     use crate::tools::source_input::{header_imports, read_query_file};
@@ -2008,21 +2051,69 @@ mod tests {
         .unwrap()
     }
 
-    fn stage_ilean_module(module: &str, fixture_name: &str) -> tempfile::TempDir {
+    /// A project whose last build indexed each `(module, source, fixture)`:
+    /// the source file comes first, and the module's `.ilean` comes later
+    /// under the build tree. Returns the directory and its canonical path,
+    /// which is how Lake names files.
+    fn built_project(modules: &[(&str, &str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let relative: std::path::PathBuf = module.split('.').collect();
-        let source = tmp.path().join(&relative).with_extension("lean");
-        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
-        std::fs::write(&source, "-- source stub\n").unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for (_, source, _) in modules {
+            let source = root.join(source);
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, "-- source stub\n").unwrap();
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let index = tmp
-            .path()
-            .join(".lake/build/lib/lean")
-            .join(&relative)
-            .with_extension("ilean");
-        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
-        std::fs::write(&index, ilean_fixture(fixture_name)).unwrap();
-        tmp
+        for (module, _, fixture) in modules {
+            let relative: std::path::PathBuf = module.split('.').collect();
+            let index = root.join(".lake/build/lib/lean").join(relative).with_extension("ilean");
+            std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+            std::fs::write(&index, ilean_fixture(fixture)).unwrap();
+        }
+        (tmp, root)
+    }
+
+    /// The project-scope reply when Lake names `sources` as the files of
+    /// their modules and knows no other module.
+    fn project_reply(
+        root: &std::path::Path,
+        req: &FindReferencesRequest,
+        sources: &[(&str, &str)],
+    ) -> crate::envelope::Response<super::FindReferencesResult> {
+        let index = crate::ilean::references_to(root, &req.name);
+        let answers = index
+            .modules
+            .iter()
+            .map(|hits| {
+                sources
+                    .iter()
+                    .find(|(module, _)| *module == hits.module)
+                    .map(|(_, source)| root.join(source))
+                    .ok_or_else(|| NoAnswer::Unknown(format!("error: unknown module `{}`", hits.module)))
+            })
+            .collect();
+        project_references(
+            root,
+            req,
+            &index,
+            answers,
+            freshness(root),
+            RuntimeFacts::default(),
+            1000,
+        )
+    }
+
+    /// Each hit's file, line, column and kind.
+    fn reference_rows(
+        response: &crate::envelope::Response<super::FindReferencesResult>,
+    ) -> Vec<(String, u32, u32, &'static str)> {
+        let Some(super::FindReferencesResult::Ok { references, .. }) = &response.result else {
+            panic!("expected the ok verdict");
+        };
+        references
+            .iter()
+            .map(|hit| (hit.file.clone(), hit.line, hit.column, hit.kind))
+            .collect()
     }
 
     fn has_artifact(
@@ -2141,21 +2232,13 @@ import Init -- comment
         broker.shutdown_all();
     }
 
-    #[tokio::test]
-    async fn project_references_report_missing_ilean_build_fact_when_not_built() {
+    #[test]
+    fn project_references_report_missing_ilean_build_fact_when_not_built() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("Demo")).unwrap();
         std::fs::write(tmp.path().join("Demo/A.lean"), "-- no build\n").unwrap();
 
-        let response = find_references_in_project(
-            tmp.path(),
-            &references_request(),
-            freshness(tmp.path()),
-            RuntimeFacts::default(),
-            1000,
-        )
-        .await
-        .unwrap();
+        let response = project_reply(tmp.path(), &references_request(), &[]);
 
         assert!(has_artifact(
             &response,
@@ -2171,20 +2254,55 @@ import Init -- comment
         ));
     }
 
-    #[tokio::test]
-    async fn project_references_report_build_fresh_ilean_fact_when_current() {
-        let project = stage_ilean_module("Demo.A", "demo_a.ilean");
+    #[test]
+    fn project_references_report_build_fresh_ilean_fact_when_current() {
+        let (_tmp, root) = built_project(&[("Demo.A", "Demo/A.lean", "demo_a.ilean")]);
 
-        let response = find_references_in_project(
-            project.path(),
-            &references_request(),
-            freshness(project.path()),
-            RuntimeFacts::default(),
-            1000,
-        )
-        .await
-        .unwrap();
+        let response = project_reply(&root, &references_request(), &[("Demo.A", "Demo/A.lean")]);
 
+        assert_eq!(reference_rows(&response), [("Demo/A.lean".to_owned(), 4, 5, "def")]);
+        assert!(has_artifact(
+            &response,
+            ArtifactKind::Ilean,
+            TrustScope::Project,
+            TrustStatus::BuildFresh
+        ));
+        assert!(response.warnings.is_empty(), "{:?}", response.warnings);
+    }
+
+    #[test]
+    fn project_references_report_stale_ilean_fact_when_source_is_newer() {
+        let (_tmp, root) = built_project(&[("Demo.A", "Demo/A.lean", "demo_a.ilean")]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("Demo/A.lean"), "-- edited after build\n").unwrap();
+
+        let response = project_reply(&root, &references_request(), &[("Demo.A", "Demo/A.lean")]);
+
+        assert!(has_artifact(
+            &response,
+            ArtifactKind::Ilean,
+            TrustScope::Project,
+            TrustStatus::StaleBuild
+        ));
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("(Demo/A.lean)")),
+            "{:?}",
+            response.warnings
+        );
+    }
+
+    /// The file a hit names is the one Lake reads for its module, here under
+    /// a library's `srcDir`, not a path built from the module name.
+    #[test]
+    fn project_references_name_the_file_lake_reads() {
+        let (_tmp, root) = built_project(&[("Demo.A", "src/Demo/A.lean", "demo_a.ilean")]);
+
+        let response = project_reply(&root, &references_request(), &[("Demo.A", "src/Demo/A.lean")]);
+
+        assert_eq!(reference_rows(&response), [("src/Demo/A.lean".to_owned(), 4, 5, "def")]);
         assert!(has_artifact(
             &response,
             ArtifactKind::Ilean,
@@ -2193,28 +2311,50 @@ import Init -- comment
         ));
     }
 
-    #[tokio::test]
-    async fn project_references_report_stale_ilean_fact_when_source_is_newer() {
-        let project = stage_ilean_module("Demo.A", "demo_a.ilean");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(project.path().join("Demo/A.lean"), "-- edited after build\n").unwrap();
+    /// An index whose module Lake no longer knows, as one left by a deleted
+    /// file, gives no hits; a warning names the module.
+    #[test]
+    fn project_references_leave_out_modules_lake_names_no_source_for() {
+        let (_tmp, root) = built_project(&[
+            ("Demo.A", "Demo/A.lean", "demo_a.ilean"),
+            ("Demo.B", "Demo/B.lean", "demo_b.ilean"),
+        ]);
 
-        let response = find_references_in_project(
-            project.path(),
-            &references_request(),
-            freshness(project.path()),
-            RuntimeFacts::default(),
-            1000,
-        )
-        .await
-        .unwrap();
+        let response = project_reply(&root, &references_request(), &[("Demo.A", "Demo/A.lean")]);
 
-        assert!(has_artifact(
-            &response,
-            ArtifactKind::Ilean,
-            TrustScope::Project,
-            TrustStatus::StaleBuild
-        ));
+        assert_eq!(reference_rows(&response), [("Demo/A.lean".to_owned(), 4, 5, "def")]);
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("1 module(s) that Lake names no source for (Demo.B)")),
+            "{:?}",
+            response.warnings
+        );
+    }
+
+    /// `files` keeps the hits in the files it names; every index is still
+    /// read.
+    #[test]
+    fn project_references_keep_only_the_named_files() {
+        let (_tmp, root) = built_project(&[
+            ("Demo.A", "Demo/A.lean", "demo_a.ilean"),
+            ("Demo.B", "Demo/B.lean", "demo_b.ilean"),
+        ]);
+        let request = FindReferencesRequest {
+            files: vec![std::path::PathBuf::from("Demo/B.lean")],
+            ..references_request()
+        };
+
+        let response = project_reply(&root, &request, &[("Demo.A", "Demo/A.lean"), ("Demo.B", "Demo/B.lean")]);
+
+        let rows = reference_rows(&response);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|(file, ..)| file == "Demo/B.lean"), "{rows:?}");
+        let Some(super::FindReferencesResult::Ok { files_scanned, .. }) = response.result else {
+            panic!("expected the ok verdict");
+        };
+        assert_eq!(files_scanned, 2);
     }
 
     #[test]

@@ -309,7 +309,7 @@ impl LeanHostService {
     }
 
     #[tool(
-        description = "List each file's whole transitive import closure from Lake setup-file (importArts), not only its direct imports: module, absolute .olean path, and, for modules built under this project's .lake/build, the absolute source path Lake names under the library's srcDir (else null). Builds nothing: a missing or stale import fails the call with error code setup_file_failed, naming the file and quoting Lake. At most 16 files."
+        description = "Imports as Lake reports them; builds nothing. For `files` (at most 16): each file's whole transitive import closure from Lake setup-file (importArts), not only its direct imports: module, absolute .olean path, and, for modules built under this project's .lake/build, the absolute source path Lake names under the library's srcDir (else null); a missing or stale import fails the call with error code setup_file_failed, naming the file and quoting Lake. For `modules` (at most 128): each module's absolute source path and the direct imports its header lists, with all, public and meta flags, from lake query; a module no workspace package holds, such as Init, gets its own error, code unknown_module, and the rest still answer."
     )]
     async fn lean_imports(
         &self,

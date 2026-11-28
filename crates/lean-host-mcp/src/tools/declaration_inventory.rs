@@ -2,8 +2,9 @@
 //!
 //! Source files use the edit-fresh worker declaration-outline selector, then
 //! supplement missing names from a fresh module `.ilean` when one is available.
-//! Module requests fall back to the build-fresh `.ilean` declaration index when
-//! the source file is unavailable.
+//! A module request reads the source file Lake names for the module; when Lake
+//! names none, it falls back to the `.ilean` declaration index an earlier build
+//! left.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -19,11 +20,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::ProjectHint;
+use crate::broker::module_setup::NoAnswer;
 use crate::diagnosis::{CallOutcome, IncompleteCause, classify_missing_olean, warn_needs_build};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::projections::{ElabFailure, project_failure};
-use crate::tools::source_input::{module_name_for_file, read_query_file, resolve_path, source_path_for_module};
+use crate::tools::source_input::{read_query_file, resolve_path};
 use crate::tools::{ToolContext, session_imports};
 use crate::trust::{ArtifactTrust, display_path};
 
@@ -93,13 +95,15 @@ pub async fn declaration_inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
 ) -> Result<Response<DeclarationInventoryResult>> {
-    inventory(ctx, req, false).await
+    Ok(inventory(ctx, req, false).await?.0)
 }
 
+/// As [`declaration_inventory`] for `lean_verify`, with the source file the
+/// inventory read, if it read one.
 pub(super) async fn verification_inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
-) -> Result<Response<DeclarationInventoryResult>> {
+) -> Result<(Response<DeclarationInventoryResult>, Option<PathBuf>)> {
     inventory(ctx, req, true).await
 }
 
@@ -107,33 +111,41 @@ async fn inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
     supervised: bool,
-) -> Result<Response<DeclarationInventoryResult>> {
+) -> Result<(Response<DeclarationInventoryResult>, Option<PathBuf>)> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
+    let root = &meta.canonical_root;
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     match req.target {
         DeclarationInventoryTarget::File { path } => {
-            let resolved = resolve_path(&meta.canonical_root, &path);
+            let resolved = resolve_path(root, &path);
             if !resolved.is_file() {
-                return metadata_response(
-                    ctx,
-                    hint,
-                    not_found_result(format!(
-                        "source file `{}` does not exist",
-                        display_path(&meta.canonical_root, &resolved)
-                    )),
-                );
+                let result = not_found_result(format!(
+                    "source file `{}` does not exist",
+                    display_path(root, &resolved)
+                ));
+                return Ok((metadata_response(ctx, hint, result)?, None));
             }
-            worker_declarations(ctx, hint, &meta.canonical_root, &path, None, limit, supervised).await
+            let response = worker_declarations(ctx, hint, root, &path, None, limit, supervised).await?;
+            Ok((response, Some(resolved)))
         }
         DeclarationInventoryTarget::Module { module } => {
-            let path = source_path_for_module(&meta.canonical_root, &module);
-            if path.is_file() {
-                worker_declarations(ctx, hint, &meta.canonical_root, &path, Some(module), limit, supervised).await
-            } else {
-                // The index lives in build products; read it under a project turn.
-                ctx.broker.ensure_read(&meta.canonical_root).await?;
-                index_declarations(ctx, hint, &meta.canonical_root, &module, limit)
+            // Lake names the module's source: its library's `srcDir` decides
+            // where the file lies.
+            let answer = ctx
+                .broker
+                .module_sources(root, &[module.as_str()])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| ServerError::Internal(format!("Lake gave no answer for module `{module}`")))?;
+            match answer {
+                Ok(source) => {
+                    let response =
+                        worker_declarations(ctx, hint, root, &source, Some(module), limit, supervised).await?;
+                    Ok((response, Some(source)))
+                }
+                Err(why) => Ok((index_declarations(ctx, hint, root, &module, &why, limit)?, None)),
             }
         }
     }
@@ -151,7 +163,7 @@ async fn worker_declarations(
     let input = read_query_file(root, path)?;
     let source_for_index = input.source.clone();
     let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved, input.hash);
-    let module = module_hint.or_else(|| module_name_for_file(root, &input.resolved));
+    let resolved = input.resolved.clone();
     let file_label = input.resolved.to_string_lossy().into_owned();
     let selectors = vec![LeanWorkerModuleQuerySelector::DeclarationOutline {
         id: DECLARATION_OUTLINE_ID.to_owned(),
@@ -180,11 +192,16 @@ async fn worker_declarations(
         CallOutcome::NeedsBuild(err) => return worker_needs_build_response(ctx, hint, source_fact, err),
     };
     let mut result = project_worker_outline(call.value, limit);
-    let index_fact = if let Some(module) = module.as_deref() {
-        supplement_with_fresh_index(root, module, &source_for_index, &mut result, limit)
-    } else {
-        None
+    // A full outline takes the names the index of the module Lake names for
+    // the file adds; a file outside every library has no index.
+    let module = match module_hint {
+        Some(module) if result.status == "ok" => Some(module),
+        None if result.status == "ok" => ctx.broker.file_module(root, &resolved).await?,
+        Some(_) | None => None,
     };
+    let index_fact = module.and_then(|module| {
+        supplement_with_fresh_index(root, &module, &resolved, &source_for_index, &mut result, limit)
+    });
     let mut response = Response::ok(result, call.freshness)
         .with_runtime(call.runtime)
         .with_trust_artifact(source_fact);
@@ -197,66 +214,44 @@ async fn worker_declarations(
     Ok(response)
 }
 
+/// The declarations of `module`, which Lake names no source for (`why`),
+/// from the `.ilean` index an earlier build left, if one is left. Such an
+/// index outlives a module deleted or renamed since, so no build refreshes it.
 fn index_declarations(
     ctx: &ToolContext,
     hint: ProjectHint,
     root: &Path,
     module: &str,
+    why: &NoAnswer,
     limit: usize,
 ) -> Result<Response<DeclarationInventoryResult>> {
+    // The index lives in build products, which the request's read turn
+    // guards; asking Lake for the source took that turn.
     let index = crate::ilean::declarations_in_module(root, module);
     let base = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
-    let mut response = match index.status {
-        crate::ilean::ModuleDeclarationIndexStatus::ProjectNotBuilt => Response::ok(
-            missing_build_result(format!(
-                "project build tree is absent; no .ilean declaration index is available for module `{module}`"
-            )),
-            base.freshness,
-        )
-        .with_runtime(base.runtime)
-        .with_trust_artifact(ArtifactTrust::ilean_project_missing_build()),
-        crate::ilean::ModuleDeclarationIndexStatus::ModuleNotBuilt => Response::ok(
-            missing_build_result(format!(
-                "module `{module}` has no source file and no built .ilean declaration index"
-            )),
-            base.freshness,
-        )
-        .with_runtime(base.runtime)
-        .with_trust_artifact(ArtifactTrust::ilean_module_missing_build(module)),
-        crate::ilean::ModuleDeclarationIndexStatus::Present => {
-            let (declarations, truncated) = truncate(index_declarations_rows(&index), limit);
-            let fact = if index.stale {
-                ArtifactTrust::ilean_module_stale_build(index.module.clone(), display_path(root, &index.index))
-            } else {
-                ArtifactTrust::ilean_module_build_fresh(index.module.clone(), display_path(root, &index.index))
-            };
-            Response::ok(
-                DeclarationInventoryResult {
-                    status: "ok".to_owned(),
-                    declarations,
-                    truncated,
-                    source: "ilean".to_owned(),
-                    files_scanned: 1,
-                    message: None,
-                    diagnostics: None,
-                },
-                base.freshness,
-            )
-            .with_runtime(base.runtime)
-            .with_trust_artifact(fact)
-        }
-    };
-    if matches!(
-        index.status,
-        crate::ilean::ModuleDeclarationIndexStatus::ProjectNotBuilt
-    ) {
-        response = response
-            .warn(
-                "project build tree is absent; build the project with lean_build to produce .ilean declaration indices",
-            )
-            .hint(crate::trust::build_action::<&str>(&[]));
+    if index.status != crate::ilean::ModuleDeclarationIndexStatus::Present {
+        let result = not_found_result(format!(
+            "Lake names no source for module `{module}`, and no build left a .ilean declaration index for it: {}",
+            why.output()
+        ));
+        return Ok(Response::ok(result, base.freshness).with_runtime(base.runtime));
     }
-    Ok(response)
+    let (declarations, truncated) = truncate(index_declarations_rows(&index), limit);
+    let fact = ArtifactTrust::ilean_module_without_source(index.module.clone(), display_path(root, &index.index));
+    Ok(Response::ok(
+        DeclarationInventoryResult {
+            status: "ok".to_owned(),
+            declarations,
+            truncated,
+            source: "ilean".to_owned(),
+            files_scanned: 1,
+            message: None,
+            diagnostics: None,
+        },
+        base.freshness,
+    )
+    .with_runtime(base.runtime)
+    .with_trust_artifact(fact))
 }
 
 fn worker_needs_build_response(
@@ -398,9 +393,13 @@ fn index_declarations_rows(index: &crate::ilean::ModuleDeclarationIndex) -> Vec<
         .collect()
 }
 
+/// Add to `result` the declarations that `module`'s index records and the
+/// outline of `source` (the text of `source_file`) lacks, when the index is
+/// newer than the file.
 fn supplement_with_fresh_index(
     root: &Path,
     module: &str,
+    source_file: &Path,
     source: &str,
     result: &mut DeclarationInventoryResult,
     limit: usize,
@@ -409,7 +408,9 @@ fn supplement_with_fresh_index(
         return None;
     }
     let index = crate::ilean::declarations_in_module(root, module);
-    if index.status != crate::ilean::ModuleDeclarationIndexStatus::Present || index.stale {
+    if index.status != crate::ilean::ModuleDeclarationIndexStatus::Present
+        || crate::ilean::source_newer_than_index(source_file, &index.index)
+    {
         return None;
     }
 
@@ -605,18 +606,6 @@ mod tests {
         }
     }
 
-    fn has_fact(
-        response: &Response<DeclarationInventoryResult>,
-        artifact: ArtifactKind,
-        scope: TrustScope,
-        status: TrustStatus,
-    ) -> bool {
-        response
-            .trust_artifacts
-            .iter()
-            .any(|fact| fact.artifact == artifact && fact.scope == scope && fact.status == status)
-    }
-
     #[test]
     fn lean_lookup_declarations_limit_truncates_deterministically() {
         let rows = vec![row("A.one", 1), row("A.two", 2)];
@@ -640,7 +629,9 @@ mod tests {
             diagnostics: None,
         };
 
-        let Some(fact) = supplement_with_fresh_index(&root, "Demo.A", "\n\n\n    foo", &mut result, 200) else {
+        let source_file = root.join("Demo/A.lean");
+        let Some(fact) = supplement_with_fresh_index(&root, "Demo.A", &source_file, "\n\n\n    foo", &mut result, 200)
+        else {
             panic!("fresh index should produce a trust fact");
         };
 
@@ -689,7 +680,8 @@ mod tests {
             message: None,
             diagnostics: None,
         };
-        assert!(supplement_with_fresh_index(&root, "Demo.A", "\n\n\n    foo", &mut result, 1).is_some());
+        let source_file = root.join("Demo/A.lean");
+        assert!(supplement_with_fresh_index(&root, "Demo.A", &source_file, "\n\n\n    foo", &mut result, 1).is_some());
         assert_eq!(result.declarations.len(), 1);
         assert_eq!(result.declarations[0].name, "_private._stdin.0.Demo.A.foo");
         assert!(!result.truncated, "a duplicate must not consume the target limit");
@@ -718,7 +710,8 @@ mod tests {
             message: None,
             diagnostics: None,
         };
-        assert!(supplement_with_fresh_index(&root, "Demo.A", "😀 «𝒳»", &mut result, 1).is_some());
+        let source_file = root.join("Demo/A.lean");
+        assert!(supplement_with_fresh_index(&root, "Demo.A", &source_file, "😀 «𝒳»", &mut result, 1).is_some());
         assert_eq!(result.declarations.len(), 1);
         assert!(!result.truncated, "Unicode columns must not create a second target");
     }
@@ -741,74 +734,75 @@ mod tests {
             diagnostics: None,
         };
 
-        let fact = supplement_with_fresh_index(&root, "Demo.A", "\n\n\n    foo", &mut result, 200);
+        let source_file = root.join("Demo/A.lean");
+        let fact = supplement_with_fresh_index(&root, "Demo.A", &source_file, "\n\n\n    foo", &mut result, 200);
 
         assert!(fact.is_none());
         assert_eq!(result.declarations.len(), 1);
         assert_eq!(result.source, "worker");
     }
 
+    fn unknown(module: &str) -> NoAnswer {
+        NoAnswer::Unknown(format!("error: unknown module `{module}`"))
+    }
+
+    /// Before Lake named module sources, an index whose module was gone read
+    /// as current. It is left from an earlier build, and no build refreshes it.
     #[test]
-    fn lean_lookup_declarations_index_fallback_reports_build_fresh_fact() {
+    fn an_index_whose_module_lake_does_not_know_is_left_from_an_earlier_build() {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         copy_ilean(&root, "Demo.A", "demo_a.ilean");
         let (ctx, broker) = test_context(root.clone());
 
-        let response = index_declarations(&ctx, ProjectHint::from_request(None), &root, "Demo.A", 200).unwrap();
+        let response = index_declarations(
+            &ctx,
+            ProjectHint::from_request(None),
+            &root,
+            "Demo.A",
+            &unknown("Demo.A"),
+            200,
+        )
+        .unwrap();
 
         assert_eq!(response.result_ref().unwrap().status, "ok");
         assert_eq!(response.result_ref().unwrap().source, "ilean");
         assert_eq!(response.result_ref().unwrap().declarations[0].name, "Demo.A.foo");
-        assert!(has_fact(
-            &response,
-            ArtifactKind::Ilean,
-            TrustScope::Module,
-            TrustStatus::BuildFresh
-        ));
+        let [fact] = response.trust_artifacts.as_slice() else {
+            panic!("expected one fact, got {:?}", response.trust_artifacts);
+        };
+        assert_eq!(
+            (fact.artifact, fact.scope, fact.status),
+            (ArtifactKind::Ilean, TrustScope::Module, TrustStatus::StaleBuild)
+        );
+        assert_eq!(fact.path.as_deref(), Some(".lake/build/lib/lean/Demo/A.ilean"));
+        assert!(fact.next_action.is_none(), "no build refreshes the index");
         assert!(broker.resident_paths().is_empty());
         drop(ctx);
         drop(broker);
     }
 
     #[test]
-    fn lean_lookup_declarations_index_fallback_reports_stale_fact() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = make_lake_dir(tmp.path());
-        copy_ilean(&root, "Demo.A", "demo_a.ilean");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::create_dir_all(root.join("Demo")).unwrap();
-        std::fs::write(root.join("Demo/A.lean"), "-- edited after build\n").unwrap();
-        let (ctx, broker) = test_context(root.clone());
-
-        let response = index_declarations(&ctx, ProjectHint::from_request(None), &root, "Demo.A", 200).unwrap();
-
-        assert!(has_fact(
-            &response,
-            ArtifactKind::Ilean,
-            TrustScope::Module,
-            TrustStatus::StaleBuild
-        ));
-        assert!(broker.resident_paths().is_empty());
-        drop(ctx);
-        drop(broker);
-    }
-
-    #[test]
-    fn lean_lookup_declarations_missing_build_reports_project_fact() {
+    fn a_module_with_no_source_and_no_index_is_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let (ctx, broker) = test_context(root.clone());
 
-        let response = index_declarations(&ctx, ProjectHint::from_request(None), &root, "Demo.A", 200).unwrap();
+        let response = index_declarations(
+            &ctx,
+            ProjectHint::from_request(None),
+            &root,
+            "Demo.A",
+            &unknown("Demo.A"),
+            200,
+        )
+        .unwrap();
 
-        assert_eq!(response.result_ref().unwrap().status, "missing_build");
-        assert!(has_fact(
-            &response,
-            ArtifactKind::Ilean,
-            TrustScope::Project,
-            TrustStatus::MissingBuild
-        ));
+        let result = response.result_ref().unwrap();
+        assert_eq!(result.status, "not_found");
+        let message = result.message.as_deref().unwrap();
+        assert!(message.contains("unknown module `Demo.A`"), "{message}");
+        assert!(response.trust_artifacts.is_empty(), "a build would not help");
         assert!(broker.resident_paths().is_empty());
         drop(ctx);
         drop(broker);

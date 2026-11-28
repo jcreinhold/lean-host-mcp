@@ -38,7 +38,7 @@ use crate::projections::{
     project_declaration_verification, project_proof_attempt,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
-use crate::tools::source_input::{read_query_file, resolve_path, source_path_for_module};
+use crate::tools::source_input::{read_query_file, resolve_path};
 use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
 use crate::trust::{ArtifactTrust, ArtifactTrustDeduper, display_path};
 
@@ -596,7 +596,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                 expansion.push_explicit_group(group_index, file, declarations);
             }
             LeanVerifyTargetGroup::FileAll { file } => {
-                let inventory = crate::tools::declaration_inventory::verification_inventory(
+                let (inventory, _) = crate::tools::declaration_inventory::verification_inventory(
                     ctx,
                     crate::tools::declaration_inventory::DeclarationInventoryRequest {
                         target: crate::tools::declaration_inventory::DeclarationInventoryTarget::File {
@@ -624,7 +624,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                 }
             }
             LeanVerifyTargetGroup::ModuleAll { module } => {
-                let inventory = crate::tools::declaration_inventory::verification_inventory(
+                let (inventory, source_file) = crate::tools::declaration_inventory::verification_inventory(
                     ctx,
                     crate::tools::declaration_inventory::DeclarationInventoryRequest {
                         target: crate::tools::declaration_inventory::DeclarationInventoryTarget::Module {
@@ -639,14 +639,12 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                 if let Some(result) = inventory.result_ref() {
                     expansion.truncated |= result.truncated;
                     if result.status == "ok" || result.status == NEEDS_BUILD_STATUS {
-                        let source = if result.source == "ilean" {
-                            VerifySource::ModuleIndex {
-                                module: module.clone(),
-                                display_file: source_path_for_module(&meta.canonical_root, module),
-                            }
-                        } else {
-                            VerifySource::File(source_path_for_module(&meta.canonical_root, module))
-                        };
+                        // The file Lake names for the module, or its build
+                        // when Lake names none.
+                        let source = source_file.map_or_else(
+                            || VerifySource::ModuleIndex { module: module.clone() },
+                            VerifySource::File,
+                        );
                         expansion.push_inventory_group(group_index, source, &result.declarations);
                     } else if let Some(message) = &result.message {
                         expansion
@@ -820,7 +818,17 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
 #[derive(Debug, Clone)]
 enum VerifySource {
     File(PathBuf),
-    ModuleIndex { module: String, display_file: PathBuf },
+    /// A module Lake names no source for, checked against its build.
+    ModuleIndex {
+        module: String,
+    },
+}
+
+/// The label of the empty buffer that checks a [`VerifySource::ModuleIndex`]
+/// module. The angle brackets name no file, so Lake option discovery reads
+/// the workspace's options, as for an import-only `lean_trial`.
+fn module_index_label(module: &str) -> String {
+    format!("<lean_verify module {module}>")
 }
 
 #[derive(Debug, Clone)]
@@ -1006,14 +1014,12 @@ fn prepare_verify_group(root: &Path, group: VerifyGroup) -> Result<PreparedVerif
                 targets: group.targets,
             })
         }
-        // The module has no source file, so the worker checks an empty buffer
-        // that imports its build. A label in angle brackets names that buffer:
-        // Lake option discovery then reads the workspace's options, as for an
-        // import-only `lean_trial`, rather than open a file that is not there.
-        // Rows still show the module's source path.
-        VerifySource::ModuleIndex { module, .. } => Ok(PreparedVerifyGroup {
+        // Lake names no source file for the module, so the worker checks an
+        // empty buffer that imports its build, and the rows show that
+        // buffer's label.
+        VerifySource::ModuleIndex { module } => Ok(PreparedVerifyGroup {
             source: String::new(),
-            file_label: format!("<lean_verify module {module}>"),
+            file_label: module_index_label(&module),
             imports: vec![module],
             source_fact: None,
             targets: group.targets,
@@ -1024,14 +1030,14 @@ fn prepare_verify_group(root: &Path, group: VerifyGroup) -> Result<PreparedVerif
 fn source_key(root: &Path, source: &VerifySource) -> String {
     match source {
         VerifySource::File(path) => format!("file:{}", display_path(root, &resolve_path(root, path))),
-        VerifySource::ModuleIndex { module, .. } => format!("module_index:{module}"),
+        VerifySource::ModuleIndex { module } => format!("module_index:{module}"),
     }
 }
 
 fn file_display(root: &Path, source: &VerifySource) -> String {
     match source {
         VerifySource::File(path) => display_path(root, &resolve_path(root, path)),
-        VerifySource::ModuleIndex { display_file, .. } => display_path(root, display_file),
+        VerifySource::ModuleIndex { module } => module_index_label(module),
     }
 }
 

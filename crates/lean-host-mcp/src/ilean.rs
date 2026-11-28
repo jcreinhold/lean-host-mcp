@@ -10,14 +10,15 @@
 //! and links nothing from Lean.
 //!
 //! The boundary is one query: [`references_to`] takes a project root and a
-//! fully-qualified name and returns a [`ReferenceIndex`] of resolved hits
-//! (source file + LSP range + def/ref kind). Everything else — file
-//! enumeration, the compact-array JSON codecs, the version gate, and
-//! module→source-path resolution — is hidden. The raw JSON types are private;
-//! callers never see them.
+//! fully-qualified name and returns a [`ReferenceIndex`] of hits grouped by
+//! the module whose index recorded them (LSP range + def/ref kind).
+//! Everything else — file enumeration, the compact-array JSON codecs and the
+//! version gate — is hidden. The raw JSON types are private; callers never
+//! see them. A module's source file is Lake's to name: callers ask
+//! `ProjectBroker::module_sources`, since a library's `srcDir` decides it.
 //!
-//! "Index absent / stale" is reported as **data**, not an error: a project
-//! that was never built yields [`IndexStatus::NotBuilt`]. A single malformed
+//! A missing index is reported as **data**, not an error: a project that was
+//! never built yields [`IndexStatus::NotBuilt`]. A single malformed
 //! or unreadable `.ilean` is skipped and counted, never fatal. The consumer
 //! (`find_references`) maps those signals onto the response envelope. Callers
 //! hold the project's read turn, so no build writes an index while it is read.
@@ -53,14 +54,13 @@ pub(crate) enum RefKind {
     Ref,
 }
 
-/// A single reference to the queried name, resolved to a source location.
+/// A single reference to the queried name, in the source of the module whose
+/// index recorded it.
 ///
 /// Coordinates are 0-based LSP line/column, carried straight from the index.
 /// Maps directly onto `find_references`'s `ReferenceHit`.
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceLocation {
-    /// Resolved `<root>/Namespace/Module.lean` for the module that recorded it.
-    pub file: PathBuf,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -81,16 +81,23 @@ pub(crate) enum IndexStatus {
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceIndex {
     pub status: IndexStatus,
-    pub references: Vec<ReferenceLocation>,
+    /// Each module whose index recorded a hit, in walk order.
+    pub modules: Vec<ModuleHits>,
     /// `.ilean` files parsed successfully.
     pub modules_scanned: usize,
     /// `.ilean` files skipped because they were unreadable, malformed, or an
     /// unsupported version. One bad file does not sink the query.
     pub modules_skipped: usize,
-    /// Contributing modules whose source `.lean` is newer than its `.ilean`
-    /// (the recorded locations may be stale). Bounded by the result set, not
-    /// the project size.
-    pub stale_sources: Vec<PathBuf>,
+}
+
+/// The hits one module's index recorded.
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleHits {
+    /// The module, as its index names it.
+    pub module: String,
+    /// The `.ilean` file that recorded the hits.
+    pub index: PathBuf,
+    pub references: Vec<ReferenceLocation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +131,6 @@ pub(crate) struct ModuleDeclarationIndex {
     pub module: String,
     pub index: PathBuf,
     pub declarations: Vec<IndexedDeclaration>,
-    pub stale: bool,
 }
 
 /// A recoverable failure loading a single `.ilean` file.
@@ -149,144 +155,57 @@ pub(crate) enum IleanError {
 /// Collect every reference to fully-qualified `name` in the project rooted at
 /// `project_root`.
 ///
-/// `files`, when given, restricts the answer to references *occurring in* those
-/// source files. Because an `.ilean` records only the references occurring in
-/// its own module's source, that restriction is also a restriction on which
-/// indices can contribute — so the scan reads just those, instead of reading the
-/// whole project and discarding the rest. When the subset cannot be mapped onto
-/// index paths with certainty the full walk runs anyway, so a narrowed request
-/// never returns less than an unnarrowed one.
+/// The scan reads every `.ilean` under the build tree. An index names its
+/// module, not that module's source file, so callers that need the file ask
+/// Lake for the modules in [`ReferenceIndex::modules`].
 ///
 /// Infallible at the top level: a missing build directory yields
 /// [`IndexStatus::NotBuilt`]; an individual unreadable or malformed `.ilean`
 /// is counted in [`ReferenceIndex::modules_skipped`] and skipped. Never panics.
-pub(crate) fn references_to(project_root: &Path, name: &str, files: Option<&[PathBuf]>) -> ReferenceIndex {
+pub(crate) fn references_to(project_root: &Path, name: &str) -> ReferenceIndex {
     let build_dir = project_root.join(BUILD_LIB_REL);
+    let mut found = ReferenceIndex {
+        status: IndexStatus::NotBuilt,
+        modules: Vec::new(),
+        modules_scanned: 0,
+        modules_skipped: 0,
+    };
     if !build_dir.is_dir() {
-        return ReferenceIndex {
-            status: IndexStatus::NotBuilt,
-            references: Vec::new(),
-            modules_scanned: 0,
-            modules_skipped: 0,
-            stale_sources: Vec::new(),
-        };
+        return found;
     }
+    found.status = IndexStatus::Present;
 
     let matcher = KeyMatcher::new(name);
-    let mut scan = ReferenceScan::default();
-
-    match files.and_then(|files| indices_for(project_root, &build_dir, files)) {
-        Some(indices) => {
-            for index_path in &indices {
-                scan.visit(project_root, index_path, &matcher);
-            }
+    for entry in WalkDir::new(&build_dir).into_iter().filter_map(std::result::Result::ok) {
+        let index_path = entry.path();
+        if !entry.file_type().is_file() || index_path.extension().is_none_or(|ext| ext != "ilean") {
+            continue;
         }
-        None => {
-            for entry in WalkDir::new(&build_dir).into_iter().filter_map(std::result::Result::ok) {
-                let index_path = entry.path();
-                if !entry.file_type().is_file() || index_path.extension().is_none_or(|ext| ext != "ilean") {
-                    continue;
-                }
-                scan.visit(project_root, index_path, &matcher);
-            }
-        }
-    }
-
-    ReferenceIndex {
-        status: IndexStatus::Present,
-        stale_sources: collect_stale_sources(&scan.contributing),
-        references: scan.references,
-        modules_scanned: scan.modules_scanned,
-        modules_skipped: scan.modules_skipped,
-    }
-}
-
-/// Running state of one project-scope scan, so the whole-tree walk and an
-/// explicit index list share a single per-file body.
-#[derive(Default)]
-struct ReferenceScan {
-    references: Vec<ReferenceLocation>,
-    modules_scanned: usize,
-    modules_skipped: usize,
-    /// (source path, index path) for each module that produced a hit; stale
-    /// detection only touches these, keeping the stat work off the hot path.
-    contributing: Vec<(PathBuf, PathBuf)>,
-}
-
-impl ReferenceScan {
-    fn visit(&mut self, project_root: &Path, index_path: &Path, matcher: &KeyMatcher<'_>) {
-        let Ok(module) = load_references(index_path, matcher) else {
-            self.modules_skipped = self.modules_skipped.saturating_add(1);
-            return;
+        let Ok(module) = load_references(index_path, &matcher) else {
+            found.modules_skipped = found.modules_skipped.saturating_add(1);
+            continue;
         };
-        self.modules_scanned = self.modules_scanned.saturating_add(1);
-
+        found.modules_scanned = found.modules_scanned.saturating_add(1);
         if module.hits.is_empty() {
-            return;
+            continue;
         }
-        let source = module_to_source(project_root, &module.module);
-        for (kind, location) in &module.hits {
-            self.references.push(location_hit(&source, location, *kind));
-        }
-        self.contributing.push((source, index_path.to_path_buf()));
+        found.modules.push(ModuleHits {
+            module: module.module,
+            index: index_path.to_path_buf(),
+            references: module
+                .hits
+                .iter()
+                .map(|(kind, location)| location_hit(location, *kind))
+                .collect(),
+        });
     }
+    found
 }
 
-/// The exact index paths that can contribute references occurring in `files`,
-/// or `None` when the subset cannot be inverted with certainty.
-///
-/// [`module_to_source`] maps a dotted module onto `<root>/A/B.lean`, so the
-/// inverse of `<root>/A/B.lean` is the index at `<build>/A/B.ilean` — the same
-/// path math as [`module_to_index`], without needing the module name. Two
-/// conditions make that inverse exact, and failing either falls back to the full
-/// walk rather than guessing:
-///
-/// - **No dotted path component.** `module_to_source` splits on `.`, so a
-///   component containing one is not in its image and the mapping would be
-///   inventing a module.
-/// - **The computed index exists.** Lake mangles some module names on disk
-///   (module `«kan-lint-style»` indexes as `kan-lint-style.ilean`), so a missing
-///   file means the real index lives under a name this mapping cannot predict —
-///   not that the module has no references.
-fn indices_for(project_root: &Path, build_dir: &Path, files: &[PathBuf]) -> Option<Vec<PathBuf>> {
-    let mut indices = Vec::with_capacity(files.len());
-    for file in files {
-        let absolute = if file.is_absolute() {
-            Cow::Borrowed(file.as_path())
-        } else {
-            Cow::Owned(project_root.join(file))
-        };
-        let relative = absolute.strip_prefix(project_root).ok()?;
-        if relative.extension()? != "lean" {
-            return None;
-        }
-        // Drop the extension before the dot check so `A/B.lean` passes while
-        // `A/B.C.lean` — which no `split('.')` can produce — does not.
-        let plain_components = relative
-            .with_extension("")
-            .components()
-            .all(|component| match component {
-                std::path::Component::Normal(part) => part.to_str().is_some_and(|part| !part.contains('.')),
-                std::path::Component::Prefix(_)
-                | std::path::Component::RootDir
-                | std::path::Component::CurDir
-                | std::path::Component::ParentDir => false,
-            });
-        if !plain_components {
-            return None;
-        }
-        let index = build_dir.join(relative).with_extension("ilean");
-        if !index.is_file() {
-            return None;
-        }
-        indices.push(index);
-    }
-    Some(indices)
-}
-
+/// The declarations one module's index records, read from the index at the
+/// path Lake's build layout gives that module.
 pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> ModuleDeclarationIndex {
     let build_dir = project_root.join(BUILD_LIB_REL);
-    let source = module_to_source(project_root, module);
     let index = module_to_index(project_root, module);
     if !build_dir.is_dir() {
         return ModuleDeclarationIndex {
@@ -294,7 +213,6 @@ pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> Modul
             module: module.to_owned(),
             index,
             declarations: Vec::new(),
-            stale: false,
         };
     }
     if !index.is_file() {
@@ -303,7 +221,6 @@ pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> Modul
             module: module.to_owned(),
             index,
             declarations: Vec::new(),
-            stale: false,
         };
     }
     let Ok(raw) = load_declarations(&index) else {
@@ -312,7 +229,6 @@ pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> Modul
             module: module.to_owned(),
             index,
             declarations: Vec::new(),
-            stale: false,
         };
     };
     let mut declarations = raw
@@ -331,13 +247,11 @@ pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> Modul
             .then(a.declaration_span.start_column.cmp(&b.declaration_span.start_column))
             .then(a.name.cmp(&b.name))
     });
-    let stale = source_newer_than_index(&source, &index);
     ModuleDeclarationIndex {
         status: ModuleDeclarationIndexStatus::Present,
         module: raw.module,
         index,
         declarations,
-        stale,
     }
 }
 
@@ -439,13 +353,6 @@ fn load_declarations(path: &Path) -> Result<ModuleDeclarations, IleanError> {
     }
 }
 
-/// Resolve a dotted module name to its source path: `Demo.A` →
-/// `<root>/Demo/A.lean`.
-fn module_to_source(root: &Path, module: &str) -> PathBuf {
-    let relative: PathBuf = module.split('.').collect();
-    root.join(relative).with_extension("lean")
-}
-
 fn module_to_index(root: &Path, module: &str) -> PathBuf {
     let relative: PathBuf = module.split('.').collect();
     root.join(BUILD_LIB_REL).join(relative).with_extension("ilean")
@@ -495,10 +402,9 @@ impl<'a> KeyMatcher<'a> {
     }
 }
 
-/// Project a raw index location onto a resolved [`ReferenceLocation`].
-fn location_hit(source: &Path, location: &LocationRaw, kind: RefKind) -> ReferenceLocation {
+/// Project a raw index location onto a [`ReferenceLocation`].
+const fn location_hit(location: &LocationRaw, kind: RefKind) -> ReferenceLocation {
     ReferenceLocation {
-        file: source.to_path_buf(),
         start_line: location.start_line,
         start_column: location.start_column,
         end_line: location.end_line,
@@ -507,19 +413,10 @@ fn location_hit(source: &Path, location: &LocationRaw, kind: RefKind) -> Referen
     }
 }
 
-/// Flag contributing sources whose `.lean` is newer than its `.ilean`.
-/// Best-effort: a stat failure on either side is treated as "not stale".
-fn collect_stale_sources(contributing: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
-    let mut stale = Vec::new();
-    for (source, index) in contributing {
-        if source_newer_than_index(source, index) {
-            stale.push(source.clone());
-        }
-    }
-    stale
-}
-
-fn source_newer_than_index(source: &Path, index: &Path) -> bool {
+/// True when `source` changed after `index` was written, so the index may
+/// record old positions. Best-effort: a stat failure on either side counts as
+/// "not newer".
+pub(crate) fn source_newer_than_index(source: &Path, index: &Path) -> bool {
     let Ok(source_mtime) = std::fs::metadata(source).and_then(|meta| meta.modified()) else {
         return false;
     };
@@ -919,7 +816,6 @@ impl<'de> Deserialize<'de> for LocationRaw {
     reason = "test code uses unwrap/expect/panic to surface failure paths concisely"
 )]
 mod tests {
-    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -978,11 +874,14 @@ mod tests {
         serde_json::json!({ "f": { "m": module, "i": id } }).to_string()
     }
 
-    fn hit(index: &ReferenceIndex, file_suffix: &str, kind: RefKind) -> Vec<(u32, u32, u32, u32)> {
+    /// The hits of `kind` that `module`'s index recorded.
+    fn hit(index: &ReferenceIndex, module: &str, kind: RefKind) -> Vec<(u32, u32, u32, u32)> {
         index
-            .references
+            .modules
             .iter()
-            .filter(|reference| reference.kind == kind && reference.file.ends_with(file_suffix))
+            .filter(|hits| hits.module == module)
+            .flat_map(|hits| &hits.references)
+            .filter(|reference| reference.kind == kind)
             .map(|reference| {
                 (
                     reference.start_line,
@@ -994,28 +893,49 @@ mod tests {
             .collect()
     }
 
+    /// Every hit, from every module.
+    fn every_hit(index: &ReferenceIndex) -> impl Iterator<Item = &ReferenceLocation> {
+        index.modules.iter().flat_map(|hits| &hits.references)
+    }
+
     #[test]
     fn resolves_def_and_usages_across_modules() {
         let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.B", "demo_b.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo", None);
+        let index = references_to(project.path(), "Demo.A.foo");
 
         assert_eq!(index.status, IndexStatus::Present);
         assert_eq!(index.modules_scanned, 2);
         assert_eq!(index.modules_skipped, 0);
 
-        // Definition lives in Demo.A's source; module→source resolution is
-        // asserted by the file suffix.
-        assert_eq!(hit(&index, "Demo/A.lean", RefKind::Def), vec![(3, 4, 3, 7)]);
-        assert!(hit(&index, "Demo/A.lean", RefKind::Ref).is_empty());
+        // The definition is in Demo.A.
+        assert_eq!(hit(&index, "Demo.A", RefKind::Def), vec![(3, 4, 3, 7)]);
+        assert!(hit(&index, "Demo.A", RefKind::Ref).is_empty());
 
-        // Both usages live in Demo.B's source (one carries a 5th parentDecl
-        // element, which must be parsed and discarded).
-        assert!(hit(&index, "Demo/B.lean", RefKind::Def).is_empty());
-        let mut b_refs = hit(&index, "Demo/B.lean", RefKind::Ref);
+        // Both usages are in Demo.B (one carries a 5th parentDecl element,
+        // which must be parsed and discarded).
+        assert!(hit(&index, "Demo.B", RefKind::Def).is_empty());
+        let mut b_refs = hit(&index, "Demo.B", RefKind::Ref);
         b_refs.sort_unstable();
         assert_eq!(b_refs, vec![(5, 2, 5, 5), (6, 8, 6, 11)]);
 
-        assert_eq!(index.references.len(), 3);
+        assert_eq!(every_hit(&index).count(), 3);
+
+        // Each group names the index that recorded it, which is where a
+        // freshness check looks.
+        let build = project.path().join(BUILD_LIB_REL);
+        let mut groups: Vec<_> = index
+            .modules
+            .iter()
+            .map(|hits| (hits.module.as_str(), hits.index.clone()))
+            .collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec![
+                ("Demo.A", build.join("Demo/A.ilean")),
+                ("Demo.B", build.join("Demo/B.ilean"))
+            ]
+        );
     }
 
     #[test]
@@ -1023,11 +943,21 @@ mod tests {
         // demo_b.ilean carries an fvar key whose id is "Demo.A.foo" and a const
         // usage of "Init.Nat" — neither must surface for the queried name.
         let project = stage(&[("Demo.B", "demo_b.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo", None);
+        let index = references_to(project.path(), "Demo.A.foo");
 
         // Only the two const usages of Demo.A.foo, none from the fvar entry.
-        assert_eq!(index.references.len(), 2);
-        assert!(index.references.iter().all(|reference| reference.kind == RefKind::Ref));
+        assert_eq!(every_hit(&index).count(), 2);
+        assert!(every_hit(&index).all(|reference| reference.kind == RefKind::Ref));
+    }
+
+    #[test]
+    fn a_module_without_hits_forms_no_group() {
+        let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.B", "demo_b.ilean")]);
+        let index = references_to(project.path(), "Nat");
+
+        assert_eq!(index.modules_scanned, 2);
+        let modules: Vec<_> = index.modules.iter().map(|hits| hits.module.as_str()).collect();
+        assert_eq!(modules, vec!["Demo.A"], "only Demo.A uses Nat");
     }
 
     #[test]
@@ -1052,19 +982,19 @@ mod tests {
         // ...and a project query counts it as skipped while still resolving the
         // good module alongside it.
         let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.Bad", "malformed.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo", None);
+        let index = references_to(project.path(), "Demo.A.foo");
         assert_eq!(index.status, IndexStatus::Present);
         assert_eq!(index.modules_scanned, 1);
         assert_eq!(index.modules_skipped, 1);
-        assert_eq!(hit(&index, "Demo/A.lean", RefKind::Def), vec![(3, 4, 3, 7)]);
+        assert_eq!(hit(&index, "Demo.A", RefKind::Def), vec![(3, 4, 3, 7)]);
     }
 
     #[test]
     fn null_definition_yields_only_usages() {
         // Demo.B's entry for Demo.A.foo has a null definition.
         let project = stage(&[("Demo.B", "demo_b.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo", None);
-        assert!(index.references.iter().all(|reference| reference.kind == RefKind::Ref));
+        let index = references_to(project.path(), "Demo.A.foo");
+        assert!(every_hit(&index).all(|reference| reference.kind == RefKind::Ref));
     }
 
     #[test]
@@ -1085,27 +1015,31 @@ mod tests {
         fs::create_dir_all(tmp.path().join("Demo")).unwrap();
         fs::write(tmp.path().join("Demo/A.lean"), "-- no build\n").unwrap();
 
-        let index = references_to(tmp.path(), "Demo.A.foo", None);
+        let index = references_to(tmp.path(), "Demo.A.foo");
         assert_eq!(index.status, IndexStatus::NotBuilt);
-        assert!(index.references.is_empty());
+        assert!(index.modules.is_empty());
         assert_eq!(index.modules_scanned, 0);
     }
 
     #[test]
-    fn stale_source_is_flagged() {
-        // Stage normally, then bump the contributing source's mtime past its
-        // index. A short sleep guarantees a distinct mtime regardless of
-        // filesystem timestamp resolution.
+    fn a_source_edited_after_its_index_is_newer() {
+        // A short sleep between writes guarantees distinct mtimes whatever the
+        // file system's timestamp resolution.
         let project = stage(&[("Demo.A", "demo_a.ilean")]);
-        std::thread::sleep(Duration::from_millis(20));
         let source = project.path().join("Demo/A.lean");
-        fs::write(&source, "-- edited after build\n").unwrap();
+        let index = project.path().join(BUILD_LIB_REL).join("Demo/A.ilean");
 
-        let index = references_to(project.path(), "Demo.A.foo", None);
-        let stale: BTreeSet<_> = index.stale_sources.iter().collect();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&index, fixture("demo_a.ilean")).unwrap();
+        assert!(!source_newer_than_index(&source, &index), "rebuilt after the edit");
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&source, "-- edited after build\n").unwrap();
+        assert!(source_newer_than_index(&source, &index), "edited after the build");
+
         assert!(
-            stale.contains(&source),
-            "expected {source:?} flagged stale, got {stale:?}"
+            !source_newer_than_index(&project.path().join("Demo/Gone.lean"), &index),
+            "a file that cannot be read counts as not newer"
         );
     }
 
@@ -1164,11 +1098,11 @@ mod tests {
         };
         let name = std::env::var("LEAN_HOST_MCP_ILEAN_NAME").unwrap_or_else(|_| "Nat.add".to_owned());
         let started = std::time::Instant::now();
-        let index = references_to(Path::new(&root), &name, None);
+        let index = references_to(Path::new(&root), &name);
         let elapsed = started.elapsed();
         eprintln!(
             "references_to({name}) -> {} hits, {} scanned, {} skipped, status {:?} in {elapsed:?}",
-            index.references.len(),
+            every_hit(&index).count(),
             index.modules_scanned,
             index.modules_skipped,
             index.status,
@@ -1189,10 +1123,10 @@ mod tests {
         );
         let project = stage_bodies(&[("Demo.V", body)]);
 
-        let index = references_to(project.path(), "Demo.V.foo", None);
+        let index = references_to(project.path(), "Demo.V.foo");
         assert_eq!(index.modules_scanned, 1);
         assert_eq!(index.modules_skipped, 0);
-        assert_eq!(hit(&index, "Demo/V.lean", RefKind::Def), vec![(3, 4, 3, 7)]);
+        assert_eq!(hit(&index, "Demo.V", RefKind::Def), vec![(3, 4, 3, 7)]);
 
         // The declaration reader reaches `version` past a trailing key too.
         let declarations = declarations_in_module(project.path(), "Demo.V");
@@ -1311,95 +1245,14 @@ mod tests {
         ]);
 
         // Garbled `decls` must not cost a reference hit...
-        let index = references_to(project.path(), "Demo.A.foo", None);
+        let index = references_to(project.path(), "Demo.A.foo");
         assert_eq!(index.modules_skipped, 1, "only Demo.B's garbled references");
-        assert_eq!(hit(&index, "Demo/A.lean", RefKind::Def), vec![(3, 4, 3, 7)]);
+        assert_eq!(hit(&index, "Demo.A", RefKind::Def), vec![(3, 4, 3, 7)]);
 
         // ...and garbled `references` must not cost a declaration.
         let declarations = declarations_in_module(project.path(), "Demo.B");
         assert_eq!(declarations.status, ModuleDeclarationIndexStatus::Present);
         assert_eq!(declarations.declarations.len(), 1);
         assert_eq!(declarations.declarations.first().unwrap().name, "Demo.B.bar");
-    }
-
-    /// Narrowing changes which files are *read*, never which hits exist: a
-    /// restricted scan returns exactly the full walk's hits for those files.
-    #[test]
-    fn narrowing_agrees_with_the_full_walk() {
-        let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.B", "demo_b.ilean")]);
-        let full = references_to(project.path(), "Demo.A.foo", None);
-        assert_eq!(full.modules_scanned, 2);
-
-        for file in [PathBuf::from("Demo/B.lean"), project.path().join("Demo/B.lean")] {
-            let narrowed = references_to(project.path(), "Demo.A.foo", Some(std::slice::from_ref(&file)));
-            assert_eq!(narrowed.modules_scanned, 1, "read one index for {file:?}");
-            assert_eq!(
-                hit(&narrowed, "Demo/B.lean", RefKind::Ref),
-                hit(&full, "Demo/B.lean", RefKind::Ref),
-            );
-            assert!(
-                hit(&narrowed, "Demo/A.lean", RefKind::Def).is_empty(),
-                "a narrowed scan never reads the other module"
-            );
-        }
-    }
-
-    /// A path this mapping cannot invert falls back to the whole walk. Guessing
-    /// instead would silently drop hits, which is the failure the fallback
-    /// exists to prevent.
-    #[test]
-    fn narrowing_falls_back_when_a_path_cannot_be_inverted() {
-        let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.B", "demo_b.ilean")]);
-        let build = project.path().join(BUILD_LIB_REL);
-
-        let rejected = [
-            // No `M.split('.')` produces a dotted component.
-            PathBuf::from("Demo/A.B.lean"),
-            // Not a Lean source at all.
-            PathBuf::from("Demo/A.olean"),
-            // Outside the project root.
-            PathBuf::from("/elsewhere/Demo/A.lean"),
-            // Escapes the root the long way.
-            PathBuf::from("../Demo/A.lean"),
-        ];
-        for file in &rejected {
-            assert!(
-                indices_for(project.path(), &build, std::slice::from_ref(file)).is_none(),
-                "{file:?} must not be inverted"
-            );
-            let index = references_to(project.path(), "Demo.A.foo", Some(std::slice::from_ref(file)));
-            assert_eq!(index.modules_scanned, 2, "{file:?} must fall back to the full walk");
-        }
-    }
-
-    /// Lake mangles some module names on disk (module `«kan-lint-style»`
-    /// indexes as `kan-lint-style.ilean`), so a computed index that does not
-    /// exist means the real one lives under a name this mapping cannot
-    /// predict — never that the module has no references.
-    #[test]
-    fn narrowing_falls_back_when_the_computed_index_is_missing() {
-        let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.B", "demo_b.ilean")]);
-        fs::write(project.path().join("Demo/C.lean"), "-- no index of this name\n").unwrap();
-
-        let files = [PathBuf::from("Demo/C.lean"), PathBuf::from("Demo/B.lean")];
-        let index = references_to(project.path(), "Demo.A.foo", Some(&files));
-        assert_eq!(
-            index.modules_scanned, 2,
-            "one un-invertible member falls the whole request back"
-        );
-        assert_eq!(hit(&index, "Demo/A.lean", RefKind::Def), vec![(3, 4, 3, 7)]);
-    }
-
-    #[test]
-    fn fresh_source_is_not_flagged() {
-        // Index written after the source (stage writes index then source, but
-        // we re-touch the index last to be unambiguous): no stale entry.
-        let project = stage(&[("Demo.A", "demo_a.ilean")]);
-        std::thread::sleep(Duration::from_millis(20));
-        let index_file = project.path().join(BUILD_LIB_REL).join("Demo/A.ilean");
-        fs::write(&index_file, fixture("demo_a.ilean")).unwrap();
-
-        let index = references_to(project.path(), "Demo.A.foo", None);
-        assert!(index.stale_sources.is_empty());
     }
 }

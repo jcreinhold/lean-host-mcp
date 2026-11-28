@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   each resident worker kept from its last completed call on its current generation. The field is absent when no resident
   worker has one, and `lean_status` still opens no worker. The status and compatibility types no longer derive
   `JsonSchema`, and a receipt's `loaded` facts use lean-rs's `LeanWorkerHostRuntimeMetadata`.
+- In the library, `tools::build::ImportsRequest` and `ImportsReply` gain a `modules` field.
 - The server runs only the worker in the generation that `<workers>/<id>/current-generation` selects, and only when that
   generation's `worker.json` holds every field this release writes. An install made by an older lean-host-mcp must be
   redone with `install` or `install-worker`: a worker in the toolchain's directory itself or at the top of the worker
@@ -38,6 +39,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   imported a missing module under a library root failed with Lake's raw error, and a trial told you to build the
   project. `lean_imports` reports such a file with code `unknown_import`, and the request log with outcome
   `unknown_import`. A client that lists trust statuses should add the new one.
+- `lean_imports` takes `modules`, up to 128 names, and lists for each the source file Lake reads, under its library's
+  `srcDir`, and the direct imports its header lists, with `all`, `public` and `meta` flags. One
+  `lake --no-build --no-cache query --json +MODULE:lean +MODULE:header` answers them all, plus one more run for each
+  name no library matches. A module Lake cannot answer for, such as `Init`, gets its own `error`, code `unknown_module`
+  or `module_header_failed`, and the rest still answer. `files` may now be empty, and the reply always holds `modules`.
 
 ### Changed
 
@@ -67,6 +73,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a build, the reply is `needs_build`. Any other failure still reports stage `lake_option_discovery` and runs no proof
   check. The lookup counts against the request's deadline, not a separate 30-second budget, and takes about 0.4 s on the
   test fixture, where the old reader took about 0.9 s.
+- The server asks Lake which module a file is and where a module's source lies. Before, it built one from the other by
+  path, which ignored a library's own `srcDir`, such as `tests/lean` or `scripts/lean`, and named modules for files
+  outside every library.
+  - Project-scope references name the file Lake reads for each module with hits, from one
+    `lake --no-build --no-cache query --json +MODULE:lean` that runs only when there are hits. `files` now keeps the
+    hits in the files it names but no longer limits which indexes are read, so `files_scanned` counts every index. A
+    module Lake names no source for, as one a deleted or renamed file leaves, contributes no hits, and a warning names
+    it; before, its hits named a file that did not exist.
+  - `lean_lookup` declarations with a module target, and `lean_verify` `module_all`, check the source Lake names, for a
+    Lake dependency's module too; before, such a module fell back to its index, or, in a dependency, reported
+    `missing_build`. When Lake names no source, the index's trust row reads `stale_build` with no next action, since no
+    build refreshes the index of a module that is gone; before, it read `build_fresh`. A module with neither a source
+    nor an index is `not_found`, with Lake's message; before, it was `missing_build` with advice to build. `module_all`
+    rows for a module with no source name the file `<lean_verify module M>`.
+  - `lean_lookup` declarations with a file target, `lean_lookup` declaration with a `file` and `lean_verify` `file_all`
+    take the file's module from `lake setup-file`, which costs one more Lake run, about 0.4 s on the test fixture. A
+    file outside every library has no module.
+  - Proof search from a file takes the goal's module from the setup Lake gives the file, so it works for a file under a
+    library's own `srcDir` or outside every library; before, it failed with "cannot select semantic source module".
 
 ## [0.18.0] - 2026-11-27
 

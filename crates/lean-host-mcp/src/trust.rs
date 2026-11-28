@@ -178,23 +178,17 @@ impl ArtifactTrust {
             ))
     }
 
-    pub fn ilean_module_stale_build(module: impl Into<String>, path: impl Into<String>) -> Self {
+    /// The `.ilean` index of a module Lake names no source for. An earlier
+    /// build left it for a module since deleted or renamed, so no build
+    /// refreshes it.
+    pub fn ilean_module_without_source(module: impl Into<String>, path: impl Into<String>) -> Self {
         let module = module.into();
         Self::new(ArtifactKind::Ilean, TrustScope::Module, TrustStatus::StaleBuild)
             .module(module.clone())
             .path(path)
             .detail(format!(
-                "module `{module}` source is newer than its .ilean declaration index"
+                "Lake names no source for module `{module}`; an earlier build left its .ilean declaration index"
             ))
-            .next_action(build_action(&[&module]))
-    }
-
-    pub fn ilean_module_missing_build(module: impl Into<String>) -> Self {
-        let module = module.into();
-        Self::new(ArtifactKind::Ilean, TrustScope::Module, TrustStatus::MissingBuild)
-            .module(module.clone())
-            .detail(format!("module `{module}` has no built .ilean declaration index"))
-            .next_action(build_action(&[&module]))
     }
 
     pub fn olean_project_missing_build(detail: impl Into<String>) -> Self {
