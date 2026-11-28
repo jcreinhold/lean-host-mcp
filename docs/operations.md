@@ -250,7 +250,9 @@ A 0.19 server and its worker upgrade together, with lean-rs 0.13, lean-semantic-
 3. Run `lean-host-mcp config check --lake-root PROJECT`. A config file that does not parse now stops the server at
    startup, where 0.18 served with the defaults.
 4. Start the server again. Its first call asks Lake for the import roots, about 0.3 s on a small project, and the server
-   asks again after each change to the lakefile, the toolchain pin or the manifest.
+   asks again after each change to the lakefile, the toolchain pin or the manifest. A change that alters the roots
+   replaces the worker on the next call, and while Lake cannot load the workspace, a call that needs a worker fails with
+   Lake's error.
 
 Clients:
 
