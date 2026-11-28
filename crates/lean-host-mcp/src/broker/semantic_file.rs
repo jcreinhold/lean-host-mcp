@@ -41,7 +41,8 @@ impl ProjectBroker {
         if setup.module != super::module_setup::EXTERNAL_MODULE {
             request.candidate_modules.insert(0, setup.module.clone());
         }
-        reader.roots = crate::lake_meta::manifest_artifact_roots(&root);
+        // Lean's own search path: Lake's roots, then the release's modules.
+        reader.roots = setup.roots.to_vec();
         reader.roots.push(reader.sysroot.join("lib/lean"));
         let PreparedReader { sysroot, roots, .. } = reader;
         let cancellation = CallCancellation::current();
@@ -77,8 +78,8 @@ impl ProjectBroker {
                         request_file.into_os_string(),
                     ],
                     environment: vec![
-                        ("LEAN_PATH".into(), lean_path),
-                        ("LEAN_SYSROOT".into(), sysroot.into_os_string()),
+                        ("LEAN_PATH".into(), Some(lean_path)),
+                        ("LEAN_SYSROOT".into(), Some(sysroot.into_os_string())),
                     ],
                     cwd: assets.into(),
                     max_stdout_bytes: crate::lean_run::OUTPUT_LIMIT,

@@ -26,6 +26,15 @@ pub const RECORD_FILE_NAME: &str = "worker.json";
 /// Directory of a generation that holds its own built copy of the SDK shims.
 pub const SHIMS_DIR: &str = "shims";
 
+/// Directory of a generation that holds the empty project the installer's
+/// smoke test serves. It is no Lake project: the worker serves its one import
+/// root, [`SMOKE_IMPORT_ROOT`], and no Lake runs for it.
+pub const SMOKE_PROJECT_DIR: &str = "smoke-project";
+
+/// The smoke project's one import root, relative to the generation. The
+/// worker serves it when the host names no import roots at launch.
+pub const SMOKE_IMPORT_ROOT: &str = "smoke-project/lean";
+
 /// Largest record the server or the worker reads.
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 

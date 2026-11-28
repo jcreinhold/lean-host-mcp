@@ -199,6 +199,10 @@ struct BrokerInner {
     /// from. Purely a cost cache: [`ProjectBroker::meta`] revalidates against
     /// disk on every lookup, so it is never served stale.
     meta_cache: Option<(ProjectInputStamp, LakeProjectMeta)>,
+    /// Lake's last answer for a root's import roots, with the stamp of the
+    /// files Lake configures the workspace from; see
+    /// [`ProjectBroker::import_roots`].
+    import_roots: Option<module_setup::ImportRoots>,
     /// Fair read and write turns per canonical root.
     locks: crate::project_lock::ProjectLocks,
 }
@@ -264,6 +268,7 @@ impl ProjectBroker {
                 opening_locks: HashMap::new(),
                 shutdown_epoch: 0,
                 meta_cache: None,
+                import_roots: None,
                 locks: crate::project_lock::ProjectLocks::default(),
             })),
             runtime_config,
@@ -898,6 +903,8 @@ impl ProjectBroker {
             .await
             .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
         let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
+        // The worker imports through Lake's roots alone and runs no Lake.
+        let import_roots = self.import_roots(&root).await?;
         let cancellation = CallCancellation::current();
         let prepared =
             host_artifacts::installed_host_artifacts(&root, &worker, &sysroot, deadline, &cancellation).await?;
@@ -959,7 +966,15 @@ impl ProjectBroker {
             // Hold same-root serialization through registration even when the
             // async caller disappears while blocking startup is still running.
             let _open_guard = open_guard;
-            let opened = LeanProject::open(meta, runtime_config, slot, maintenance, prepared, initialization)?;
+            let opened = LeanProject::open(
+                meta,
+                runtime_config,
+                slot,
+                maintenance,
+                prepared,
+                import_roots,
+                initialization,
+            )?;
             let mut registry = inner.lock();
             if registry.shutdown_epoch != epoch {
                 drop(registry);

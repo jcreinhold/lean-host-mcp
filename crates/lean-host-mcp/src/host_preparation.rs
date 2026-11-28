@@ -38,7 +38,10 @@ const READY_FLAG: &str = "--lean-rs-ready-host-artifacts";
 pub(crate) const PREPARE_FLAG: &str = "--lean-rs-prepare-host-artifacts";
 // The SDK variables this process may have inherited that would change an
 // artifact mode: a parent's lifeline and a parent's prepared artifacts.
-const SCRUB_ENV: &[&str] = &["LEAN_RS_WORKER_PARENT_LIFELINE", "LEAN_RS_PREPARED_HOST_ARTIFACTS"];
+const SCRUB_ENV: &[&str] = &[
+    lean_rs_worker_protocol::WORKER_PARENT_LIFELINE_ENV,
+    lean_rs_worker_protocol::PREPARED_HOST_ARTIFACTS_ENV,
+];
 
 /// Failed preparation supplies no native check result or independent-H exit proof.
 #[derive(Debug)]

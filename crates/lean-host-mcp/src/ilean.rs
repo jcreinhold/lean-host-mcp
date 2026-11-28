@@ -1,21 +1,24 @@
 //! Pure-Rust reader for Lean's per-module `.ilean` reference indices.
 //!
-//! `lake build` writes one `.ilean` file per module under
-//! `<project>/.lake/build/lib/lean/`. An `.ilean` is the LSP reference index:
-//! for every name it records the definition site and all usage sites *within
-//! that module's source*. Reading it answers "all references to a
-//! fully-qualified name `N`" in milliseconds — no Lean runtime, no
-//! re-elaboration — because the format is plain JSON (`Json.compress`) with
-//! names stored as strings. This module therefore lives in the parent crate
-//! and links nothing from Lean.
+//! `lake build` writes one `.ilean` file per module beside its `.olean`, in
+//! the import directory of the module's package. An `.ilean` is the LSP
+//! reference index: for every name it records the definition site and all
+//! usage sites *within that module's source*. Reading it answers "all
+//! references to a fully-qualified name `N`" in milliseconds — no Lean
+//! runtime, no re-elaboration — because the format is plain JSON
+//! (`Json.compress`) with names stored as strings. This module therefore
+//! lives in the parent crate and links nothing from Lean.
 //!
-//! The boundary is one query: [`references_to`] takes a project root and a
-//! fully-qualified name and returns a [`ReferenceIndex`] of hits grouped by
-//! the module whose index recorded them (LSP range + def/ref kind).
-//! Everything else — file enumeration, the compact-array JSON codecs and the
-//! version gate — is hidden. The raw JSON types are private; callers never
-//! see them. A module's source file is Lake's to name: callers ask
-//! `ProjectBroker::module_sources`, since a library's `srcDir` decides it.
+//! The boundary is two queries over Lake's import roots
+//! (`ProjectBroker::import_roots`), so this module assumes no build layout.
+//! [`references_to`] takes a fully-qualified name and returns a
+//! [`ReferenceIndex`] of hits grouped by the module whose index recorded them
+//! (LSP range + def/ref kind). [`declarations_in_module`] finds one module's
+//! index as Lean finds a module. Everything else — file enumeration, the
+//! compact-array JSON codecs and the version gate — is hidden. The raw JSON
+//! types are private; callers never see them. A module's source file is
+//! Lake's to name: callers ask `ProjectBroker::module_sources`, since a
+//! library's `srcDir` decides it.
 //!
 //! A missing index is reported as **data**, not an error: a project that was
 //! never built yields [`IndexStatus::NotBuilt`]. A single malformed
@@ -39,11 +42,6 @@ use walkdir::WalkDir;
 /// Only this `.ilean` format version is understood. A different version is
 /// rejected rather than parsed into a silent wrong answer.
 const SUPPORTED_VERSION: u64 = 5;
-
-/// Project-relative path to the directory holding the project's own module
-/// indices. Dependency indices live under separate `.lake/packages/*/` trees,
-/// so a recursive walk of this directory yields exactly the project's modules.
-use crate::lake_meta::BUILD_LIB_REL;
 
 /// Whether a resolved location is a definition site or a use site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +69,8 @@ pub(crate) struct ReferenceLocation {
 /// Whether the project's reference index exists on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexStatus {
-    /// `<root>/.lake/build/lib/lean` is missing — the project was never built.
+    /// The root package's import directory is missing: the project was
+    /// never built.
     NotBuilt,
     /// The index directory exists and was scanned.
     Present,
@@ -98,16 +97,6 @@ pub(crate) struct ModuleHits {
     pub references: Vec<ReferenceLocation>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModuleDeclarationIndexStatus {
-    /// `<root>/.lake/build/lib/lean` is missing — the project was never built.
-    ProjectNotBuilt,
-    /// The build tree exists, but this module has no `.ilean` file.
-    ModuleNotBuilt,
-    /// The module index exists and was parsed.
-    Present,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedDeclaration {
     pub name: String,
@@ -123,10 +112,12 @@ pub(crate) struct DeclSpan {
     pub end_column: u32,
 }
 
+/// The declarations one module's index records.
 #[derive(Debug, Clone)]
 pub(crate) struct ModuleDeclarationIndex {
-    pub status: ModuleDeclarationIndexStatus,
+    /// The module, as its index names it.
     pub module: String,
+    /// The index the declarations came from.
     pub index: PathBuf,
     pub declarations: Vec<IndexedDeclaration>,
 }
@@ -150,31 +141,36 @@ pub(crate) enum IleanError {
     },
 }
 
-/// Collect every reference to fully-qualified `name` in the project rooted at
-/// `project_root`.
+/// Collect every reference to fully-qualified `name` that the project's own
+/// modules record, given the project's import `roots`.
 ///
-/// The scan reads every `.ilean` under the build tree. An index names its
-/// module, not that module's source file, so callers that need the file ask
-/// Lake for the modules in [`ReferenceIndex::modules`].
+/// The scan reads every `.ilean` under the root package's import directory
+/// ([`crate::broker::module_setup::package_import_dir`]). Lake writes each
+/// dependency's indexes under that dependency's own root, so the scan reads
+/// no dependency. An index names its module, not that module's source file,
+/// so callers that need the file ask Lake for the modules in
+/// [`ReferenceIndex::modules`].
 ///
-/// Infallible at the top level: a missing build directory yields
+/// Infallible at the top level: a missing import directory yields
 /// [`IndexStatus::NotBuilt`]; an individual unreadable or malformed `.ilean`
 /// is counted in [`ReferenceIndex::modules_skipped`] and skipped. Never panics.
-pub(crate) fn references_to(project_root: &Path, name: &str) -> ReferenceIndex {
-    let build_dir = project_root.join(BUILD_LIB_REL);
+pub(crate) fn references_to(roots: &[PathBuf], name: &str) -> ReferenceIndex {
     let mut found = ReferenceIndex {
         status: IndexStatus::NotBuilt,
         modules: Vec::new(),
         modules_scanned: 0,
         modules_skipped: 0,
     };
-    if !build_dir.is_dir() {
+    let Some(package_dir) = crate::broker::module_setup::package_import_dir(roots).filter(|dir| dir.is_dir()) else {
         return found;
-    }
+    };
     found.status = IndexStatus::Present;
 
     let matcher = KeyMatcher::new(name);
-    for entry in WalkDir::new(&build_dir).into_iter().filter_map(std::result::Result::ok) {
+    for entry in WalkDir::new(package_dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
         let index_path = entry.path();
         if !entry.file_type().is_file() || index_path.extension().is_none_or(|ext| ext != "ilean") {
             continue;
@@ -199,35 +195,13 @@ pub(crate) fn references_to(project_root: &Path, name: &str) -> ReferenceIndex {
     found
 }
 
-/// The declarations one module's index records, read from the index at the
-/// path Lake's build layout gives that module.
-pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> ModuleDeclarationIndex {
-    let build_dir = project_root.join(BUILD_LIB_REL);
-    let index = module_to_index(project_root, module);
-    if !build_dir.is_dir() {
-        return ModuleDeclarationIndex {
-            status: ModuleDeclarationIndexStatus::ProjectNotBuilt,
-            module: module.to_owned(),
-            index,
-            declarations: Vec::new(),
-        };
-    }
-    if !index.is_file() {
-        return ModuleDeclarationIndex {
-            status: ModuleDeclarationIndexStatus::ModuleNotBuilt,
-            module: module.to_owned(),
-            index,
-            declarations: Vec::new(),
-        };
-    }
-    let Ok(raw) = load_declarations(&index) else {
-        return ModuleDeclarationIndex {
-            status: ModuleDeclarationIndexStatus::ModuleNotBuilt,
-            module: module.to_owned(),
-            index,
-            declarations: Vec::new(),
-        };
-    };
+/// The declarations that the index of `module` records, found on the
+/// project's import `roots` as Lean finds a module ([`module_index`]).
+/// `None` when no root holds the module's package, or when the index there
+/// is missing or cannot be read.
+pub(crate) fn declarations_in_module(roots: &[PathBuf], module: &str) -> Option<ModuleDeclarationIndex> {
+    let index = module_index(roots, module)?;
+    let raw = load_declarations(&index).ok()?;
     let mut declarations = raw
         .decls
         .into_iter()
@@ -244,12 +218,11 @@ pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> Modul
             .then(a.declaration_span.start_column.cmp(&b.declaration_span.start_column))
             .then(a.name.cmp(&b.name))
     });
-    ModuleDeclarationIndex {
-        status: ModuleDeclarationIndexStatus::Present,
+    Some(ModuleDeclarationIndex {
         module: raw.module,
         index,
         declarations,
-    }
+    })
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>, IleanError> {
@@ -350,9 +323,19 @@ fn load_declarations(path: &Path) -> Result<ModuleDeclarations, IleanError> {
     }
 }
 
-fn module_to_index(root: &Path, module: &str) -> PathBuf {
-    let relative: PathBuf = module.split('.').collect();
-    root.join(BUILD_LIB_REL).join(relative).with_extension("ilean")
+/// The `.ilean` path of `module` on the search path `roots`, by Lean's rule
+/// (`SearchPath.findWithExt`): the first root that holds a directory or an
+/// index named for the module's first component holds the module's whole
+/// package, even when it lacks the module. `None` when no root holds it.
+fn module_index(roots: &[PathBuf], module: &str) -> Option<PathBuf> {
+    let package = module.split('.').next()?;
+    let root = roots
+        .iter()
+        .find(|root| root.join(package).is_dir() || root.join(format!("{package}.ilean")).exists())?;
+    Some(
+        root.join(module.split('.').collect::<PathBuf>())
+            .with_extension("ilean"),
+    )
 }
 
 /// Precomputed state for testing one `references` map key against the query.
@@ -819,9 +802,13 @@ mod tests {
 
     use super::*;
 
-    /// Read a committed fixture body. The `.lake/` directory is gitignored, so
-    /// the raw `.ilean` JSON bodies are committed as flat files and staged into
-    /// the real on-disk layout per test (see [`stage`]).
+    /// Where the tests put the package's indexes. The reader takes the
+    /// directory from Lake's import roots, so any directory serves.
+    const IMPORT_DIR: &str = "imports";
+
+    /// Read a committed fixture body. The raw `.ilean` JSON bodies are
+    /// committed as flat files and staged into an import root per test (see
+    /// [`stage`]).
     fn fixture(name: &str) -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/ilean")
@@ -830,8 +817,8 @@ mod tests {
     }
 
     /// Materialize a project root in a tempdir: each `(module, fixture)` pair
-    /// writes the fixture body to `<root>/.lake/build/lib/lean/<Mod/Path>.ilean`
-    /// and a matching source stub at `<root>/<Mod/Path>.lean`.
+    /// writes the fixture body to `<root>/<IMPORT_DIR>/<Mod/Path>.ilean` and a
+    /// matching source stub at `<root>/<Mod/Path>.lean`.
     fn stage(modules: &[(&str, &str)]) -> tempfile::TempDir {
         let bodies: Vec<(&str, String)> = modules
             .iter()
@@ -845,7 +832,7 @@ mod tests {
     /// assertion says more than a committed file named after the property.
     fn stage_bodies(modules: &[(&str, String)]) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        let build = tmp.path().join(BUILD_LIB_REL);
+        let build = tmp.path().join(IMPORT_DIR);
         for (module, body) in modules {
             let relative: PathBuf = module.split('.').collect();
 
@@ -858,6 +845,11 @@ mod tests {
             fs::write(&source, "-- source stub\n").unwrap();
         }
         tmp
+    }
+
+    /// The import roots of a staged project: its one package's directory.
+    fn roots(project: &tempfile::TempDir) -> Vec<PathBuf> {
+        vec![project.path().join(IMPORT_DIR)]
     }
 
     /// A `references` key as Lean writes it: compressed JSON, itself a string.
@@ -898,7 +890,7 @@ mod tests {
     #[test]
     fn resolves_def_and_usages_across_modules() {
         let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.B", "demo_b.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo");
+        let index = references_to(&roots(&project), "Demo.A.foo");
 
         assert_eq!(index.status, IndexStatus::Present);
         assert_eq!(index.modules_scanned, 2);
@@ -923,7 +915,7 @@ mod tests {
         // demo_b.ilean carries an fvar key whose id is "Demo.A.foo" and a const
         // usage of "Init.Nat" — neither must surface for the queried name.
         let project = stage(&[("Demo.B", "demo_b.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo");
+        let index = references_to(&roots(&project), "Demo.A.foo");
 
         // Only the two const usages of Demo.A.foo, none from the fvar entry.
         assert_eq!(every_hit(&index).count(), 2);
@@ -933,7 +925,7 @@ mod tests {
     #[test]
     fn a_module_without_hits_forms_no_group() {
         let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.B", "demo_b.ilean")]);
-        let index = references_to(project.path(), "Nat");
+        let index = references_to(&roots(&project), "Nat");
 
         assert_eq!(index.modules_scanned, 2);
         let modules: Vec<_> = index.modules.iter().map(|hits| hits.module.as_str()).collect();
@@ -962,7 +954,7 @@ mod tests {
         // ...and a project query counts it as skipped while still resolving the
         // good module alongside it.
         let project = stage(&[("Demo.A", "demo_a.ilean"), ("Demo.Bad", "malformed.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo");
+        let index = references_to(&roots(&project), "Demo.A.foo");
         assert_eq!(index.status, IndexStatus::Present);
         assert_eq!(index.modules_scanned, 1);
         assert_eq!(index.modules_skipped, 1);
@@ -973,7 +965,7 @@ mod tests {
     fn null_definition_yields_only_usages() {
         // Demo.B's entry for Demo.A.foo has a null definition.
         let project = stage(&[("Demo.B", "demo_b.ilean")]);
-        let index = references_to(project.path(), "Demo.A.foo");
+        let index = references_to(&roots(&project), "Demo.A.foo");
         assert!(every_hit(&index).all(|reference| reference.kind == RefKind::Ref));
     }
 
@@ -995,10 +987,11 @@ mod tests {
         fs::create_dir_all(tmp.path().join("Demo")).unwrap();
         fs::write(tmp.path().join("Demo/A.lean"), "-- no build\n").unwrap();
 
-        let index = references_to(tmp.path(), "Demo.A.foo");
+        let index = references_to(&[tmp.path().join(IMPORT_DIR)], "Demo.A.foo");
         assert_eq!(index.status, IndexStatus::NotBuilt);
         assert!(index.modules.is_empty());
         assert_eq!(index.modules_scanned, 0);
+        assert_eq!(references_to(&[], "Demo.A.foo").status, IndexStatus::NotBuilt);
     }
 
     #[test]
@@ -1007,7 +1000,7 @@ mod tests {
         // file system's timestamp resolution.
         let project = stage(&[("Demo.A", "demo_a.ilean")]);
         let source = project.path().join("Demo/A.lean");
-        let index = project.path().join(BUILD_LIB_REL).join("Demo/A.ilean");
+        let index = project.path().join(IMPORT_DIR).join("Demo/A.ilean");
 
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&index, fixture("demo_a.ilean")).unwrap();
@@ -1026,9 +1019,9 @@ mod tests {
     #[test]
     fn declarations_in_module_reads_decl_ranges_from_ilean() {
         let project = stage(&[("Demo.A", "demo_a.ilean")]);
-        let index = declarations_in_module(project.path(), "Demo.A");
+        let index = declarations_in_module(&roots(&project), "Demo.A").unwrap();
 
-        assert_eq!(index.status, ModuleDeclarationIndexStatus::Present);
+        assert_eq!(index.module, "Demo.A");
         assert_eq!(index.declarations.len(), 1);
         let declaration = index.declarations.first().unwrap();
         assert_eq!(declaration.name, "Demo.A.foo");
@@ -1037,21 +1030,41 @@ mod tests {
     }
 
     #[test]
-    fn declarations_in_module_reports_missing_module_index() {
+    fn declarations_in_module_finds_no_missing_module_index() {
         let project = stage(&[("Demo.A", "demo_a.ilean")]);
-        let index = declarations_in_module(project.path(), "Demo.Missing");
-
-        assert_eq!(index.status, ModuleDeclarationIndexStatus::ModuleNotBuilt);
-        assert!(index.declarations.is_empty());
+        assert!(declarations_in_module(&roots(&project), "Demo.Missing").is_none());
     }
 
     #[test]
-    fn declarations_in_module_reports_project_not_built() {
+    fn declarations_in_module_finds_nothing_in_an_unbuilt_project() {
         let tmp = tempfile::tempdir().unwrap();
-        let index = declarations_in_module(tmp.path(), "Demo.A");
+        assert!(declarations_in_module(&[tmp.path().join(IMPORT_DIR)], "Demo.A").is_none());
+    }
 
-        assert_eq!(index.status, ModuleDeclarationIndexStatus::ProjectNotBuilt);
-        assert!(index.declarations.is_empty());
+    /// Lean gives a module's whole package to the first root that holds a
+    /// directory or an index named for the package, so a later root's copy of
+    /// the module is never read.
+    #[test]
+    fn a_module_index_lies_on_the_first_root_that_holds_its_package() {
+        let project = stage(&[("Demo.A", "demo_a.ilean")]);
+        let package = project.path().join(IMPORT_DIR);
+        let others = tempfile::tempdir().unwrap();
+        let [empty, directory, file] = ["empty", "directory", "file"].map(|name| others.path().join(name));
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(directory.join("Demo")).unwrap();
+        fs::create_dir_all(&file).unwrap();
+        fs::write(file.join("Demo.ilean"), "{}").unwrap();
+
+        let found = declarations_in_module(&[empty, package.clone()], "Demo.A").unwrap();
+        assert_eq!(found.index, package.join("Demo/A.ilean"));
+        assert!(
+            declarations_in_module(&[directory, package.clone()], "Demo.A").is_none(),
+            "a root with a Demo directory holds the package"
+        );
+        assert!(
+            declarations_in_module(&[file, package], "Demo.A").is_none(),
+            "a root with a Demo index holds the package"
+        );
     }
 
     #[test]
@@ -1061,11 +1074,12 @@ mod tests {
         assert!(serde_json::from_str::<DeclInfoRaw>("[1,2,3,4,5,6,7,8,9]").is_err());
     }
 
-    /// Measurement, not a gate. Point at a real built project to sanity-check
-    /// shape and timing:
+    /// Measurement, not a gate. Point at the root package's import directory
+    /// of a real built project, the last root before Lake's own on the
+    /// `LEAN_PATH` that `lake env` prints, to sanity-check shape and timing:
     ///
     /// ```sh
-    /// LEAN_HOST_MCP_ILEAN_FIXTURE=~/Code/kan-proofs \
+    /// LEAN_HOST_MCP_ILEAN_FIXTURE=<import directory> \
     /// LEAN_HOST_MCP_ILEAN_NAME=<FQN> \
     /// cargo test -p lean-host-mcp ilean -- --ignored --nocapture
     /// ```
@@ -1078,7 +1092,7 @@ mod tests {
         };
         let name = std::env::var("LEAN_HOST_MCP_ILEAN_NAME").unwrap_or_else(|_| "Nat.add".to_owned());
         let started = std::time::Instant::now();
-        let index = references_to(Path::new(&root), &name);
+        let index = references_to(&[PathBuf::from(root)], &name);
         let elapsed = started.elapsed();
         eprintln!(
             "references_to({name}) -> {} hits, {} scanned, {} skipped, status {:?} in {elapsed:?}",
@@ -1103,14 +1117,13 @@ mod tests {
         );
         let project = stage_bodies(&[("Demo.V", body)]);
 
-        let index = references_to(project.path(), "Demo.V.foo");
+        let index = references_to(&roots(&project), "Demo.V.foo");
         assert_eq!(index.modules_scanned, 1);
         assert_eq!(index.modules_skipped, 0);
         assert_eq!(hit(&index, "Demo.V", RefKind::Def), vec![(3, 4, 3, 7)]);
 
         // The declaration reader reaches `version` past a trailing key too.
-        let declarations = declarations_in_module(project.path(), "Demo.V");
-        assert_eq!(declarations.status, ModuleDeclarationIndexStatus::Present);
+        let declarations = declarations_in_module(&roots(&project), "Demo.V").unwrap();
         assert_eq!(declarations.declarations.len(), 1);
     }
 
@@ -1124,7 +1137,7 @@ mod tests {
             "Demo.F",
             r#"{"decls":{},"module":"Demo.F","references":42,"version":99}"#.to_owned(),
         )]);
-        let path = project.path().join(BUILD_LIB_REL).join("Demo/F.ilean");
+        let path = project.path().join(IMPORT_DIR).join("Demo/F.ilean");
 
         match load_references(&path, &KeyMatcher::new("Demo.F.foo")) {
             Err(IleanError::UnsupportedVersion { found, .. }) => assert_eq!(found, 99),
@@ -1136,7 +1149,7 @@ mod tests {
     #[test]
     fn missing_version_is_a_json_error() {
         let project = stage_bodies(&[("Demo.N", r#"{"decls":{},"module":"Demo.N","references":{}}"#.to_owned())]);
-        let path = project.path().join(BUILD_LIB_REL).join("Demo/N.ilean");
+        let path = project.path().join(IMPORT_DIR).join("Demo/N.ilean");
 
         match load_references(&path, &KeyMatcher::new("Demo.N.foo")) {
             Err(IleanError::Json { source, .. }) => {
@@ -1225,13 +1238,12 @@ mod tests {
         ]);
 
         // Garbled `decls` must not cost a reference hit...
-        let index = references_to(project.path(), "Demo.A.foo");
+        let index = references_to(&roots(&project), "Demo.A.foo");
         assert_eq!(index.modules_skipped, 1, "only Demo.B's garbled references");
         assert_eq!(hit(&index, "Demo.A", RefKind::Def), vec![(3, 4, 3, 7)]);
 
         // ...and garbled `references` must not cost a declaration.
-        let declarations = declarations_in_module(project.path(), "Demo.B");
-        assert_eq!(declarations.status, ModuleDeclarationIndexStatus::Present);
+        let declarations = declarations_in_module(&roots(&project), "Demo.B").unwrap();
         assert_eq!(declarations.declarations.len(), 1);
         assert_eq!(declarations.declarations.first().unwrap().name, "Demo.B.bar");
     }

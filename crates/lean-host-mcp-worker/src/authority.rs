@@ -1,17 +1,18 @@
 //! The installed worker serves one Lake project from that project's own build.
 //!
-//! The host names the project's import roots at launch, in Lean's search
-//! order, through `LEAN_RS_WORKER_APPLICATION_INPUT`. Without that input the
-//! worker serves the installer's empty smoke project. The server that launched
-//! the worker owns the project's checkout: no other server builds it, and this
-//! one stops the worker before each build it runs. A worker whose launch roots
-//! are not Lake build outputs refuses each import with the reason, rather than
+//! The host asks Lake for the project's import roots and names them at launch,
+//! in Lean's search order, through [`WORKER_APPLICATION_INPUT_ENV`]. The worker
+//! gives the SDK those roots, so the SDK runs no Lake of its own. Without that
+//! input the worker serves the installer's empty smoke project. The server that
+//! launched the worker owns the project's checkout: no other server builds it,
+//! and this one stops the worker before each build it runs. A worker whose
+//! launch roots are invalid refuses each import with the reason, rather than
 //! exit before the SDK child connects. It admits an import or a source request
 //! only when Lean searches exactly the launch roots, then the shim roots, then
 //! the release, and only while no launch root holds a module package whose
 //! compiled code this process runs: the release's or the shims'. It refuses
 //! project libraries, plugins, terms, kernel requests and worker commands.
-use lean_host_mcp_worker::{Deployment, SHIMS_DIR, invalid_data};
+use lean_host_mcp_worker::{Deployment, SHIMS_DIR, SMOKE_IMPORT_ROOT, invalid_data};
 use lean_rs::host_bridge::{
     HostCachedModuleBatch, HostModuleBatch, HostModuleQuery, HostSourceOptions, TrustedHostKernelRequest,
     TrustedHostTerm, TrustedModuleSource,
@@ -24,6 +25,7 @@ use lean_rs::module::{
 use lean_rs::{LeanResult, LeanRuntime};
 use lean_rs_host::host::LeanPreparedHostArtifacts;
 use lean_rs_worker_child::{WorkerAuthority, WorkerManifestRead, WorkerSourceContext};
+use lean_rs_worker_protocol::WORKER_APPLICATION_INPUT_ENV;
 use lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -32,8 +34,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Where Lake writes a package's `.olean` files, relative to the package.
-const BUILD_LIB: &str = ".lake/build/lib/lean";
 /// Most launch roots the worker accepts, one for each package of the project's
 /// Lake workspace. A worker launched with more refuses every import.
 const MAX_LAUNCH_ROOTS: usize = 32;
@@ -87,24 +87,24 @@ pub(super) fn digest(path: &Path) -> io::Result<String> {
 }
 /// The import roots the host named at launch, in Lean's search order, or the
 /// smoke project's one root when it named none.
+///
+/// Lake decides where each package's modules go, so a root may be any
+/// absolute directory; [`Installed::check_roots`] still refuses a root that
+/// shadows a package whose compiled code this process runs.
 fn launch_roots(dir: &Path) -> io::Result<Vec<String>> {
-    let roots = match std::env::var_os("LEAN_RS_WORKER_APPLICATION_INPUT") {
+    let roots = match std::env::var_os(WORKER_APPLICATION_INPUT_ENV) {
         Some(input) => serde_json::from_slice::<Vec<String>>(input.as_encoded_bytes())?,
         None => vec![
-            dir.join("smoke-project")
-                .join(BUILD_LIB)
+            dir.join(SMOKE_IMPORT_ROOT)
                 .into_os_string()
                 .into_string()
                 .map_err(|_| invalid_data("invalid installed path encoding"))?,
         ],
     };
-    if roots.is_empty()
-        || roots.len() > MAX_LAUNCH_ROOTS
-        || roots
-            .iter()
-            .any(|root| !Path::new(root).is_absolute() || !Path::new(root).ends_with(BUILD_LIB))
-    {
-        return Err(invalid_data("launch roots are not Lake build outputs"));
+    if roots.is_empty() || roots.len() > MAX_LAUNCH_ROOTS || roots.iter().any(|root| !Path::new(root).is_absolute()) {
+        return Err(invalid_data(format!(
+            "launch roots must be 1 to {MAX_LAUNCH_ROOTS} absolute paths"
+        )));
     }
     Ok(roots)
 }
@@ -440,6 +440,14 @@ impl WorkerAuthority for Installed {
     }
     fn manifest_read(&self, _: &Path) -> LeanResult<WorkerManifestRead> {
         Err(deny())
+    }
+    /// The launch roots, which the host had from Lake, so the SDK runs no
+    /// `lake env` of its own.
+    fn project_import_roots(&self, _: &Path) -> LeanResult<Option<Vec<PathBuf>>> {
+        if let Some(error) = &self.refusal {
+            return Err(refuse(error));
+        }
+        Ok(Some(self.paths.iter().take(self.launch).map(PathBuf::from).collect()))
     }
     fn worker(&self, _: &'static LeanRuntime, _: &Path, _: &[u8]) -> LeanResult<AuthorizedWorkerSnapshot<'static>> {
         Err(deny())

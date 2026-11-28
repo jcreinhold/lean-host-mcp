@@ -145,7 +145,11 @@ async fn inventory(
                         worker_declarations(ctx, hint, root, &source, Some(module), limit, supervised).await?;
                     Ok((response, Some(source)))
                 }
-                Err(why) => Ok((index_declarations(ctx, hint, root, &module, &why, limit)?, None)),
+                Err(why) => {
+                    // Lake names the directories that hold the indexes.
+                    let roots = ctx.broker.import_roots(root).await?;
+                    Ok((index_declarations(ctx, hint, root, &roots, &module, &why, limit)?, None))
+                }
             }
         }
     }
@@ -199,9 +203,13 @@ async fn worker_declarations(
         None if result.status == "ok" => ctx.broker.file_module(root, &resolved).await?,
         Some(_) | None => None,
     };
-    let index_fact = module.and_then(|module| {
-        supplement_with_fresh_index(root, &module, &resolved, &source_for_index, &mut result, limit)
-    });
+    let index_fact = match module {
+        Some(module) => {
+            let roots = ctx.broker.import_roots(root).await?;
+            supplement_with_fresh_index(root, &roots, &module, &resolved, &source_for_index, &mut result, limit)
+        }
+        None => None,
+    };
     let mut response = Response::ok(result, call.freshness)
         .with_runtime(call.runtime)
         .with_trust_artifact(source_fact);
@@ -215,27 +223,28 @@ async fn worker_declarations(
 }
 
 /// The declarations of `module`, which Lake names no source for (`why`),
-/// from the `.ilean` index an earlier build left, if one is left. Such an
-/// index outlives a module deleted or renamed since, so no build refreshes it.
+/// from the `.ilean` index an earlier build left on the import `roots`, if
+/// one is left. Such an index outlives a module deleted or renamed since, so
+/// no build refreshes it.
 fn index_declarations(
     ctx: &ToolContext,
     hint: ProjectHint,
     root: &Path,
+    roots: &[PathBuf],
     module: &str,
     why: &NoAnswer,
     limit: usize,
 ) -> Result<Response<DeclarationInventoryResult>> {
     // The index lives in build products, which the request's read turn
     // guards; asking Lake for the source took that turn.
-    let index = crate::ilean::declarations_in_module(root, module);
     let base = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
-    if index.status != crate::ilean::ModuleDeclarationIndexStatus::Present {
+    let Some(index) = crate::ilean::declarations_in_module(roots, module) else {
         let result = not_found_result(format!(
             "Lake names no source for module `{module}`, and no build left a .ilean declaration index for it: {}",
             why.output()
         ));
         return Ok(Response::ok(result, base.freshness).with_runtime(base.runtime));
-    }
+    };
     let (declarations, truncated) = truncate(index_declarations_rows(&index), limit);
     let fact = ArtifactTrust::ilean_module_without_source(index.module.clone(), display_path(root, &index.index));
     Ok(Response::ok(
@@ -393,11 +402,12 @@ fn index_declarations_rows(index: &crate::ilean::ModuleDeclarationIndex) -> Vec<
         .collect()
 }
 
-/// Add to `result` the declarations that `module`'s index records and the
-/// outline of `source` (the text of `source_file`) lacks, when the index is
-/// newer than the file.
+/// Add to `result` the declarations that `module`'s index on the import
+/// `roots` records and the outline of `source` (the text of `source_file`)
+/// lacks, when the index is newer than the file.
 fn supplement_with_fresh_index(
     root: &Path,
+    roots: &[PathBuf],
     module: &str,
     source_file: &Path,
     source: &str,
@@ -407,10 +417,8 @@ fn supplement_with_fresh_index(
     if result.status != "ok" {
         return None;
     }
-    let index = crate::ilean::declarations_in_module(root, module);
-    if index.status != crate::ilean::ModuleDeclarationIndexStatus::Present
-        || crate::ilean::source_newer_than_index(source_file, &index.index)
-    {
+    let index = crate::ilean::declarations_in_module(roots, module)?;
+    if crate::ilean::source_newer_than_index(source_file, &index.index) {
         return None;
     }
 
@@ -575,9 +583,18 @@ mod tests {
         )
     }
 
+    /// Where the tests put the package's indexes. The inventory takes the
+    /// directory from Lake's import roots, so any directory serves.
+    const IMPORT_DIR: &str = "imports";
+
+    /// The import roots of a test project: its one package's directory.
+    fn roots(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        vec![root.join(IMPORT_DIR)]
+    }
+
     fn copy_ilean(root: &std::path::Path, module: &str, fixture: &str) -> std::path::PathBuf {
         let relative: std::path::PathBuf = module.split('.').collect();
-        let index = root.join(".lake/build/lib/lean").join(relative).with_extension("ilean");
+        let index = root.join(IMPORT_DIR).join(relative).with_extension("ilean");
         std::fs::create_dir_all(index.parent().unwrap()).unwrap();
         std::fs::copy(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -630,8 +647,15 @@ mod tests {
         };
 
         let source_file = root.join("Demo/A.lean");
-        let Some(fact) = supplement_with_fresh_index(&root, "Demo.A", &source_file, "\n\n\n    foo", &mut result, 200)
-        else {
+        let Some(fact) = supplement_with_fresh_index(
+            &root,
+            &roots(&root),
+            "Demo.A",
+            &source_file,
+            "\n\n\n    foo",
+            &mut result,
+            200,
+        ) else {
             panic!("fresh index should produce a trust fact");
         };
 
@@ -668,7 +692,7 @@ mod tests {
             .unwrap()
             .replace("Demo.A.foo", "_private.Demo.A.0.Demo.A.foo");
         std::fs::write(&index_path, contents).unwrap();
-        let index = crate::ilean::declarations_in_module(&root, "Demo.A");
+        let index = crate::ilean::declarations_in_module(&roots(&root), "Demo.A").unwrap();
         let mut source = index_declarations_rows(&index).remove(0);
         source.name = "_private._stdin.0.Demo.A.foo".to_owned();
         let mut result = DeclarationInventoryResult {
@@ -681,7 +705,18 @@ mod tests {
             diagnostics: None,
         };
         let source_file = root.join("Demo/A.lean");
-        assert!(supplement_with_fresh_index(&root, "Demo.A", &source_file, "\n\n\n    foo", &mut result, 1).is_some());
+        assert!(
+            supplement_with_fresh_index(
+                &root,
+                &roots(&root),
+                "Demo.A",
+                &source_file,
+                "\n\n\n    foo",
+                &mut result,
+                1
+            )
+            .is_some()
+        );
         assert_eq!(result.declarations.len(), 1);
         assert_eq!(result.declarations[0].name, "_private._stdin.0.Demo.A.foo");
         assert!(!result.truncated, "a duplicate must not consume the target limit");
@@ -711,7 +746,10 @@ mod tests {
             diagnostics: None,
         };
         let source_file = root.join("Demo/A.lean");
-        assert!(supplement_with_fresh_index(&root, "Demo.A", &source_file, "😀 «𝒳»", &mut result, 1).is_some());
+        assert!(
+            supplement_with_fresh_index(&root, &roots(&root), "Demo.A", &source_file, "😀 «𝒳»", &mut result, 1)
+                .is_some()
+        );
         assert_eq!(result.declarations.len(), 1);
         assert!(!result.truncated, "Unicode columns must not create a second target");
     }
@@ -735,7 +773,15 @@ mod tests {
         };
 
         let source_file = root.join("Demo/A.lean");
-        let fact = supplement_with_fresh_index(&root, "Demo.A", &source_file, "\n\n\n    foo", &mut result, 200);
+        let fact = supplement_with_fresh_index(
+            &root,
+            &roots(&root),
+            "Demo.A",
+            &source_file,
+            "\n\n\n    foo",
+            &mut result,
+            200,
+        );
 
         assert!(fact.is_none());
         assert_eq!(result.declarations.len(), 1);
@@ -759,6 +805,7 @@ mod tests {
             &ctx,
             ProjectHint::from_request(None),
             &root,
+            &roots(&root),
             "Demo.A",
             &unknown("Demo.A"),
             200,
@@ -775,7 +822,7 @@ mod tests {
             (fact.artifact, fact.scope, fact.status),
             (ArtifactKind::Ilean, TrustScope::Module, TrustStatus::StaleBuild)
         );
-        assert_eq!(fact.path.as_deref(), Some(".lake/build/lib/lean/Demo/A.ilean"));
+        assert_eq!(fact.path.as_deref(), Some("imports/Demo/A.ilean"));
         assert!(fact.next_action.is_none(), "no build refreshes the index");
         assert!(broker.resident_paths().is_empty());
         drop(ctx);
@@ -792,6 +839,7 @@ mod tests {
             &ctx,
             ProjectHint::from_request(None),
             &root,
+            &roots(&root),
             "Demo.A",
             &unknown("Demo.A"),
             200,

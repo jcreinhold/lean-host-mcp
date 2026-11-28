@@ -1,10 +1,10 @@
-//! File setup, module sources and module headers from the selected Lake. Keep
-//! Lake's original frame, including import visibility, plugin entry points
-//! and compiler options.
+//! File setup, module sources, module headers and import roots from the
+//! selected Lake. Keep Lake's original frame, including import visibility,
+//! plugin entry points and compiler options.
 //!
 //! Requirement: no Lake run here overlaps a build, and each runs under the
-//! same read turn as the check it serves. Every run goes through
-//! `lake_reader`, which takes the request's read turn on the project first.
+//! same read turn as the check it serves. Every run goes through `lake_run`,
+//! which takes the request's read turn on the project first.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
 use crate::cancellation::CallCancellation;
 use crate::envelope::TargetCheckNotStarted;
@@ -16,10 +16,12 @@ use std::{
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 const SETUP_FILE: &str = "Lake setup-file";
+const IMPORT_ROOTS: &str = "Lake env";
 const MODULE_SOURCES: &str = "Lake module sources";
 const MODULE_INPUTS: &str = "Lake module inputs";
 const MODULE_LOOKUP: &str = "Lake module lookup";
@@ -271,26 +273,26 @@ pub(crate) struct StagedSetup {
     pub(crate) module: String,
     pub(crate) options: BTreeMap<String, LeanOptionValue>,
     sysroot: PathBuf,
-    /// The project's package roots ([`crate::lake_meta::manifest_package_roots`]).
-    packages: Vec<PathBuf>,
+    /// The project's import roots ([`ProjectBroker::import_roots`]) that
+    /// Lake gave when it staged this setup.
+    pub(crate) roots: Arc<[PathBuf]>,
     inputs: BTreeMap<PathBuf, Identity>,
 }
 
 impl StagedSetup {
     pub(super) fn artifact_identity_sha256(&self, shim_digest: &str) -> io::Result<String> {
         let executable = Identity::read(&self.sysroot.join("bin/lean"))?;
-        let bytes = serde_json::to_vec(&(&self.sysroot, executable, &self.packages, &self.inputs, shim_digest))?;
+        let bytes = serde_json::to_vec(&(&self.sysroot, executable, &self.roots, &self.inputs, shim_digest))?;
         Ok(crate::digest::sha256_hex(&bytes))
     }
 
-    /// Refuse the setup when the toolchain, the project's packages or any
-    /// file it names changed since Lake answered, such as a build outside
-    /// this server that replaced an import.
-    pub(super) fn check(&self, root: &Path, sysroot: &Path) -> io::Result<()> {
-        if self.sysroot != sysroot || self.packages != crate::lake_meta::manifest_package_roots(root) {
-            return Err(invalid_data(
-                "the project's packages or toolchain changed after Lake's setup",
-            ));
+    /// Refuse the setup when the toolchain or any file it names changed
+    /// since Lake answered, such as a build outside this server that
+    /// replaced an import. The files include the manifest and the toolchain
+    /// pin, so a change to the project's packages refuses it too.
+    pub(super) fn check(&self, sysroot: &Path) -> io::Result<()> {
+        if self.sysroot != sysroot {
+            return Err(invalid_data("the project's toolchain changed after Lake's setup"));
         }
         for (p, identity) in &self.inputs {
             if Identity::read(p)? != *identity {
@@ -299,6 +301,26 @@ impl StagedSetup {
         }
         Ok(())
     }
+}
+
+/// Lake's import roots for one project root, kept while the files Lake
+/// configures its workspace from keep their stamp.
+pub(super) struct ImportRoots {
+    root: PathBuf,
+    stamp: crate::lake_meta::ProjectInputStamp,
+    roots: Arc<[PathBuf]>,
+}
+
+/// The root package's import directory among the project's import `roots`
+/// ([`ProjectBroker::import_roots`]): Lake lists the root package last.
+/// `None` only for an empty list, which Lake never gives.
+pub(crate) fn package_import_dir(roots: &[PathBuf]) -> Option<&Path> {
+    roots.last().map(PathBuf::as_path)
+}
+
+/// The workspace at `root` whose Lake comes from `sysroot`.
+fn workspace(root: &Path, sysroot: &Path) -> lean_toolchain::LakeWorkspace {
+    lean_toolchain::LakeWorkspace::new(root).lean_sysroot(sysroot)
 }
 
 /// The `count` results `lake query --json` printed, one line of JSON each.
@@ -378,9 +400,17 @@ fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
     Ok(setup)
 }
 
+/// Read what `lake setup-file` printed for `file` and take the identity of
+/// every file it names.
+///
+/// Each named file must be a canonical file. Each import's `.olean` and IR
+/// files must also lie under one of the project's import `roots` or the
+/// release's `lib`, since Lake writes them to its packages' import
+/// directories. Lake decides where a dynlib or plugin lives, so either may
+/// lie anywhere; the lakefile already ran as code when Lake answered.
 pub(crate) fn stage(
     bytes: Vec<u8>,
-    packages: &[PathBuf],
+    roots: Arc<[PathBuf]>,
     sysroot: &Path,
     root: &Path,
     file: &Path,
@@ -389,14 +419,13 @@ pub(crate) fn stage(
     // These fields pass through byte-for-byte. Only Lake/Lean interprets them.
     let release_lib = sysroot.join("lib");
     let mut inputs = BTreeMap::new();
-    let mut validate = |p: &Path| -> io::Result<()> {
-        if !p.is_absolute()
-            || p.canonicalize()? != p
-            || !p.is_file()
-            || !(p.starts_with(&release_lib) || packages.iter().any(|r| p.starts_with(r.join(".lake/build"))))
-        {
+    let mut validate = |p: &Path, import: bool| -> io::Result<()> {
+        if !p.is_absolute() || p.canonicalize()? != p || !p.is_file() {
+            return Err(invalid_data("Lake setup names a path that is not a canonical file"));
+        }
+        if import && !(p.starts_with(&release_lib) || roots.iter().any(|r| p.starts_with(r))) {
             return Err(invalid_data(
-                "Lake setup artifact outside the project's package outputs or the selected release",
+                "Lake setup names an import artifact outside the project's import roots and the selected release",
             ));
         }
         inputs.insert(p.to_owned(), Identity::read(p)?);
@@ -411,20 +440,20 @@ pub(crate) fn stage(
             return Err(invalid_data("unsupported Lake import artifact layout"));
         }
         for path in parts.iter().flatten() {
-            validate(path)?;
+            validate(path, true)?;
         }
     }
     for path in &setup.dynlibs {
-        validate(path)?;
+        validate(path, false)?;
     }
     for plugin in &setup.plugins {
         match plugin {
-            Plugin::Path(p) => validate(p)?,
+            Plugin::Path(p) => validate(p, false)?,
             Plugin::Named { path, init_fn } => {
                 if init_fn.as_ref().is_some_and(String::is_empty) {
                     return Err(invalid_data("empty plugin initializer"));
                 }
-                validate(path)?;
+                validate(path, false)?;
             }
         }
     }
@@ -440,7 +469,7 @@ pub(crate) fn stage(
         module: setup.name,
         options: setup.options,
         inputs,
-        packages: packages.to_vec(),
+        roots,
         sysroot: sysroot.to_owned(),
     })
 }
@@ -466,7 +495,7 @@ impl ProjectBroker {
         let setup = self.setup_file(&root, Path::new(file), source).await?;
         let activity = self.preparation_activity();
         let reader = super::verify_file::PreparedReader::installed(meta)?;
-        setup.check(&root, &reader.sysroot)?;
+        setup.check(&reader.sysroot)?;
         if fs::read(file)? != source.as_bytes() {
             return Err(ServerError::BadProject("source changed during setup transfer".into()));
         }
@@ -703,7 +732,7 @@ impl ProjectBroker {
                 "current source differs from selected verification file".into(),
             ));
         }
-        let packages = crate::lake_meta::manifest_package_roots(root);
+        let roots = self.import_roots(root).await?;
         let args = vec!["setup-file".into(), file.as_os_str().to_owned()];
         let (sysroot, output) = self
             .lake_reader(root, SETUP_FILE, args, &[0, FAILURE_EXIT, NO_BUILD_EXIT])
@@ -711,24 +740,99 @@ impl ProjectBroker {
         if output.exit_code == FAILURE_EXIT {
             return Err(self.setup_failure(root, output).await);
         }
-        Ok(stage(setup_output(output)?, &packages, &sysroot, root, file)?)
+        Ok(stage(setup_output(output)?, roots, &sysroot, root, file)?)
     }
 
-    /// Run the project's `lake --no-build --no-cache ARGS` in `root` as a
-    /// short run, with Lake's caches pointed at the run's private inputs, and
-    /// return the toolchain prefix with Lake's output.
+    /// The project's import roots: the directories Lake puts on `LEAN_PATH`
+    /// for the packages of the workspace at `root`, dependencies first and
+    /// the root package last, as `lake env` reports them under this request's
+    /// read turn. Lake builds nothing. A root may not exist until Lake builds
+    /// its package.
     ///
-    /// Every Lake run that reads the project for a request starts here, so
-    /// this is where it takes the request's read turn on `root`: Lake waits
-    /// for a running or queued build, and the check that follows in the same
-    /// request keeps the same turn. The run holds a share of the turn until
-    /// its process group has exited.
+    /// Lake configures the workspace from the lakefiles, the toolchain pin
+    /// and the manifest, so the answer is kept until one of them changes. A
+    /// dependency's own lakefile is not among them.
+    pub(crate) async fn import_roots(&self, root: &Path) -> Result<Arc<[PathBuf]>> {
+        if let Some(roots) = self.known_import_roots(root) {
+            return Ok(roots);
+        }
+        let stamp = crate::lake_meta::input_stamp(root);
+        let (sysroot, output) = self
+            .lake_run(root, IMPORT_ROOTS, &[0], |sysroot| {
+                let command = workspace(root, sysroot).lean_path_command().map_err(invalid)?;
+                Ok(crate::lean_run::Program::from_command(
+                    &command,
+                    root,
+                    crate::lean_run::OUTPUT_LIMIT,
+                ))
+            })
+            .await?;
+        let roots: Arc<[PathBuf]> = workspace(root, &sysroot)
+            .read_lean_path(&output.into_process_output())
+            .map_err(invalid)?
+            .into();
+        self.inner.lock().import_roots = Some(ImportRoots {
+            root: root.to_owned(),
+            stamp,
+            roots: Arc::clone(&roots),
+        });
+        Ok(roots)
+    }
+
+    /// The import roots Lake last gave for `root`, if none of the files
+    /// [`Self::import_roots`] watches changed since. Runs no Lake.
+    pub(crate) fn known_import_roots(&self, root: &Path) -> Option<Arc<[PathBuf]>> {
+        let stamp = crate::lake_meta::input_stamp(root);
+        self.inner
+            .lock()
+            .import_roots
+            .as_ref()
+            .filter(|known| known.root == root && known.stamp == stamp)
+            .map(|known| Arc::clone(&known.roots))
+    }
+
+    /// Run the project's `lake --no-build --no-cache ARGS` in `root`; see
+    /// [`Self::lake_run`].
     async fn lake_reader(
         &self,
         root: &Path,
         label: &'static str,
         args: Vec<OsString>,
         accepted: &'static [i32],
+    ) -> Result<(PathBuf, super::reader::ReaderOutput)> {
+        self.lake_run(root, label, accepted, |sysroot| {
+            let mut command = vec![
+                sysroot.join("bin/lake").into_os_string(),
+                "--no-build".into(),
+                "--no-cache".into(),
+            ];
+            command.extend(args);
+            Ok(crate::lean_run::Program {
+                command,
+                environment: Vec::new(),
+                cwd: root.to_owned(),
+                max_stdout_bytes: crate::lean_run::PROGRAM_OUTPUT_LIMIT,
+                stdin: None,
+            })
+        })
+        .await
+    }
+
+    /// Run the Lake program that `program` makes from the project's
+    /// toolchain prefix as a short run, with Lake's caches pointed at the
+    /// run's private inputs, and return the prefix with Lake's output.
+    ///
+    /// Every Lake run that reads the project for a request starts here, so
+    /// this is where it takes the request's read turn on `root`: Lake waits
+    /// for a running or queued build, and the check that follows in the same
+    /// request keeps the same turn. The run holds a share of the turn until
+    /// its process group has exited.
+    async fn lake_run(
+        &self,
+        root: &Path,
+        label: &'static str,
+        accepted: &'static [i32],
+        program: impl FnOnce(&Path) -> Result<crate::lean_run::Program> + Send,
     ) -> Result<(PathBuf, super::reader::ReaderOutput)> {
         self.ensure_read(root).await?;
         let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(invalid)?;
@@ -738,9 +842,8 @@ impl ProjectBroker {
             )));
         }
         let sysroot = id.elan_dir().map_err(invalid)?.canonicalize()?;
+        let mut program = program(&sysroot)?;
         let activity = self.preparation_activity();
-        let lake = sysroot.join("bin/lake");
-        let cwd = root.to_owned();
         let output = super::reader::reader_run(
             label,
             root,
@@ -753,18 +856,13 @@ impl ProjectBroker {
                 // Point any Lake cache at the run's private inputs.
                 let cache = assets.join("lake-cache");
                 fs::create_dir(&cache)?;
-                let mut command = vec![lake.into_os_string(), "--no-build".into(), "--no-cache".into()];
-                command.extend(args);
-                Ok(crate::lean_run::Program {
-                    command,
-                    environment: vec![
-                        ("LAKE_CACHE_DIR".into(), cache.into_os_string()),
-                        ("LAKE_ARTIFACT_CACHE".into(), "false".into()),
-                    ],
-                    cwd,
-                    max_stdout_bytes: crate::lean_run::PROGRAM_OUTPUT_LIMIT,
-                    stdin: None,
-                })
+                program
+                    .environment
+                    .push(("LAKE_CACHE_DIR".into(), Some(cache.into_os_string())));
+                program
+                    .environment
+                    .push(("LAKE_ARTIFACT_CACHE".into(), Some("false".into())));
+                Ok(program)
             },
         )
         .await
@@ -1023,6 +1121,10 @@ mod tests {
                 "lookup",
                 as_request(patience, Box::pin(broker.unknown_modules(root, &modules))).await,
             ),
+            (
+                "import roots",
+                as_request(patience, Box::pin(broker.import_roots(root))).await,
+            ),
         ]
     }
 
@@ -1144,6 +1246,36 @@ mod tests {
         Ok(())
     }
 
+    /// The import roots are what `lake env` reports: for a workspace with no
+    /// dependency, the package's own import directory alone. The broker keeps
+    /// the answer until a file Lake configures the workspace from changes,
+    /// and Lake builds nothing.
+    #[tokio::test]
+    #[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE"]
+    async fn import_roots_are_what_lake_env_reports() -> TestResult {
+        let (_dir, root) = options_project()?;
+        let broker = ProjectBroker::new(super::super::BrokerConfig {
+            lake_root: Some(root.clone()),
+            ..super::super::BrokerConfig::unserved()
+        });
+        assert!(broker.known_import_roots(&root).is_none());
+        let started = std::time::Instant::now();
+        let roots = broker.import_roots(&root).await?;
+        eprintln!("lake env took {:?}", started.elapsed());
+        assert_eq!(&*roots, [root.join(".lake/build/lib/lean")]);
+        assert_eq!(broker.known_import_roots(&root).as_deref(), Some(&*roots));
+        let lakefile = root.join("lakefile.lean");
+        let mut text = fs::read_to_string(&lakefile)?;
+        text.push('\n');
+        fs::write(&lakefile, text)?;
+        assert!(
+            broker.known_import_roots(&root).is_none(),
+            "a lakefile edit drops the answer"
+        );
+        assert!(!root.join(".lake/build").exists(), "Lake built something");
+        Ok(())
+    }
+
     /// Lake names each module's source under its library's `srcDir` and
     /// reads its header; a name no package holds, a name with no source file
     /// and a header that does not parse each get their own answer, and the
@@ -1224,14 +1356,14 @@ mod tests {
             module: "Dep".to_owned(),
             options: BTreeMap::new(),
             sysroot: root.join("release"),
-            packages: crate::lake_meta::manifest_package_roots(&root),
+            roots: Arc::from([output.clone()]),
             inputs: BTreeMap::from([(leaf.clone(), Identity::read(&leaf)?)]),
         };
-        setup.check(&root, &setup.sysroot)?;
+        setup.check(&setup.sysroot)?;
         let replacement = output.join("replacement");
         fs::write(&replacement, b"same bytes")?;
         fs::rename(replacement, leaf)?;
-        assert!(matches!(setup.check(&root, &setup.sysroot), Err(error) if error.kind() == io::ErrorKind::InvalidData));
+        assert!(matches!(setup.check(&setup.sysroot), Err(error) if error.kind() == io::ErrorKind::InvalidData));
         Ok(())
     }
 }

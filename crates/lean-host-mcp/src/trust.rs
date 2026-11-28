@@ -160,9 +160,11 @@ impl ArtifactTrust {
             .detail("references come from the .ilean indexes of the last build; the server does not compare them with current sources")
     }
 
-    pub fn ilean_project_missing_build() -> Self {
+    /// The project's `.ilean` indexes are missing: the root package's import
+    /// directory, which Lake names, does not exist.
+    pub fn ilean_project_missing_build(detail: impl Into<String>) -> Self {
         Self::new(ArtifactKind::Ilean, TrustScope::Project, TrustStatus::MissingBuild)
-            .detail(".lake/build/lib/lean is absent")
+            .detail(detail)
             .next_action(build_action::<&str>(&[]))
     }
 
@@ -234,6 +236,15 @@ impl ArtifactTrust {
 
     pub fn worker_toolchain_not_applicable(detail: impl Into<String>) -> Self {
         Self::new(ArtifactKind::Worker, TrustScope::Toolchain, TrustStatus::NotApplicable).detail(detail)
+    }
+
+    /// `lean_status` runs no Lake, and Lake has not named the project's
+    /// import directories since the server started or since the files Lake
+    /// configures the workspace from last changed.
+    pub fn import_roots_unknown(artifact: ArtifactKind) -> Self {
+        Self::new(artifact, TrustScope::Project, TrustStatus::Unknown)
+            .detail("Lake has not named the project's import directories since the server started or its Lake configuration changed, and lean_status runs no Lake")
+            .next_action("run lean_lookup or a check, which asks Lake, then lean_status again")
     }
 
     pub fn build_tree_unknown(path: impl Into<String>, artifact: ArtifactKind) -> Self {

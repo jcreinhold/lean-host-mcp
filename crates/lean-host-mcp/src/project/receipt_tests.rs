@@ -247,6 +247,7 @@ fn fixture_config(
         worker_path: executable,
         lean_sysroot: root.join("unused-sysroot"),
         prepared_host_artifacts: None,
+        import_roots: Arc::from([]),
         session_id: project.session_id.clone(),
         runtime: Arc::clone(&project.runtime),
         healthy: Arc::clone(&project.healthy),

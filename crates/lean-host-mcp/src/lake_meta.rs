@@ -1,10 +1,10 @@
 //! What the server knows about a Lake project before Lake runs: its root, its
-//! toolchain pin, a fingerprint of its manifest, and the import roots the
-//! manifest names.
+//! toolchain pin and a fingerprint of its manifest.
 //!
-//! The server reads no lakefile. Lake evaluates the configuration itself, in
-//! `lake setup-file` and the module options reader, so nothing here can
-//! disagree with it. A root must hold a `lakefile.toml` or `lakefile.lean`.
+//! The server reads no lakefile and parses no manifest. Lake evaluates the
+//! configuration itself, in `lake setup-file`, `lake env` and the module
+//! options reader, so nothing here can disagree with it. A root must hold a
+//! `lakefile.toml` or `lakefile.lean`.
 
 use std::path::{Path, PathBuf};
 
@@ -64,21 +64,27 @@ impl LakeProjectMeta {
     /// The file set is exactly [`Self::from_explicit`]'s inputs — both
     /// lakefile spellings, the toolchain pin and the manifest — so an equal
     /// stamp means an equal rebuild.
-    ///
-    /// Change detection is `(length, mtime)` per file, not content. `mtime` is
-    /// nanosecond-resolution on APFS and ext4, so a write between two stamps is
-    /// always visible; length alone would not be enough, because a
-    /// `lake-manifest.json` revision swap is length-preserving.
     pub(crate) fn input_stamp(&self) -> ProjectInputStamp {
-        let root = &self.canonical_root;
-        ProjectInputStamp {
-            files: [
-                stat_stamp(&root.join(LAKEFILES[0])),
-                stat_stamp(&root.join(LAKEFILES[1])),
-                stat_stamp(&root.join("lean-toolchain")),
-                stat_stamp(&root.join("lake-manifest.json")),
-            ],
-        }
+        input_stamp(&self.canonical_root)
+    }
+}
+
+/// Stat the files at `root` that Lake configures its workspace from, and
+/// that [`LakeProjectMeta::from_explicit`] reads: both lakefile spellings,
+/// the toolchain pin and the manifest.
+///
+/// Change detection is `(length, mtime)` per file, not content. `mtime` is
+/// nanosecond-resolution on APFS and ext4, so a write between two stamps is
+/// always visible; length alone would not be enough, because a
+/// `lake-manifest.json` revision swap is length-preserving.
+pub(crate) fn input_stamp(root: &Path) -> ProjectInputStamp {
+    ProjectInputStamp {
+        files: [
+            stat_stamp(&root.join(LAKEFILES[0])),
+            stat_stamp(&root.join(LAKEFILES[1])),
+            stat_stamp(&root.join("lean-toolchain")),
+            stat_stamp(&root.join("lake-manifest.json")),
+        ],
     }
 }
 
@@ -125,88 +131,6 @@ fn fingerprint_lake_project(lake_root: &Path) -> Result<String> {
     Ok(crate::digest::sha256_hex(&bytes))
 }
 
-/// Project-relative directory holding built module artifacts: `.olean` for the
-/// environment, `.ilean` for the reference index. One definition, because
-/// [`manifest_artifact_roots`] and the `.ilean` reader must agree on where Lake
-/// writes.
-pub(crate) const BUILD_LIB_REL: &str = ".lake/build/lib/lean";
-
-/// The project's own import roots in Lean's search order: its build output,
-/// then each manifest package's, as the SDK's session import computes them.
-/// A project worker gets these at launch and admits no other import, and a
-/// short run searches them. The server refuses to start with `LEAN_PATH`
-/// set, so nothing else joins them.
-///
-/// Mirrors `lean-rs-host`'s `LakeProject::olean_search_paths` and
-/// `manifest_package_root` without linking the Lean runtime into this parent:
-/// project first, then manifest order, with `packagesDir`, path `dir`, and Git
-/// `subDir` respected. Unbuilt paths stay in the list so a reader finds later
-/// builds.
-pub(crate) fn manifest_artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
-    manifest_package_dirs(lake_root)
-        .into_iter()
-        .map(|package| package.join(BUILD_LIB_REL))
-        .collect()
-}
-
-/// The project's packages as canonical directories, project first, then
-/// manifest order, without the ones that do not exist or repeat: the
-/// directories whose `.lake/build` a module setup may name.
-pub(crate) fn manifest_package_roots(lake_root: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for package in manifest_package_dirs(lake_root) {
-        if let Ok(package) = package.canonicalize()
-            && !roots.contains(&package)
-        {
-            roots.push(package);
-        }
-    }
-    roots
-}
-
-/// The project's directory, then each manifest package's, as
-/// [`manifest_artifact_roots`] describes.
-fn manifest_package_dirs(lake_root: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![lake_root.to_path_buf()];
-    let Ok(bytes) = std::fs::read(lake_root.join("lake-manifest.json")) else {
-        return roots;
-    };
-    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return roots;
-    };
-    let packages_dir = manifest
-        .get("packagesDir")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(".lake/packages");
-    let Some(packages) = manifest.get("packages").and_then(serde_json::Value::as_array) else {
-        return roots;
-    };
-    for package in packages {
-        let Some(name) = package.get("name").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let name = name
-            .trim()
-            .trim_matches('`')
-            .trim_matches('«')
-            .trim_matches('»')
-            .trim_matches('"')
-            .trim();
-        if package.get("type").and_then(serde_json::Value::as_str) == Some("path")
-            && let Some(dir) = package.get("dir").and_then(serde_json::Value::as_str)
-        {
-            roots.push(lake_root.join(dir));
-            continue;
-        }
-        let mut package_root = lake_root.join(packages_dir).join(name);
-        if let Some(sub_dir) = package.get("subDir").and_then(serde_json::Value::as_str) {
-            package_root.push(sub_dir);
-        }
-        roots.push(package_root);
-    }
-    roots
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -218,148 +142,6 @@ mod tests {
     use std::fs;
 
     use super::*;
-
-    #[test]
-    fn artifact_roots_follow_manifest_order_without_scanning_or_filtering_packages() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"packages":[
-            {"name":"z-first","type":"git"}, {"name":"a-second","type":"git"}
-        ]}"#,
-        )
-        .unwrap();
-        // A checkout absent from the manifest must not affect resolution.
-        fs::create_dir_all(root.join(".lake/packages/unlisted").join(BUILD_LIB_REL)).unwrap();
-        assert_eq!(
-            manifest_artifact_roots(root),
-            vec![
-                root.join(BUILD_LIB_REL),
-                root.join(".lake/packages/z-first").join(BUILD_LIB_REL),
-                root.join(".lake/packages/a-second").join(BUILD_LIB_REL)
-            ]
-        );
-    }
-
-    #[test]
-    fn artifact_roots_resolve_custom_packages_dir_and_normalize_names() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"packagesDir":"vendor","packages":[
-            {"name":" «doc-gen4» ","type":"git"}, {"name":"`batteries`","type":"git"}
-        ]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            manifest_artifact_roots(root),
-            vec![
-                root.join(BUILD_LIB_REL),
-                root.join("vendor/doc-gen4").join(BUILD_LIB_REL),
-                root.join("vendor/batteries").join(BUILD_LIB_REL)
-            ]
-        );
-    }
-
-    #[test]
-    fn artifact_roots_resolve_relative_and_absolute_path_dependencies() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let external = root.join("external");
-        fs::write(
-            root.join("lake-manifest.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "packagesDir": "vendor", "packages": [
-                    {"name":"sibling","type":"path","dir":"../sibling", "subDir":"ignored"},
-                    {"name":"external","type":"path","dir":external},
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            manifest_artifact_roots(root),
-            vec![
-                root.join(BUILD_LIB_REL),
-                root.join("../sibling").join(BUILD_LIB_REL),
-                external.join(BUILD_LIB_REL)
-            ]
-        );
-    }
-
-    #[test]
-    fn artifact_roots_resolve_git_package_subdirectories() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"packagesDir":"vendor","packages":[
-            {"name":"«multi-package»","type":"git","subDir":"crates/lean"}
-        ]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            manifest_artifact_roots(root),
-            vec![
-                root.join(BUILD_LIB_REL),
-                root.join("vendor/multi-package/crates/lean").join(BUILD_LIB_REL)
-            ]
-        );
-    }
-
-    #[test]
-    fn artifact_roots_match_worker_fallback_for_malformed_manifest_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(root.join("lake-manifest.json"), b"{malformed").unwrap();
-        assert_eq!(manifest_artifact_roots(root), vec![root.join(BUILD_LIB_REL)]);
-        fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"packages":[
-            {"type":"git"}, "invalid", {"name":"fallback","type":"path"}
-        ]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            manifest_artifact_roots(root),
-            vec![
-                root.join(BUILD_LIB_REL),
-                root.join(".lake/packages/fallback").join(BUILD_LIB_REL)
-            ]
-        );
-    }
-
-    #[test]
-    fn building_a_package_keeps_the_roots_and_their_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"packages":[
-            {"name":"dep","type":"path","dir":"local-dep"}
-        ]}"#,
-        )
-        .unwrap();
-        let roots = manifest_artifact_roots(root);
-        let artifact = root.join("local-dep").join(BUILD_LIB_REL).join("Demo/A.olean");
-        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        fs::write(artifact, b"built").unwrap();
-        assert_eq!(
-            manifest_artifact_roots(root),
-            roots,
-            "building must not change search precedence"
-        );
-    }
-
-    #[test]
-    fn artifact_roots_survive_a_project_with_no_lake_directory_at_all() {
-        let tmp = tempfile::tempdir().unwrap();
-        // An unbuilt project still yields its own nonexistent build directory.
-        let roots = manifest_artifact_roots(tmp.path());
-        assert_eq!(roots, vec![tmp.path().join(BUILD_LIB_REL)]);
-    }
 
     /// Write a project whose every stamped input exists, so a test that
     /// mutates one of them is measuring that file and not its creation.

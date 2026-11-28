@@ -395,6 +395,7 @@ impl LeanProject {
         slot: OwnedSemaphorePermit,
         maintenance: crate::broker::MaintenanceAccess,
         prepared_host_artifacts: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts,
+        import_roots: Arc<[PathBuf]>,
         initialization: CallOperation,
     ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -430,6 +431,7 @@ impl LeanProject {
         };
         config.maintenance = maintenance;
         config.prepared_host_artifacts = Some(prepared_host_artifacts);
+        config.import_roots = import_roots;
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
@@ -938,6 +940,10 @@ struct ActorConfig {
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
     prepared_host_artifacts: Option<lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts>,
+    /// The project's import roots as Lake reports them
+    /// ([`crate::broker::ProjectBroker::import_roots`]), which the worker
+    /// imports through and gives the SDK, so it runs no Lake of its own.
+    import_roots: Arc<[PathBuf]>,
     session_id: String,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     healthy: Arc<AtomicBool>,
@@ -1064,6 +1070,7 @@ impl ActorConfig {
             worker_path,
             lean_sysroot,
             prepared_host_artifacts: None,
+            import_roots: Arc::from([]),
             session_id,
             runtime,
             healthy,
@@ -2389,10 +2396,10 @@ fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
         )
 }
 
-/// The worker child of one actor generation, ordinary or companion: the
-/// project's worker and toolchain with the installed shims. Prepared storage
-/// facts never substitute for loaded checks.
-fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerChild> {
+/// The worker child of one actor generation: the project's worker and
+/// toolchain with the installed shims, launched with the project's import
+/// roots. Prepared storage facts never substitute for loaded checks.
+fn native_worker_child(config: &ActorConfig) -> Result<LeanWorkerChild> {
     // Unit actor tests use a framed Python child that never loads Lean. The
     // production and integration-test binaries always require prepared shims.
     #[cfg(test)]
@@ -2407,22 +2414,21 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
             "native actor requires prepared host artifacts".to_owned(),
         ));
     };
-    let mut child = LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
-        .prepared_host_artifacts(artifacts.clone());
-    if scope == "main" {
-        // The worker admits an import only through exactly these roots.
-        let roots = crate::lake_meta::manifest_artifact_roots(&config.lake_root)
-            .into_iter()
-            .map(|root| {
-                root.into_os_string()
-                    .into_string()
-                    .map_err(|_| ServerError::BadProject("project import root is not UTF-8".to_owned()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let input = serde_json::to_string(&roots).map_err(|error| ServerError::Internal(error.to_string()))?;
-        child = child.application_launch_input(&input).map_err(crate::error::invalid)?;
-    }
-    Ok(child)
+    // The worker admits an import only through exactly these roots, and
+    // hands them to the SDK in place of its own `lake env`.
+    let roots = config
+        .import_roots
+        .iter()
+        .map(|root| {
+            root.to_str()
+                .ok_or_else(|| ServerError::BadProject("project import root is not UTF-8".to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let input = serde_json::to_string(&roots).map_err(|error| ServerError::Internal(error.to_string()))?;
+    LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
+        .prepared_host_artifacts(artifacts.clone())
+        .application_launch_input(&input)
+        .map_err(crate::error::invalid)
 }
 
 fn worker_builder(config: &ActorConfig) -> Result<LeanWorkerHostHandleBuilder> {
@@ -2435,7 +2441,7 @@ fn worker_builder(config: &ActorConfig) -> Result<LeanWorkerHostHandleBuilder> {
     Ok(
         LeanWorkerHostHandleBuilder::shims_only(&config.lake_root, std::iter::empty::<String>())
             .require_host_runtime(expectation)
-            .worker_child(native_worker_child(config, "main")?)
+            .worker_child(native_worker_child(config)?)
             .startup_timeout(Duration::from_secs(30))
             .request_timeout(Duration::from_millis(config.request_timeout_millis))
             .process_tracker(config.process_tracker.clone())

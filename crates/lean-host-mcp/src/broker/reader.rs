@@ -88,6 +88,18 @@ impl ReaderOutput {
             ),
         )
     }
+
+    /// The output as [`std::process::Command::output`] gives it, for a reader
+    /// of Lake's answers that takes that form, such as lean-toolchain's.
+    pub(crate) fn into_process_output(self) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::Output {
+            // A wait status keeps the exit code in its second byte.
+            status: std::process::ExitStatus::from_raw((self.exit_code & 0xff) << 8),
+            stdout: self.stdout,
+            stderr: self.stderr.into_bytes(),
+        }
+    }
 }
 
 /// [`reader_output`] for a program whose exit codes in `accepted` all carry a
@@ -228,6 +240,22 @@ mod tests {
             accepted_exit("Lean file diagnostics", exit(1, "why"), &[0, 1]).map_err(|failure| failure.error)?;
         assert_eq!((output.exit_code, output.stderr.as_str()), (1, "why"));
         assert!(accepted_exit("Lean file diagnostics", exit(2, ""), &[0, 1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_output_keeps_the_exit_code_and_both_streams() -> TestResult {
+        for code in [0, 1, 3] {
+            let output = accepted_exit("Lake env", exit(code, "why"), &[0, 1, 3])
+                .map_err(|failure| failure.error)?
+                .into_process_output();
+            assert_eq!(output.status.code(), Some(code));
+            assert_eq!(output.status.success(), code == 0);
+            assert_eq!(
+                (output.stdout.as_slice(), output.stderr.as_slice()),
+                (&b"{}"[..], &b"why"[..])
+            );
+        }
         Ok(())
     }
 

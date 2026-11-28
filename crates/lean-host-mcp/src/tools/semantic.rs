@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
@@ -810,7 +810,10 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 ));
             }
             if includes.contains(&StatusInclude::Artifacts) {
-                artifacts.extend(status_artifact_facts(Path::new(&project_root)));
+                // The roots Lake last gave: lean_status runs no Lake, since it
+                // must answer while a build runs.
+                let roots = ctx.broker.known_import_roots(Path::new(&project_root));
+                artifacts.extend(status_artifact_facts(roots.as_deref()));
             }
             let mut trust = SemanticTrust::from(Response::<()>::ok((), identity.freshness).freshness);
             trust.artifacts.clone_from(&artifacts);
@@ -966,18 +969,28 @@ fn status_includes(include: &[StatusInclude]) -> Vec<StatusInclude> {
     }
 }
 
-fn status_artifact_facts(root: &Path) -> Vec<ArtifactTrust> {
-    let build_tree = root.join(".lake/build/lib/lean");
-    if build_tree.is_dir() {
-        let path = build_tree.to_string_lossy().into_owned();
+/// What `lean_status` can say about the project's build outputs without
+/// running Lake: whether the root package's import directory exists, among
+/// the import `roots` Lake last gave, if it gave any since the project's Lake
+/// configuration last changed.
+fn status_artifact_facts(roots: Option<&[PathBuf]>) -> Vec<ArtifactTrust> {
+    let Some(package_dir) = roots.and_then(crate::broker::module_setup::package_import_dir) else {
+        return vec![
+            ArtifactTrust::import_roots_unknown(ArtifactKind::Olean),
+            ArtifactTrust::import_roots_unknown(ArtifactKind::Ilean),
+        ];
+    };
+    let path = package_dir.to_string_lossy().into_owned();
+    if package_dir.is_dir() {
         vec![
             ArtifactTrust::build_tree_unknown(path.clone(), ArtifactKind::Olean),
             ArtifactTrust::build_tree_unknown(path, ArtifactKind::Ilean),
         ]
     } else {
+        let detail = format!("the root package's import directory {path} is absent");
         vec![
-            ArtifactTrust::olean_project_missing_build(".lake/build/lib/lean is absent"),
-            ArtifactTrust::ilean_project_missing_build(),
+            ArtifactTrust::olean_project_missing_build(detail.clone()),
+            ArtifactTrust::ilean_project_missing_build(detail),
         ]
     }
 }
@@ -1313,9 +1326,13 @@ mod tests {
                 && artifact.scope == TrustScope::Toolchain
                 && artifact.status == TrustStatus::NotApplicable
         }));
-        assert!(response.trust.artifacts.iter().any(|artifact| {
-            artifact.artifact == ArtifactKind::Olean && artifact.status == TrustStatus::MissingBuild
-        }));
+        // A new server has not asked Lake for the import roots, and
+        // lean_status does not ask.
+        assert!(
+            response.trust.artifacts.iter().any(|artifact| {
+                artifact.artifact == ArtifactKind::Olean && artifact.status == TrustStatus::Unknown
+            })
+        );
         // With no resident worker there is no receipt to report.
         let data = response.data.as_ref().unwrap();
         assert_eq!(data.pointer("/worker/opened"), Some(&json!(false)));
@@ -1325,11 +1342,50 @@ mod tests {
         drop(broker);
     }
 
+    /// The status of the build outputs follows the root package's import
+    /// directory, the last of Lake's roots, and is unknown until Lake names it.
+    #[test]
+    fn status_artifacts_follow_the_package_import_directory() {
+        let statuses = |facts: Vec<ArtifactTrust>| {
+            facts
+                .iter()
+                .map(|fact| (fact.artifact, fact.status, fact.path.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses(status_artifact_facts(None)),
+            [
+                (ArtifactKind::Olean, TrustStatus::Unknown, None),
+                (ArtifactKind::Ilean, TrustStatus::Unknown, None),
+            ]
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let (dependency, package) = (tmp.path().join("dependency"), tmp.path().join("package"));
+        std::fs::create_dir(&dependency).unwrap();
+        let roots = [dependency, package.clone()];
+        assert_eq!(
+            statuses(status_artifact_facts(Some(&roots))),
+            [
+                (ArtifactKind::Olean, TrustStatus::MissingBuild, None),
+                (ArtifactKind::Ilean, TrustStatus::MissingBuild, None),
+            ]
+        );
+        std::fs::create_dir(&package).unwrap();
+        let path = Some(package.to_string_lossy().into_owned());
+        assert_eq!(
+            statuses(status_artifact_facts(Some(&roots))),
+            [
+                (ArtifactKind::Olean, TrustStatus::Unknown, path.clone()),
+                (ArtifactKind::Ilean, TrustStatus::Unknown, path),
+            ]
+        );
+    }
+
     #[test]
     fn quiet_telemetry_does_not_drop_trust_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let response = Response::ok(serde_json::json!({"status": "ok"}), freshness(tmp.path()))
-            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build());
+            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build("absent"));
 
         let semantic = from_tool_response(
             response,
@@ -1365,7 +1421,7 @@ mod tests {
             crate::cache::hash_bytes(text.as_bytes()),
         );
         let response = Response::ok(serde_json::json!({"status": "ok"}), freshness(root))
-            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build())
+            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build("absent"))
             .with_trust_artifact(source);
 
         let json = serde_json::to_value(from_tool_response(response, ToolConfig::default()).unwrap()).unwrap();
@@ -1382,7 +1438,7 @@ mod tests {
         );
 
         let no_file = Response::ok(serde_json::json!({"status": "ok"}), freshness(root))
-            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build());
+            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build("absent"));
         let json = serde_json::to_value(from_tool_response(no_file, ToolConfig::default()).unwrap()).unwrap();
         assert!(json.pointer("/trust/source_sha256").is_none());
     }

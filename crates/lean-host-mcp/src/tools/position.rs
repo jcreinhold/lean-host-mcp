@@ -1234,10 +1234,11 @@ async fn find_references_in_project(
         .with_runtime(runtime));
     }
 
+    // Lake names the directory that holds the project's indexes.
+    let roots = ctx.broker.import_roots(root).await?;
     let index = {
-        let scan_root = root.to_path_buf();
         let scan_name = req.name.clone();
-        tokio::task::spawn_blocking(move || crate::ilean::references_to(&scan_root, &scan_name))
+        tokio::task::spawn_blocking(move || crate::ilean::references_to(&roots, &scan_name))
             .await
             .map_err(|err| ServerError::Internal(format!("reference index scan task failed: {err}")))?
     };
@@ -1266,14 +1267,16 @@ fn project_references(
     runtime: RuntimeFacts,
     limit: usize,
 ) -> Response<FindReferencesResult> {
-    // A wholly-absent build directory is the honest "the project is not built"
-    // verdict — degrade to the shared `needs_build` warning, never a silent
-    // empty result (which would read as "no references"). A built tree with zero
-    // hits for the name is a legitimate empty answer, not a degrade.
+    // A wholly-absent import directory is the honest "the project is not
+    // built" verdict — degrade to the shared `needs_build` warning, never a
+    // silent empty result (which would read as "no references"). A built tree
+    // with zero hits for the name is a legitimate empty answer, not a degrade.
     if index.status == crate::ilean::IndexStatus::NotBuilt {
         let response = Response::ok(empty_references_result(0, 0), freshness)
             .with_runtime(runtime)
-            .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_missing_build());
+            .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_missing_build(
+                "the root package's import directory, where Lake writes the project's .ilean indexes, is absent",
+            ));
         return crate::diagnosis::warn_needs_build(
             response,
             &crate::diagnosis::IncompleteCause::MissingImports(Vec::new()),
@@ -2029,8 +2032,12 @@ mod tests {
         .unwrap()
     }
 
+    /// Where the tests put the package's indexes. The scan takes the
+    /// directory from Lake's import roots, so any directory serves.
+    const IMPORT_DIR: &str = "imports";
+
     /// A project whose last build indexed each `(module, source, fixture)`:
-    /// the source file, and the module's `.ilean` under the build tree.
+    /// the source file, and the module's `.ilean` under [`IMPORT_DIR`].
     /// Returns the directory and its canonical path, which is how Lake names
     /// files.
     fn built_project(modules: &[(&str, &str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -2043,7 +2050,7 @@ mod tests {
         }
         for (module, _, fixture) in modules {
             let relative: std::path::PathBuf = module.split('.').collect();
-            let index = root.join(".lake/build/lib/lean").join(relative).with_extension("ilean");
+            let index = root.join(IMPORT_DIR).join(relative).with_extension("ilean");
             std::fs::create_dir_all(index.parent().unwrap()).unwrap();
             std::fs::write(&index, ilean_fixture(fixture)).unwrap();
         }
@@ -2057,7 +2064,7 @@ mod tests {
         req: &FindReferencesRequest,
         sources: &[(&str, &str)],
     ) -> crate::envelope::Response<super::FindReferencesResult> {
-        let index = crate::ilean::references_to(root, &req.name);
+        let index = crate::ilean::references_to(&[root.join(IMPORT_DIR)], &req.name);
         let answers = index
             .modules
             .iter()

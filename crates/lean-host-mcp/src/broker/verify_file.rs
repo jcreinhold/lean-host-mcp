@@ -278,9 +278,9 @@ impl ProjectBroker {
                     environment: vec![
                         (
                             "LEAN_PATH".into(),
-                            std::env::join_paths(shims).map_err(io::Error::other)?,
+                            Some(std::env::join_paths(shims).map_err(io::Error::other)?),
                         ),
-                        ("LEAN_SYSROOT".into(), sysroot.into_os_string()),
+                        ("LEAN_SYSROOT".into(), Some(sysroot.into_os_string())),
                     ],
                     cwd: assets.into(),
                     max_stdout_bytes: crate::lean_run::OUTPUT_LIMIT,

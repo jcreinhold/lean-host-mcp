@@ -37,9 +37,8 @@ pub(super) fn bind(
     prepared: LeanWorkerPreparedHostArtifacts,
 ) -> Result<crate::toolchain::WorkerSidecar> {
     use crate::toolchain::{WORKER_FILE_NAME, WorkerSidecar, hash_lean_header};
-    let project = candidate.join("smoke-project");
-    fs::create_dir(&project)?;
-    fs::create_dir_all(project.join(".lake/build/lib/lean"))?;
+    fs::create_dir(candidate.join(lean_host_mcp_worker::SMOKE_PROJECT_DIR))?;
+    fs::create_dir(candidate.join(lean_host_mcp_worker::SMOKE_IMPORT_ROOT))?;
     let manifest = Path::new(&prepared.shim_manifest_path);
     let data = lean_toolchain::CapabilityManifest::from_bytes(manifest, prepared.shim_manifest_json.as_bytes())
         .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
@@ -104,17 +103,19 @@ pub(super) fn probe(
         .checked_native_loader_environment()
         .prepared_host_artifacts(prepared);
     let run = || -> Result<()> {
-        let mut handle =
-            LeanWorkerHostHandleBuilder::shims_only(candidate.join("smoke-project"), std::iter::empty::<String>())
-                .require_host_runtime(
-                    crate::runtime_compatibility::session_expectation(id.as_str(), None).map_err(anyhow::Error::msg)?,
-                )
-                .worker_child(child)
-                .process_tracker(tracker.clone())
-                .num_threads(2)
-                .startup_timeout(Duration::from_secs(30))
-                .request_timeout(Duration::from_secs(20))
-                .open()?;
+        let mut handle = LeanWorkerHostHandleBuilder::shims_only(
+            candidate.join(lean_host_mcp_worker::SMOKE_PROJECT_DIR),
+            std::iter::empty::<String>(),
+        )
+        .require_host_runtime(
+            crate::runtime_compatibility::session_expectation(id.as_str(), None).map_err(anyhow::Error::msg)?,
+        )
+        .worker_child(child)
+        .process_tracker(tracker.clone())
+        .num_threads(2)
+        .startup_timeout(Duration::from_secs(30))
+        .request_timeout(Duration::from_secs(20))
+        .open()?;
         let result = handle.inspect_declaration_with_imports(
             vec!["Init".to_owned()],
             &LeanWorkerDeclarationInspectionRequest::new("Nat.add_zero"),
@@ -240,7 +241,7 @@ mod tests {
         let runtime = crate::toolchain::WorkerSidecar::load(&generation)
             .map(crate::toolchain::WorkerSidecar::into_deployment)
             .context("missing installed runtime")?;
-        let shadow = generation.join("smoke-project/.lake/build/lib/lean/Init");
+        let shadow = generation.join(lean_host_mcp_worker::SMOKE_IMPORT_ROOT).join("Init");
         fs::create_dir(&shadow)?;
         let refusal = probe(&generation, &id, &sysroot, runtime.prepared);
         fs::remove_dir(&shadow)?;
@@ -358,7 +359,7 @@ mod tests {
         let result = refuse("ordered shim roots differ");
         fs::write(&sidecar, &original)?;
         result?;
-        let shadow = candidate.join("smoke-project/.lake/build/lib/lean/Init");
+        let shadow = candidate.join(lean_host_mcp_worker::SMOKE_IMPORT_ROOT).join("Init");
         fs::create_dir(&shadow)?;
         let result = refuse("shadows compiled package Init");
         fs::remove_dir(shadow)?;

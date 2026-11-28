@@ -61,12 +61,34 @@ const LATE_POLL: Duration = Duration::from_millis(100);
 pub(crate) struct Program {
     /// The program and its arguments.
     pub(crate) command: Vec<OsString>,
-    /// Variables set on top of the server's environment.
-    pub(crate) environment: Vec<(OsString, OsString)>,
+    /// Changes to the server's environment: `Some` sets a variable, `None`
+    /// removes one the server has.
+    pub(crate) environment: Vec<(OsString, Option<OsString>)>,
     pub(crate) cwd: PathBuf,
     pub(crate) max_stdout_bytes: usize,
     /// Bytes the program reads as stdin; without them it reads nothing.
     pub(crate) stdin: Option<Vec<u8>>,
+}
+
+impl Program {
+    /// The program `command` describes, with the same arguments, working
+    /// directory and changes to the environment, reading no stdin. A command
+    /// that names no working directory runs in `cwd`.
+    pub(crate) fn from_command(command: &Command, cwd: &Path, max_stdout_bytes: usize) -> Self {
+        Self {
+            command: std::iter::once(command.get_program())
+                .chain(command.get_args())
+                .map(ToOwned::to_owned)
+                .collect(),
+            environment: command
+                .get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+                .collect(),
+            cwd: command.get_current_dir().unwrap_or(cwd).to_owned(),
+            max_stdout_bytes,
+            stdin: None,
+        }
+    }
 }
 
 /// What a failed run says about the program.
@@ -307,7 +329,10 @@ fn command(program: &Program, inputs: &Path) -> io::Result<(Command, Capture, Ca
     let mut command = Command::new(executable);
     command.args(arguments).current_dir(&program.cwd);
     for (key, value) in &program.environment {
-        command.env(key, value);
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
     }
     match &program.stdin {
         Some(bytes) => {
@@ -531,7 +556,7 @@ mod tests {
         move |inputs| {
             Ok(Program {
                 command: vec!["sh".into(), "-c".into(), script.into()],
-                environment: vec![("RUN_INPUTS".into(), inputs.as_os_str().to_owned())],
+                environment: vec![("RUN_INPUTS".into(), Some(inputs.as_os_str().to_owned()))],
                 cwd: inputs.to_path_buf(),
                 max_stdout_bytes: 64,
                 stdin: Some(b"from stdin".to_vec()),
@@ -558,6 +583,32 @@ mod tests {
         assert_eq!(exit.code, 3);
         assert_eq!(exit.stdout, b"from stdin");
         assert_eq!(exit.stderr, "oops\n");
+        Ok(())
+    }
+
+    /// A program made from a command keeps what the command changes in the
+    /// environment, removals included, such as the `LEAN_PATH` that
+    /// lean-toolchain's `lake env` command removes.
+    #[test]
+    fn a_program_from_a_command_sets_and_removes_variables() -> TestResult {
+        let inputs = tempfile::tempdir()?;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "echo \"${HOME-removed} $SET_BY_COMMAND $PWD\""])
+            .env("SET_BY_COMMAND", "set")
+            .env_remove("HOME");
+        let cwd = inputs.path().canonicalize()?;
+        let exit = run(
+            Duration::from_secs(10),
+            || false,
+            Box::new(()),
+            |_| Ok(Program::from_command(&command, &cwd, OUTPUT_LIMIT)),
+        )
+        .map_err(|failure| failure.detail)?;
+        assert_eq!(
+            String::from_utf8(exit.stdout)?,
+            format!("removed set {}\n", cwd.display())
+        );
         Ok(())
     }
 
