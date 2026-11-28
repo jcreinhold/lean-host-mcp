@@ -97,6 +97,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `stale_build` rows, and the stale warning and its hint, are gone. Lake's own check, `lake build --no-build` on the
   modules with hits, walks each module's import closure: about 1 s for one Proofs module and 3 s for Mathlib, as much as
   the lookup or more.
+- The server itself finds the installed shim `.olean` that a file check loads for each driver module, by Lean's
+  `findOLean` rule: the first shim root with a directory or `.olean` named for the module's first component holds it.
+  Before, it called `lean_toolchain::olean_candidate`, which used the same rule. An entry the server cannot inspect
+  still stops the check, now with the message `cannot inspect shim module prefix PATH`.
 
 ## [0.18.0] - 2026-11-27
 

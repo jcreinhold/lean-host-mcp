@@ -228,6 +228,9 @@ verdict is required, so a record that an older release wrote without one does no
 compatibility, so the server serves a worker that another host version built. `install` and `install-worker --auto`
 rebuild such a worker: the worker and host crates release together, and a release can keep the protocol. The installer
 builds the shims with plain Lake in the generation's own directory, and the digests of the shim files bind that build.
+Before each file check the server hashes those files again and finds the `.olean` that Lean loads for each driver module
+by Lean's `findOLean` rule over the recorded shim roots, in order: the first root with a directory or `.olean` named for
+the module's first component. The check runs only when that file is one the record names (`broker/verify_file.rs`).
 
 The smoke test opens a worker session importing `Init` and inspects `Nat.add_zero`. Install writes the record without a
 verdict before the test and records `passed` after it, then selects the generation. A failure exits installation nonzero

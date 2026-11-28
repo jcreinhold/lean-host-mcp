@@ -73,7 +73,7 @@ impl VerifierShims {
             verify_hash(path, hash)?;
         }
         for module in crate::toolchain::VERIFIER_MODULES {
-            let path = lean_toolchain::olean_candidate(&self.paths, module, |path| fs::metadata(path))
+            let path = shim_olean(&self.paths, module)
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("missing verification driver shim module"))?;
             if !self.files.contains_key(&path) {
@@ -84,6 +84,35 @@ impl VerifierShims {
         }
         Ok(())
     }
+}
+
+/// The `.olean` that Lean loads for `module` from the installed shim roots
+/// `roots`, searched in order, or `None` when no root holds it. Lean's
+/// `findOLean` takes the first root with a directory or an `.olean` named for
+/// the module's first component, even when the module's own file is missing
+/// there. An entry it cannot inspect stops the search, where Lean would skip
+/// it. The worker searches these roots in the order the install recorded, and
+/// no project's Lake workspace holds them, so the server answers this itself.
+fn shim_olean(roots: &[PathBuf], module: &str) -> io::Result<Option<PathBuf>> {
+    let package = module.split_once('.').map_or(module, |(first, _)| first);
+    let entry = |path: &Path| match fs::metadata(path) {
+        Ok(found) => Ok(Some(found)),
+        Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(None),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!("cannot inspect shim module prefix {}: {err}", path.display()),
+        )),
+    };
+    for root in roots {
+        let prefix = root.join(package);
+        if entry(&prefix)?.is_some_and(|found| found.is_dir()) || entry(&prefix.with_extension("olean"))?.is_some() {
+            let mut olean = root.clone();
+            olean.extend(module.split('.'));
+            olean.set_extension("olean");
+            return Ok(Some(olean));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Deserialize)]
@@ -553,6 +582,109 @@ mod tests {
             error.to_string().contains("code 1 after printing no error: trace"),
             "{error}"
         );
+    }
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    /// Write `text` to `path`, with its directories.
+    fn write(path: &Path, text: &str) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, text)
+    }
+
+    /// Lean loads a module from the first root that holds its package, as a
+    /// directory or an `.olean`, even when that root lacks the module itself.
+    #[test]
+    fn a_shim_module_loads_from_the_first_root_that_holds_its_package() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        let roots = [first.clone(), second.clone()];
+        assert_eq!(shim_olean(&roots, "A.B")?, None);
+        // A file named for the package is no package, and neither is a root
+        // that is a file.
+        write(&first.join("A"), "not a directory")?;
+        write(&second.join("A/B.olean"), "built")?;
+        assert_eq!(shim_olean(&roots, "A.B")?, Some(second.join("A/B.olean")));
+        assert_eq!(
+            shim_olean(&[first.join("A"), second.clone()], "A.B")?,
+            Some(second.join("A/B.olean"))
+        );
+        fs::remove_file(first.join("A"))?;
+        fs::create_dir(first.join("A"))?;
+        assert_eq!(shim_olean(&roots, "A.B")?, Some(first.join("A/B.olean")));
+        fs::remove_dir(first.join("A"))?;
+        write(&first.join("A.olean"), "built")?;
+        assert_eq!(shim_olean(&roots, "A.B")?, Some(first.join("A/B.olean")));
+        assert_eq!(shim_olean(&roots, "A")?, Some(first.join("A.olean")));
+        Ok(())
+    }
+
+    /// An entry that cannot be read stops the search, since a later root
+    /// might not be the one Lean loads from.
+    #[cfg(unix)]
+    #[test]
+    fn a_shim_root_that_cannot_be_read_stops_the_search() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        fs::create_dir(&first)?;
+        // A link to itself fails to resolve with an error of its own.
+        std::os::unix::fs::symlink("A", first.join("A"))?;
+        write(&second.join("A/B.olean"), "built")?;
+        let Err(err) = shim_olean(&[first.clone(), second], "A.B") else {
+            return Err("the search skipped a root it could not read".into());
+        };
+        assert!(
+            err.to_string().contains(&first.join("A").display().to_string()),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// A generation serves checks only when the `.olean` that Lean loads for
+    /// each verification driver module is one the install recorded.
+    #[test]
+    fn shims_validate_only_with_the_recorded_olean_of_each_driver_module() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let (interop, host) = (base.join("interop"), base.join("host"));
+        let mut files = std::collections::BTreeMap::new();
+        for module in crate::toolchain::VERIFIER_MODULES {
+            let mut olean = if module.starts_with("LeanRsInterop.") {
+                interop.clone()
+            } else {
+                host.clone()
+            };
+            olean.extend(module.split('.'));
+            olean.set_extension("olean");
+            write(&olean, module)?;
+            files.insert(olean.clone(), crate::digest::file_sha256_hex(&olean)?);
+        }
+        let shims = |paths: Vec<PathBuf>| VerifierShims {
+            sysroot: base.clone(),
+            paths,
+            files: files.clone(),
+        };
+        shims(vec![interop.clone(), host.clone()]).validate()?;
+        let Err(err) = shims(vec![interop.clone()]).validate() else {
+            return Err("a generation without the host shims passed".into());
+        };
+        assert!(
+            err.to_string().contains("missing verification driver shim module"),
+            "{err}"
+        );
+        // An earlier root that holds the host package shadows the recorded
+        // modules.
+        fs::create_dir(interop.join("LeanRsHostShims"))?;
+        let Err(err) = shims(vec![interop, host]).validate() else {
+            return Err("a shadowed driver module passed".into());
+        };
+        assert!(
+            err.to_string().contains("lacks verification driver module identity"),
+            "{err}"
+        );
+        Ok(())
     }
 
     #[test]
