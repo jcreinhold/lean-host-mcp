@@ -262,7 +262,6 @@ fn write_local_config(root: &Path, mut table: toml::Table, paths: &[(&str, PathB
 mod tests {
     use super::*;
     use crate::config_file::ConfigFile;
-    use crate::toolchain::WORKER_FILE_NAME;
 
     struct Fixture {
         _tmp: tempfile::TempDir,
@@ -306,10 +305,7 @@ mod tests {
         let mut builds = Vec::new();
         install(&plan, args, exe, |workers, id| {
             builds.push((workers.to_path_buf(), id.to_string()));
-            let slot = workers.join(id.as_str());
-            fs::create_dir_all(&slot)?;
-            fs::write(slot.join(WORKER_FILE_NAME), b"worker")?;
-            Ok(())
+            crate::toolchain::WorkerSidecar::install_stub(workers, id, "header", workers).map(drop)
         })?;
         Ok((plan, builds))
     }

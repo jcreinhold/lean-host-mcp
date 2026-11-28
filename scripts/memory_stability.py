@@ -45,7 +45,7 @@ Example:
     --project-root fixtures/lean \
     --workload scripts/memory_stability.fixture.json \
     --server-bin target/debug/lean-host-mcp \
-    --workers-dir target/debug \
+    --workers-dir /path/to/installed/workers \
     --repeats 20
 """
 
@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers-dir",
         type=Path,
-        help="Optional LEAN_HOST_MCP_WORKERS_DIR override, useful for development builds.",
+        help="Optional LEAN_HOST_MCP_WORKERS_DIR override: a directory that install-worker installed into.",
     )
     parser.add_argument(
         "--repeats",

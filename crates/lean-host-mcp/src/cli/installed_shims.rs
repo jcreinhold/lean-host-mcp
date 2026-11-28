@@ -83,7 +83,7 @@ pub(super) fn bind(
     };
     // The SDK manifest was generated in this final directory. Preserve its exact bytes.
     deployment.relative_to(candidate)?;
-    let record = WorkerSidecar::new(id, hash_lean_header(sysroot)?, Some(deployment));
+    let record = WorkerSidecar::new(id, hash_lean_header(sysroot)?, deployment);
     record.write(candidate)?;
     Ok(record)
 }
@@ -159,7 +159,7 @@ pub(super) fn qualify(candidate: &Path, id: &crate::toolchain::ToolchainId, sysr
     let prepared = prepare(candidate, sysroot)?;
     let mut record = bind(candidate, id, sysroot, prepared)?;
     let snapshot = crate::toolchain::WorkerSidecar::load(candidate)
-        .and_then(crate::toolchain::WorkerSidecar::into_deployment)
+        .map(crate::toolchain::WorkerSidecar::into_deployment)
         .context("unreadable installed snapshot")?;
     probe(candidate, id, sysroot, snapshot.prepared)?;
     record.complete(
@@ -224,7 +224,7 @@ mod tests {
         let generation = std::path::PathBuf::from(std::env::var_os("R2_GENERATION").context("missing generation")?);
         let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
         let runtime = crate::toolchain::WorkerSidecar::load(&generation)
-            .and_then(crate::toolchain::WorkerSidecar::into_deployment)
+            .map(crate::toolchain::WorkerSidecar::into_deployment)
             .context("missing installed runtime")?;
         probe(&generation, &id, &id.elan_dir()?.canonicalize()?, runtime.prepared)
     }
@@ -238,7 +238,7 @@ mod tests {
         let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
         let sysroot = id.elan_dir()?.canonicalize()?;
         let runtime = crate::toolchain::WorkerSidecar::load(&generation)
-            .and_then(crate::toolchain::WorkerSidecar::into_deployment)
+            .map(crate::toolchain::WorkerSidecar::into_deployment)
             .context("missing installed runtime")?;
         let shadow = generation.join("smoke-project/.lake/build/lib/lean/Init");
         fs::create_dir(&shadow)?;

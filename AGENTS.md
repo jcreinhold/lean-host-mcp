@@ -26,10 +26,12 @@ cargo test --locked -p lean-host-mcp --test http_transport
 ```
 
 The parent library tests need no Lean fixture. The all-target runner provisions a disposable installed worker for the
-stdio EOF check. Opt-in e2e and build tests require built fixture `.olean` files and a matching worker:
+stdio EOF check. Opt-in e2e and build tests require built fixture `.olean` files and a worker that `install-worker`
+installed for the fixture's toolchain. The worker that Cargo builds refuses to serve without the files that
+`install-worker` puts beside it.
 
 ```sh
-LEAN_HOST_MCP_WORKERS_DIR=$PWD/target/release \
+LEAN_HOST_MCP_WORKERS_DIR=/path/to/installed/workers \
 LEAN_HOST_MCP_TEST_FIXTURE=$PWD/fixtures/lean \
     cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation \
     -- --ignored --test-threads=1

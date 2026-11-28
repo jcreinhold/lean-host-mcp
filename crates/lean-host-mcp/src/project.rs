@@ -365,9 +365,9 @@ pub(crate) struct LeanProject {
     toolchain: String,
     manifest_hash: String,
     session_id: String,
-    /// Toolchain-provenance advisories captured at open (unknown pin, missing
-    /// sidecar). Surfaced into every response's envelope warnings via
-    /// [`Self::freshness`]; empty for a fully-vouched-for worker.
+    /// Toolchain advisories captured at open: a pin outside lean-rs's numbered
+    /// releases. Surfaced into every response's envelope warnings via
+    /// [`Self::freshness`]; empty for a supported pin.
     open_warnings: Vec<String>,
     actor_tx: Mutex<Option<mpsc::Sender<ProjectMessage>>>,
     active_jobs: Arc<AtomicUsize>,
@@ -966,9 +966,9 @@ struct ActorConfig {
     /// The handle is used *only* to wrap the receive; no Lean session ever
     /// crosses it.
     tokio_handle: Option<tokio::runtime::Handle>,
-    /// Open-time toolchain advisories (unknown pin, missing sidecar, no smoke
-    /// record). The actor carries them so a `runtime_unavailable` it produces
-    /// after worker death still flags a suspect worker. Mirrors
+    /// Open-time toolchain advisories (an unknown pin). The actor carries them
+    /// so a `runtime_unavailable` it produces after worker death still flags a
+    /// suspect worker. Mirrors
     /// [`LeanProject::open_warnings`]; both come from the one
     /// [`WorkerBinary::resolve_ready`] verdict at open.
     toolchain_advisories: Vec<String>,
@@ -984,12 +984,8 @@ pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf
     let dir = crate::toolchain::workers_dir(&meta.canonical_root, None).map_err(ServerError::BadProject)?;
     let fix = crate::toolchain::install_fix(&meta.canonical_root);
     let worker = format!("worker for leanprover/lean4:{toolchain_id} in {}", dir.display());
-    let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready(&toolchain_id, &dir, &fix) {
-        Readiness::Ready {
-            worker,
-            lean_sysroot,
-            note,
-        } => (worker.path, lean_sysroot, note.into_iter().collect()),
+    let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready(&toolchain_id, &dir) {
+        Readiness::Ready { worker, lean_sysroot } => (worker.path, lean_sysroot, Vec::new()),
         Readiness::UnknownPin {
             pin,
             worker,
@@ -1027,16 +1023,13 @@ pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf
         }
         Readiness::Unusable { detail, .. } => {
             CallCancellation::current().begin_operation().not_started();
-            let detail = detail.lines().next().unwrap_or_default().trim();
             return Err(ServerError::BadProject(format!(
                 "{worker} is unusable ({detail}); run: {fix}"
             )));
         }
-        Readiness::NotInstalled { .. } => {
-            return Err(ServerError::BadProject(format!(
-                "no worker for leanprover/lean4:{toolchain_id} in {}; run: {fix}",
-                dir.display()
-            )));
+        Readiness::NotInstalled { toolchain } => {
+            let missing = crate::toolchain::ToolchainError::WorkerNotInstalled { toolchain, dir };
+            return Err(ServerError::BadProject(format!("{missing}; run: {fix}")));
         }
         Readiness::ToolchainNotInstalled { toolchain, elan_dir } => {
             return Err(ServerError::BadProject(format!(
@@ -1057,11 +1050,11 @@ pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf
 
 impl ActorConfig {
     /// Resolve the pinned toolchain into a spawnable config plus any
-    /// open-time provenance advisories. All version-drift situations collapse
-    /// into the one [`WorkerBinary::resolve_ready`] verdict: hard failures
-    /// become a typed [`ServerError::BadProject`] carrying the corrective
-    /// command; soft ones (unknown pin, missing sidecar) ride along as
-    /// warnings the project surfaces in every envelope.
+    /// open-time advisories. All version-drift situations collapse into the
+    /// one [`WorkerBinary::resolve_ready`] verdict: hard failures become a
+    /// typed [`ServerError::BadProject`] carrying the corrective command; an
+    /// unknown pin rides along as a warning the project surfaces in every
+    /// envelope.
     fn from_meta(
         meta: &LakeProjectMeta,
         session_id: String,

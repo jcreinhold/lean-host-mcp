@@ -10,8 +10,8 @@
 //! - [`WorkerBinary`] is the resolved path to a worker binary that links
 //!   the corresponding Lean shared library. It lives in the worker directory
 //!   [`workers_dir`] picks for a Lake root, at
-//!   `<dir>/<id>/lean-host-mcp-worker` (or a bare `<dir>/lean-host-mcp-worker`
-//!   for a developer build).
+//!   `<dir>/<id>/<generation>/lean-host-mcp-worker`, where the file
+//!   `<dir>/<id>/current-generation` names the generation.
 //! - [`ToolchainError`] is the typed failure surface. Project-open code
 //!   maps it into [`crate::error::ServerError::BadProject`] with the
 //!   [`install_fix`] command, so the fix flows through to the client.
@@ -87,6 +87,10 @@ pub struct ToolchainId(String);
 
 /// File name of the per-toolchain worker binary inside a worker directory.
 pub const WORKER_FILE_NAME: &str = "lean-host-mcp-worker";
+
+/// What a refusal adds when an older release's install could be the cause:
+/// the server reads no install layout or record that an older release left.
+pub(crate) const OLDER_INSTALL: &str = "an install by an older lean-host-mcp must be redone";
 
 /// Env var that overrides the worker directory for every Lake root, for
 /// example to serve a worker built in this checkout. It beats the config
@@ -285,47 +289,41 @@ pub struct WorkerBinary {
 
 impl WorkerBinary {
     /// Look up the worker binary for `toolchain` in the worker directory
-    /// `dir`: a bare developer build at `<dir>/lean-host-mcp-worker` wins,
-    /// else the selected generation of `<dir>/<id>/`.
+    /// `dir`: the one in the generation that `<dir>/<id>/current-generation`
+    /// names.
     ///
     /// # Errors
     ///
-    /// [`ToolchainError::WorkerNotInstalled`] when no candidate exists.
+    /// [`ToolchainError::WorkerNotInstalled`] when the slot has no valid
+    /// selector or its generation holds no worker.
     pub fn resolve_in(toolchain: &ToolchainId, dir: &Path) -> Result<Self, ToolchainError> {
-        Self::resolve_location(toolchain, dir).map(|(worker, _)| worker)
-    }
-
-    fn resolve_location(toolchain: &ToolchainId, dir: &Path) -> Result<(Self, bool), ToolchainError> {
         let not_installed = || ToolchainError::WorkerNotInstalled {
             toolchain: toolchain.clone(),
             dir: dir.to_path_buf(),
         };
-        let slot = if dir.join(WORKER_FILE_NAME).is_file() {
-            dir.to_path_buf()
-        } else {
-            dir.join(toolchain.as_str())
-        };
-        let generation = Self::selected_dir(&slot).map_err(|_| not_installed())?;
+        let generation = Self::selected_dir(&dir.join(toolchain.as_str()))
+            .ok()
+            .flatten()
+            .ok_or_else(not_installed)?;
         let path = generation.join(WORKER_FILE_NAME);
         if !path.is_file() {
             return Err(not_installed());
         }
-        Ok((
-            Self {
-                path,
-                toolchain: toolchain.clone(),
-            },
-            generation != slot,
-        ))
+        Ok(Self {
+            path,
+            toolchain: toolchain.clone(),
+        })
     }
 
-    /// Resolve the generation once. A malformed selector must not revive an old binary.
-    pub(crate) fn selected_dir(slot: &Path) -> std::io::Result<PathBuf> {
+    /// The generation that `<slot>/current-generation` names, or `None` when
+    /// the slot has no selector. A malformed selector is an error, so it never
+    /// revives an old binary.
+    pub(crate) fn selected_dir(slot: &Path) -> std::io::Result<Option<PathBuf>> {
         use std::io::Read as _;
         let selector = slot.join("current-generation");
         let invalid = || crate::error::invalid_data("invalid installed worker generation");
         match std::fs::symlink_metadata(&selector) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(slot.to_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Ok(meta) if meta.is_file() && meta.len() <= 80 => {}
             Err(e) => return Err(e),
             Ok(_) => return Err(invalid()),
@@ -344,30 +342,29 @@ impl WorkerBinary {
         if !std::fs::symlink_metadata(&path)?.is_dir() {
             return Err(invalid());
         }
-        Ok(path)
+        Ok(Some(path))
     }
 
     /// The one answer project-open needs about a pinned toolchain: window
-    /// membership, elan + worker install presence, and header-digest
-    /// provenance, folded into a single [`Readiness`] verdict the caller maps
-    /// to one outcome (spawn, warn-and-spawn, or a typed `BadProject`).
+    /// membership, elan + worker install presence, and the generation's
+    /// `worker.json`, folded into a single [`Readiness`] verdict the caller
+    /// maps to one outcome (spawn, warn-and-spawn, or a typed `BadProject`).
     ///
     /// This hides five independently-volatile decisions behind one call — the
     /// window source ([`ToolchainId::window_verdict`]), the elan layout
     /// ([`ToolchainId::elan_dir`]), the worker install layout
     /// ([`Self::resolve_in`]), the header-digest provenance
-    /// mechanism, and the recorded runtime smoke result (both via the private
+    /// mechanism, and the recorded smoke test (both via the private
     /// `WorkerSidecar`) — so no call site consults a classifier and a separate
     /// provenance check. An out-of-window pin short-circuits before any
     /// filesystem probe, so the caller gets the window message even when the
     /// bogus toolchain was never installed.
     ///
-    /// On the happy path it hashes `<elan_dir>/include/lean/lean.h` once (a
-    /// few-KB SHA-256); this belongs on the cold resolve/open path, not the
-    /// warm per-call path. `dir` is the worker directory and `fix` the command
-    /// that soft advisories name.
+    /// On the happy path it hashes `<elan_dir>/include/lean/lean.h` and the
+    /// worker binary once; this belongs on the cold resolve/open path, not the
+    /// warm per-call path. `dir` is the worker directory.
     #[must_use]
-    pub fn resolve_ready(pin: &ToolchainId, dir: &Path, fix: &str) -> Readiness {
+    pub fn resolve_ready(pin: &ToolchainId, dir: &Path) -> Readiness {
         // Window first: an out-of-window pin can never load, and the bogus
         // toolchain is usually not installed, so checking elan first would
         // bury the useful "outside the window" message.
@@ -387,7 +384,7 @@ impl WorkerBinary {
             }
         };
         let current = hash_lean_header(&elan_dir).ok();
-        Self::resolve_ready_with(pin, dir, fix, elan_dir, current.as_deref())
+        Self::resolve_ready_with(pin, dir, elan_dir, current.as_deref())
     }
 
     /// [`Self::resolve_ready`] with the resolved `lean_sysroot` (the
@@ -399,7 +396,6 @@ impl WorkerBinary {
     pub fn resolve_ready_with(
         pin: &ToolchainId,
         dir: &Path,
-        fix: &str,
         lean_sysroot: PathBuf,
         current_digest: Option<&str>,
     ) -> Readiness {
@@ -409,82 +405,39 @@ impl WorkerBinary {
         if let WindowVerdict::OutOfWindow { window, nearest } = window {
             return Readiness::Unsupported { window, nearest };
         }
-        let Ok((worker, selected_generation)) = Self::resolve_location(pin, dir) else {
+        let Ok(worker) = Self::resolve_in(pin, dir) else {
             return Readiness::NotInstalled { toolchain: pin.clone() };
         };
-        // Provenance, in order of severity:
-        //   1. header drift     → Stale
-        //   2. protocol mismatch → Incompatible
-        //   3. smoke failed      → Unusable
-        //   4. smoke missing     → Ready + soft note
-        //   5. sidecar absent    → Ready + soft note
-        let install_dir = worker.path.parent().unwrap_or(&worker.path);
-        let sidecar = WorkerSidecar::load(install_dir);
-        if selected_generation {
-            let valid = sidecar.as_ref().is_some_and(|record| {
-                record.toolchain == pin.as_str()
-                    && matches!(record.smoke(), Some(SmokeOutcome::Passed))
-                    && record.deployment.as_ref().is_some_and(|deployment| {
-                        deployment.sysroot == lean_sysroot
-                            && std::fs::symlink_metadata(&worker.path).is_ok_and(|meta| meta.is_file())
-                            && crate::cli::install_worker::sha256_prefix(&worker.path, 64)
-                                .is_ok_and(|digest| digest == deployment.worker_sha256)
-                    })
-            });
-            if !valid {
-                return Readiness::Unusable {
-                    toolchain: pin.clone(),
-                    detail: "selected worker generation is incomplete or differs from its installed deployment".into(),
-                };
-            }
-        }
-        let note = match sidecar {
-            Some(sidecar) => {
-                // A recorded build-time digest that no longer matches the
-                // toolchain's current lean.h means the header drifted under the
-                // worker; a rebuild is the right move regardless of any smoke
-                // verdict, so check it first.
-                if let Some(current) = current_digest
-                    && !sidecar.header_matches(current)
-                {
-                    return Readiness::Stale { toolchain: pin.clone() };
-                }
-                if let Some(worker_protocol) = sidecar.protocol_version()
-                    && worker_protocol != lean_rs_worker_protocol::protocol::PROTOCOL_VERSION
-                {
-                    return Readiness::Incompatible {
-                        toolchain: pin.clone(),
-                        worker_protocol,
-                        host_protocol: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
-                    };
-                }
-                match sidecar.smoke() {
-                    // A header-digest match does not imply ABI compatibility (a
-                    // toolchain's libleanshared can crash this worker); the
-                    // recorded runtime smoke result is the sound signal.
-                    Some(SmokeOutcome::Failed { detail }) => {
-                        return Readiness::Unusable {
-                            toolchain: pin.clone(),
-                            detail: detail.to_owned(),
-                        };
-                    }
-                    Some(SmokeOutcome::Passed) => None,
-                    // Built by an older host that did not smoke-test: the header
-                    // digest still guards drift, but the worker is unverified at
-                    // runtime — nudge a reinstall to record a smoke result.
-                    None => Some(format!(
-                        "worker for {pin} has no runtime smoke record (installed by an older host); \
-                         reinstall to verify it can run: {fix}"
-                    )),
-                }
-            }
-            // A worker installed by an older host has no sidecar: not an error,
-            // just unknown provenance worth a soft nudge to reinstall.
-            None => Some(format!(
-                "worker for {pin} has no provenance record (installed by an older host); \
-                 reinstall to enable header-drift detection: {fix}"
-            )),
+        let unusable = |detail: String| Readiness::Unusable {
+            toolchain: pin.clone(),
+            detail,
         };
+        // The record, then in order of severity: header drift, protocol
+        // mismatch, then a generation that did not pass its smoke test or no
+        // longer matches its record.
+        let generation = worker.path.parent().unwrap_or(&worker.path);
+        let Some(record) = WorkerSidecar::load(generation) else {
+            return unusable(format!("its worker.json is missing or unreadable; {OLDER_INSTALL}"));
+        };
+        if let Some(current) = current_digest
+            && !record.header_matches(current)
+        {
+            return Readiness::Stale { toolchain: pin.clone() };
+        }
+        let worker_protocol = record.protocol_version();
+        if worker_protocol != lean_rs_worker_protocol::protocol::PROTOCOL_VERSION {
+            return Readiness::Incompatible {
+                toolchain: pin.clone(),
+                worker_protocol,
+                host_protocol: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
+            };
+        }
+        if record.smoke().is_none() {
+            return unusable("its install did not pass the smoke test".to_owned());
+        }
+        if !record.deploys(&worker, &lean_sysroot) {
+            return unusable("its generation differs from its worker.json".to_owned());
+        }
         if matches!(window, WindowVerdict::Unknown) {
             return Readiness::UnknownPin {
                 pin: pin.as_str().to_owned(),
@@ -492,11 +445,7 @@ impl WorkerBinary {
                 lean_sysroot,
             };
         }
-        Readiness::Ready {
-            worker,
-            lean_sysroot,
-            note,
-        }
+        Readiness::Ready { worker, lean_sysroot }
     }
 }
 
@@ -539,13 +488,10 @@ impl WindowVerdict {
 #[derive(Debug)]
 pub enum Readiness {
     /// Spawn the worker. `lean_sysroot` is the toolchain's `elan_dir` (the
-    /// child's `LEAN_SYSROOT`); `note` carries a soft advisory (e.g. missing
-    /// provenance sidecar) to surface as an envelope warning, `None` when the
-    /// worker is fully vouched-for.
+    /// child's `LEAN_SYSROOT`).
     Ready {
         worker: WorkerBinary,
         lean_sysroot: PathBuf,
-        note: Option<String>,
     },
     /// Numbered pin outside the supported window. Carries the window range and
     /// the nearest supported version.
@@ -559,14 +505,13 @@ pub enum Readiness {
         worker_protocol: u16,
         host_protocol: u16,
     },
-    /// The worker built and its header digest matches, but it failed its
-    /// post-build runtime smoke test — the toolchain's `libleanshared` is
-    /// ABI-incompatible with this lean-rs build and the worker crashes when it
-    /// loads Lean. `detail` is the recorded failure (e.g. `signal: 11
-    /// (SIGSEGV)`). A hard verdict: serving it would only produce per-call
-    /// `runtime_unavailable` crashes.
+    /// The selected generation cannot be served: its `worker.json` does not
+    /// load, its install did not pass the smoke test, or its worker binary,
+    /// toolchain or Lean prefix differs from the record. `detail` says which.
+    /// A hard verdict: the server refuses before it starts the worker.
     Unusable { toolchain: ToolchainId, detail: String },
-    /// No worker binary installed for this pin.
+    /// No selected generation with a worker binary for this pin. An older
+    /// release's install without a generation selector counts as none.
     NotInstalled { toolchain: ToolchainId },
     /// The pinned elan toolchain itself is not installed under the elan home.
     ToolchainNotInstalled { toolchain: ToolchainId, elan_dir: PathBuf },
@@ -674,18 +619,19 @@ pub(crate) fn hash_lean_header(elan_dir: &Path) -> std::io::Result<String> {
     crate::digest::file_sha256_hex(&elan_dir.join("include").join("lean").join("lean.h"))
 }
 
-/// Private provenance record written next to an installed worker binary.
+/// The record that `install-worker` writes as `worker.json` in each
+/// generation.
 ///
-/// Records what the worker was built against so [`WorkerBinary::resolve_ready`]
+/// Records what the worker was built against, so [`WorkerBinary::resolve_ready`]
 /// can detect header drift (the toolchain's `lean.h` changing under a worker
-/// that keeps being selected). Its `deployment` is the
-/// [`lean_host_mcp_worker::Deployment`] the worker checks itself against.
-/// Fields stay private; callers go through the query methods.
+/// that keeps being selected), and the [`Deployment`] the worker checks itself
+/// against. Every field but `smoke` is required, so a record that an older
+/// release wrote without one does not load. Fields stay private; callers go
+/// through the query methods.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct WorkerSidecar {
     toolchain: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    deployment: Option<Deployment>,
+    deployment: Deployment,
     /// Full SHA-256 of the `lean.h` the worker was built against.
     header_digest: String,
     /// `lean_toolchain::LEAN_VERSION` the host was built against.
@@ -694,19 +640,13 @@ pub(crate) struct WorkerSidecar {
     /// and host crates release together, so install replaces a worker that
     /// another release built. The server's gate still serves one whose
     /// `worker_protocol_version` matches.
-    #[serde(default)]
     built_by_host_version: String,
-    /// `lean-rs-worker-protocol` wire version. Zero for a legacy sidecar; the
-    /// runtime handshake remains authoritative for those workers.
-    #[serde(default)]
+    /// `lean-rs-worker-protocol` wire version the worker speaks.
     worker_protocol_version: u16,
     /// Whether `supported_by_digest(header_digest)` matched at build time.
     digest_supported_at_build: bool,
-    /// Outcome of the post-build runtime smoke test. `None` for a sidecar
-    /// written by a host predating the smoke test — unknown, not failed, so the
-    /// gate treats it as a soft "reinstall to verify" note rather than a hard
-    /// `Unusable`.
-    #[serde(default)]
+    /// The smoke test's verdict. A candidate's record has none until its
+    /// worker passes, and install selects a generation only after that.
     smoke: Option<SmokeOutcome>,
 }
 
@@ -721,23 +661,8 @@ pub const VERIFIER_MODULES: &[&str] = &[
 ];
 
 impl WorkerSidecar {
-    pub(crate) fn into_deployment(self) -> Option<Deployment> {
+    pub(crate) fn into_deployment(self) -> Deployment {
         self.deployment
-    }
-
-    /// Write `<install_dir>/worker.json` recording `header_digest`, the host's
-    /// build-time context, and the post-build `smoke` outcome. Overwrites any
-    /// existing record.
-    #[cfg(test)]
-    pub(crate) fn record(
-        install_dir: &Path,
-        id: &ToolchainId,
-        header_digest: String,
-        smoke: SmokeOutcome,
-    ) -> std::io::Result<()> {
-        let mut sidecar = Self::new(id, header_digest, None);
-        sidecar.smoke = Some(smoke);
-        sidecar.write(install_dir)
     }
 
     /// A deployment of the worker with digest `worker_sha256`, built against
@@ -757,9 +682,34 @@ impl WorkerSidecar {
         }
     }
 
+    /// Install a stub generation for `id` in the worker directory `dir`:
+    /// `<dir>/<id>/current-generation` selects `generation-test`, which holds a
+    /// worker file and a record that passed its smoke test, built against
+    /// `sysroot` and the `lean.h` with digest `header`. Returns the generation
+    /// and its record.
+    #[cfg(test)]
+    pub(crate) fn install_stub(
+        dir: &Path,
+        id: &ToolchainId,
+        header: &str,
+        sysroot: &Path,
+    ) -> anyhow::Result<(PathBuf, Self)> {
+        let slot = dir.join(id.as_str());
+        let generation = slot.join("generation-test");
+        std::fs::create_dir_all(&generation)?;
+        let worker = generation.join(WORKER_FILE_NAME);
+        std::fs::write(&worker, b"#!/bin/sh\n")?;
+        let digest = crate::cli::install_worker::sha256_prefix(&worker, 64)?;
+        let mut record = Self::new(id, header.to_owned(), Self::test_deployment(&digest, sysroot));
+        record.complete(&digest, SmokeOutcome::Passed)?;
+        record.write(&generation)?;
+        std::fs::write(slot.join("current-generation"), "generation-test")?;
+        Ok((generation, record))
+    }
+
     /// The record of a generation that runs `deployment`, before its smoke
     /// test.
-    pub(crate) fn new(id: &ToolchainId, header_digest: String, deployment: Option<Deployment>) -> Self {
+    pub(crate) fn new(id: &ToolchainId, header_digest: String, deployment: Deployment) -> Self {
         Self {
             deployment,
             toolchain: id.as_str().to_owned(),
@@ -773,7 +723,7 @@ impl WorkerSidecar {
     }
 
     pub(crate) fn complete(&mut self, digest: &str, smoke: SmokeOutcome) -> std::io::Result<()> {
-        if self.deployment.as_ref().is_none_or(|d| d.worker_sha256 != digest) {
+        if self.deployment.worker_sha256 != digest {
             return Err(crate::error::invalid_data("candidate worker changed during smoke"));
         }
         self.smoke = Some(smoke);
@@ -785,17 +735,25 @@ impl WorkerSidecar {
         std::fs::write(install_dir.join(lean_host_mcp_worker::RECORD_FILE_NAME), json)
     }
 
-    /// Load `<install_dir>/worker.json`. `None` when absent or unparseable —
-    /// an older host left no record, which is unknown provenance, not an error.
+    /// Load `<install_dir>/worker.json`, with the deployment's paths resolved
+    /// there. `None` when the record is missing, too large or malformed, as a
+    /// record that an older release wrote can be.
     pub(crate) fn load(install_dir: &Path) -> Option<Self> {
         let bytes = lean_host_mcp_worker::read_record(install_dir).ok()?;
         let mut record: Self = serde_json::from_slice(&bytes).ok()?;
-        if let Some(deployment) = record.deployment.as_mut()
-            && Path::new(&deployment.prepared.shim_manifest_path).is_relative()
-        {
-            deployment.resolve_in(install_dir).ok()?;
-        }
+        record.deployment.resolve_in(install_dir).ok()?;
         Some(record)
+    }
+
+    /// Whether the record describes `worker` run with the Lean prefix
+    /// `lean_sysroot`: the same toolchain and prefix, and a worker binary with
+    /// the recorded digest.
+    pub(crate) fn deploys(&self, worker: &WorkerBinary, lean_sysroot: &Path) -> bool {
+        self.toolchain == worker.toolchain.as_str()
+            && self.deployment.sysroot == lean_sysroot
+            && std::fs::symlink_metadata(&worker.path).is_ok_and(|meta| meta.is_file())
+            && crate::cli::install_worker::sha256_prefix(&worker.path, 64)
+                .is_ok_and(|digest| digest == self.deployment.worker_sha256)
     }
 
     /// Whether the recorded build-time digest still matches the toolchain.
@@ -803,23 +761,22 @@ impl WorkerSidecar {
         self.header_digest == current_digest
     }
 
-    /// Whether this `lean-host-mcp` release built the worker. A sidecar older
-    /// than the field records no release, so it never matches.
+    /// Whether this `lean-host-mcp` release built the worker.
     pub(crate) fn built_by_this_host(&self) -> bool {
         self.built_by_host_version == env!("CARGO_PKG_VERSION")
     }
 
-    /// Recorded worker wire protocol, or `None` for a legacy sidecar.
-    pub(crate) fn protocol_version(&self) -> Option<u16> {
-        (self.worker_protocol_version != 0).then_some(self.worker_protocol_version)
+    /// The worker's wire protocol version.
+    pub(crate) fn protocol_version(&self) -> u16 {
+        self.worker_protocol_version
     }
 
     /// One-word protocol compatibility label for `install-worker --list`.
     pub(crate) fn protocol_status(&self) -> &'static str {
-        match self.protocol_version() {
-            None => "unknown",
-            Some(version) if version == lean_rs_worker_protocol::protocol::PROTOCOL_VERSION => "compatible",
-            Some(_) => "incompatible",
+        if self.worker_protocol_version == lean_rs_worker_protocol::protocol::PROTOCOL_VERSION {
+            "compatible"
+        } else {
+            "incompatible"
         }
     }
 
@@ -835,16 +792,15 @@ impl WorkerSidecar {
         }
     }
 
-    /// The recorded post-build runtime smoke outcome, if any.
-    pub(crate) fn smoke(&self) -> Option<&SmokeOutcome> {
-        self.smoke.as_ref()
+    /// The recorded smoke test verdict, if any.
+    pub(crate) fn smoke(&self) -> Option<SmokeOutcome> {
+        self.smoke
     }
 
     /// One-word label for the `install-worker --list` `runtime` column:
-    /// `runs` / `crashed`, or `untested` for a sidecar written before the
-    /// post-build smoke test existed.
+    /// `runs` once the worker passed its smoke test, else `untested`.
     pub(crate) fn smoke_status(&self) -> &'static str {
-        self.smoke.as_ref().map_or("untested", SmokeOutcome::label)
+        if self.smoke.is_some() { "runs" } else { "untested" }
     }
 }
 
@@ -873,9 +829,11 @@ impl fmt::Display for ToolchainError {
                 toolchain,
                 elan_dir.display()
             ),
-            Self::WorkerNotInstalled { toolchain, dir } => {
-                write!(f, "no worker for leanprover/lean4:{toolchain} in {}", dir.display())
-            }
+            Self::WorkerNotInstalled { toolchain, dir } => write!(
+                f,
+                "no worker for leanprover/lean4:{toolchain} in {} ({OLDER_INSTALL})",
+                dir.display()
+            ),
         }
     }
 }
@@ -894,9 +852,6 @@ mod tests {
     use std::fs;
 
     use super::*;
-
-    /// The fix command the readiness tests pass; notes must repeat it.
-    const FIX: &str = "lean-host-mcp install --lake-root /project";
 
     #[test]
     fn elan_home_prefers_the_env_then_the_recorded_path_then_home() {
@@ -982,7 +937,10 @@ mod tests {
         let err = WorkerBinary::resolve_in(&id, tmp.path()).unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("no worker for leanprover/lean4:v4.30.0 in {}", tmp.path().display())
+            format!(
+                "no worker for leanprover/lean4:v4.30.0 in {} ({OLDER_INSTALL})",
+                tmp.path().display()
+            )
         );
     }
 
@@ -1019,23 +977,36 @@ mod tests {
     }
 
     #[test]
-    fn worker_binary_with_id_subdir_wins() {
+    fn worker_binary_is_the_selected_generations() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("v4.30.0").unwrap();
-        let nested = tmp.path().join("v4.30.0");
-        fs::create_dir_all(&nested).unwrap();
-        fs::write(nested.join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
+        let (generation, _) = WorkerSidecar::install_stub(tmp.path(), &id, "header", tmp.path()).unwrap();
         let resolved = WorkerBinary::resolve_in(&id, tmp.path()).unwrap();
-        assert_eq!(resolved.path, nested.join(WORKER_FILE_NAME));
+        assert_eq!(resolved.path, generation.join(WORKER_FILE_NAME));
     }
 
     #[test]
-    fn worker_binary_bare_developer_fallback_wins() {
+    fn layouts_an_older_release_made_are_not_installed() {
         let tmp = tempfile::tempdir().unwrap();
-        let id = ToolchainId::parse("v4.30.0").unwrap();
+        let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
+        // A bare worker in the worker directory, and one in a slot that has no
+        // generation selector.
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        let resolved = WorkerBinary::resolve_in(&id, tmp.path()).unwrap();
-        assert_eq!(resolved.path, tmp.path().join(WORKER_FILE_NAME));
+        let slot = tmp.path().join(id.as_str());
+        fs::create_dir_all(&slot).unwrap();
+        fs::write(slot.join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
+        WorkerSidecar::new(&id, "d".into(), WorkerSidecar::test_deployment("x", tmp.path()))
+            .write(&slot)
+            .unwrap();
+        assert!(matches!(
+            WorkerBinary::resolve_in(&id, tmp.path()),
+            Err(ToolchainError::WorkerNotInstalled { .. })
+        ));
+        assert_eq!(WorkerBinary::selected_dir(&slot).unwrap(), None);
+        assert!(matches!(
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("d")),
+            Readiness::NotInstalled { .. }
+        ));
     }
 
     /// The supported window's floor and head, read live from
@@ -1185,32 +1156,60 @@ mod tests {
     fn sidecar_round_trips_record_then_load() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("v4.30.0").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "abc123".to_owned(), SmokeOutcome::Passed).unwrap();
-        let loaded = WorkerSidecar::load(tmp.path()).expect("sidecar should load");
+        let (generation, _) = WorkerSidecar::install_stub(tmp.path(), &id, "abc123", tmp.path()).unwrap();
+        let loaded = WorkerSidecar::load(&generation).expect("sidecar should load");
         assert!(loaded.header_matches("abc123"));
         assert!(!loaded.header_matches("different"));
         assert_eq!(loaded.header_status(Some("abc123")), "fresh");
         assert_eq!(loaded.header_status(Some("different")), "stale");
         assert_eq!(loaded.header_status(None), "unknown");
         assert_eq!(loaded.smoke_status(), "runs");
-        assert_eq!(loaded.smoke(), Some(&SmokeOutcome::Passed));
+        assert_eq!(loaded.smoke(), Some(SmokeOutcome::Passed));
+        assert!(loaded.built_by_this_host());
+        assert_eq!(
+            loaded.into_deployment().prepared.shim_manifest_path,
+            generation.join("shims/test").to_string_lossy(),
+            "load resolves the stored paths in the generation"
+        );
     }
 
     #[test]
-    fn legacy_sidecar_without_smoke_field_loads_as_no_record() {
-        // A sidecar written by a host predating the smoke test has no `smoke`
-        // key; `#[serde(default)]` must read it back as unknown, not fail.
+    fn records_an_older_release_wrote_do_not_load() {
         let tmp = tempfile::tempdir().unwrap();
-        let legacy = r#"{
-            "toolchain": "v4.30.0",
-            "header_digest": "abc123",
-            "built_against_lean_version": "4.30.0",
-            "digest_supported_at_build": true
-        }"#;
-        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), legacy).unwrap();
-        let loaded = WorkerSidecar::load(tmp.path()).expect("legacy sidecar should load");
-        assert_eq!(loaded.smoke(), None);
-        assert_eq!(loaded.smoke_status(), "untested");
+        let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
+        let (generation, record) = WorkerSidecar::install_stub(tmp.path(), &id, "d", tmp.path()).unwrap();
+        let current = serde_json::to_value(&record).unwrap();
+        let without = |key: &str| {
+            let mut value = current.clone();
+            value.as_object_mut().unwrap().remove(key);
+            value
+        };
+        let mut absolute = current.clone();
+        *absolute.pointer_mut("/deployment/prepared/shim_manifest_path").unwrap() =
+            generation.join("shims/test").to_string_lossy().into();
+        let mut failed = current.clone();
+        *failed.pointer_mut("/smoke").unwrap() =
+            serde_json::json!({ "result": "failed", "detail": "signal: 11 (SIGSEGV)" });
+        let older = [
+            without("deployment"),
+            without("built_by_host_version"),
+            without("worker_protocol_version"),
+            absolute,
+            failed,
+        ];
+        for value in older {
+            fs::write(
+                generation.join(lean_host_mcp_worker::RECORD_FILE_NAME),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            assert!(WorkerSidecar::load(&generation).is_none(), "{value}");
+            let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("d"));
+            let Readiness::Unusable { detail, .. } = readiness else {
+                panic!("expected Unusable, got {readiness:?}");
+            };
+            assert!(detail.ends_with(OLDER_INSTALL), "got: {detail}");
+        }
     }
 
     #[test]
@@ -1223,11 +1222,11 @@ mod tests {
         fs::write(slot.join("current-generation"), "generation-example").unwrap();
         let worker = generation.join(WORKER_FILE_NAME);
         fs::write(&worker, b"qualified worker").unwrap();
-        let ready = || WorkerBinary::resolve_ready_with(&pin, root.path(), FIX, root.path().to_owned(), Some("header"));
+        let ready = || WorkerBinary::resolve_ready_with(&pin, root.path(), root.path().to_owned(), Some("header"));
         assert!(matches!(ready(), Readiness::Unusable { .. }));
         let digest = crate::cli::install_worker::sha256_prefix(&worker, 64).unwrap();
         let deployment = WorkerSidecar::test_deployment(&digest, root.path());
-        let mut record = WorkerSidecar::new(&pin, "header".into(), Some(deployment));
+        let mut record = WorkerSidecar::new(&pin, "header".into(), deployment);
         record.complete(&digest, SmokeOutcome::Passed).unwrap();
         record.write(&generation).unwrap();
         assert!(matches!(ready(), Readiness::Ready { .. }));
@@ -1235,101 +1234,65 @@ mod tests {
         assert!(matches!(ready(), Readiness::Unusable { .. }));
         fs::write(&worker, b"qualified worker").unwrap();
         assert!(matches!(ready(), Readiness::Ready { .. }));
+        let elsewhere =
+            WorkerBinary::resolve_ready_with(&pin, root.path(), PathBuf::from("/other/lean"), Some("header"));
+        assert!(
+            matches!(elsewhere, Readiness::Unusable { .. }),
+            "another Lean prefix than the record's: {elsewhere:?}"
+        );
     }
 
     #[test]
-    fn smoke_failed_is_unusable_even_with_matching_digest() {
+    fn a_record_without_a_smoke_verdict_is_unusable() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        WorkerSidecar::record(
-            tmp.path(),
-            &id,
-            "digest".to_owned(),
-            SmokeOutcome::Failed {
-                detail: "signal: 11 (SIGSEGV)".to_owned(),
-            },
-        )
-        .unwrap();
-        let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
+        let (generation, mut record) = WorkerSidecar::install_stub(tmp.path(), &id, "digest", tmp.path()).unwrap();
+        record.smoke = None;
+        record.write(&generation).unwrap();
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("digest"));
         let Readiness::Unusable { detail, .. } = readiness else {
             panic!("expected Unusable, got {readiness:?}");
         };
-        assert!(detail.contains("SIGSEGV"), "got: {detail}");
+        assert!(detail.contains("smoke test"), "got: {detail}");
     }
 
     #[test]
-    fn smoke_record_missing_is_ready_with_reinstall_note() {
-        // Sidecar present (digest guards drift) but no smoke record: a legacy
-        // worker. Ready, but nudged to reinstall to verify it runs.
+    fn a_qualified_generation_is_ready() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        let legacy = format!(
-            r#"{{"toolchain":"{}","header_digest":"digest","built_against_lean_version":"x","digest_supported_at_build":true}}"#,
-            id.as_str()
-        );
-        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), legacy).unwrap();
-        let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
-        let Readiness::Ready { note: Some(note), .. } = readiness else {
-            panic!("expected Ready with a reinstall note, got {readiness:?}");
-        };
-        assert!(note.contains("smoke") && note.ends_with(FIX), "got: {note}");
-    }
-
-    #[test]
-    fn ready_with_matching_digest_carries_no_note() {
-        let tmp = tempfile::tempdir().unwrap();
-        let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "digest".to_owned(), SmokeOutcome::Passed).unwrap();
-        let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
+        WorkerSidecar::install_stub(tmp.path(), &id, "digest", tmp.path()).unwrap();
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("digest"));
         assert!(
-            matches!(readiness, Readiness::Ready { note: None, .. }),
-            "expected Ready with no note, got {readiness:?}"
+            matches!(readiness, Readiness::Ready { .. }),
+            "expected Ready, got {readiness:?}"
         );
     }
 
     #[test]
-    fn protocol_version_round_trips_and_legacy_sidecar_is_unknown() {
+    fn protocol_status_compares_the_recorded_protocol() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("v4.30.0").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "abc".to_owned(), SmokeOutcome::Passed).unwrap();
-        let loaded = WorkerSidecar::load(tmp.path()).unwrap();
+        let (generation, mut record) = WorkerSidecar::install_stub(tmp.path(), &id, "abc", tmp.path()).unwrap();
+        let loaded = WorkerSidecar::load(&generation).unwrap();
         assert_eq!(
             loaded.protocol_version(),
-            Some(lean_rs_worker_protocol::protocol::PROTOCOL_VERSION)
+            lean_rs_worker_protocol::protocol::PROTOCOL_VERSION
         );
         assert_eq!(loaded.protocol_status(), "compatible");
-
-        // A sidecar written before the field existed reads back as unknown
-        // provenance (serde default ""), never a spurious mismatch.
-        let legacy = tempfile::tempdir().unwrap();
-        let json = r#"{"toolchain":"v4.30.0","header_digest":"abc","built_against_lean_version":"x","digest_supported_at_build":true,"smoke":{"result":"passed"}}"#;
-        fs::write(legacy.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), json).unwrap();
-        let old = WorkerSidecar::load(legacy.path()).unwrap();
-        assert_eq!(old.protocol_version(), None);
-        assert_eq!(old.protocol_status(), "unknown");
+        record.worker_protocol_version = 999;
+        assert_eq!(record.protocol_status(), "incompatible");
     }
 
     #[test]
     fn package_version_skew_is_ready_when_protocol_is_compatible() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        let skewed = format!(
-            r#"{{"toolchain":"{}","header_digest":"digest","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","worker_protocol_version":{},"digest_supported_at_build":true,"smoke":{{"result":"passed"}}}}"#,
-            id.as_str(),
-            lean_rs_worker_protocol::protocol::PROTOCOL_VERSION
-        );
-        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), skewed).unwrap();
-        let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
+        let (generation, mut record) = WorkerSidecar::install_stub(tmp.path(), &id, "digest", tmp.path()).unwrap();
+        record.built_by_host_version = "0.0.1-old".into();
+        record.write(&generation).unwrap();
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("digest"));
         assert!(
-            matches!(readiness, Readiness::Ready { note: None, .. }),
+            matches!(readiness, Readiness::Ready { .. }),
             "expected compatible package skew to be silent, got {readiness:?}"
         );
     }
@@ -1338,14 +1301,10 @@ mod tests {
     fn protocol_mismatch_is_a_hard_incompatibility() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        let skewed = format!(
-            r#"{{"toolchain":"{}","header_digest":"digest","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","worker_protocol_version":999,"digest_supported_at_build":true,"smoke":{{"result":"passed"}}}}"#,
-            id.as_str()
-        );
-        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), skewed).unwrap();
-        let readiness =
-            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, tmp.path().to_path_buf(), Some("digest"));
+        let (generation, mut record) = WorkerSidecar::install_stub(tmp.path(), &id, "digest", tmp.path()).unwrap();
+        record.worker_protocol_version = 999;
+        record.write(&generation).unwrap();
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("digest"));
         assert!(matches!(
             readiness,
             Readiness::Incompatible {
@@ -1359,37 +1318,36 @@ mod tests {
     fn forged_mismatching_digest_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "built-digest".to_owned(), SmokeOutcome::Passed).unwrap();
-        let sysroot = tmp.path().to_path_buf();
+        WorkerSidecar::install_stub(tmp.path(), &id, "built-digest", tmp.path()).unwrap();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("drifted-digest")),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("drifted-digest")),
             Readiness::Stale { .. }
         ));
     }
 
     #[test]
-    fn missing_sidecar_is_ready_with_soft_note() {
+    fn a_missing_record_is_unusable_and_says_to_redo_the_install() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("whatever"));
-        let Readiness::Ready { note: Some(note), .. } = readiness else {
-            panic!("expected Ready with a soft note, got {readiness:?}");
+        let (generation, _) = WorkerSidecar::install_stub(tmp.path(), &id, "d", tmp.path()).unwrap();
+        fs::remove_file(generation.join(lean_host_mcp_worker::RECORD_FILE_NAME)).unwrap();
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("d"));
+        let Readiness::Unusable { detail, .. } = readiness else {
+            panic!("expected Unusable, got {readiness:?}");
         };
-        assert!(note.contains("provenance") && note.ends_with(FIX), "got: {note}");
+        assert_eq!(
+            detail,
+            format!("its worker.json is missing or unreadable; {OLDER_INSTALL}")
+        );
     }
 
     #[test]
     fn unknown_nightly_pin_installed_and_fresh_is_unknown_pin() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("nightly-2026-05-20").unwrap();
-        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "d".to_owned(), SmokeOutcome::Passed).unwrap();
-        let sysroot = tmp.path().to_path_buf();
+        WorkerSidecar::install_stub(tmp.path(), &id, "d", tmp.path()).unwrap();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("d")),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), tmp.path().to_owned(), Some("d")),
             Readiness::UnknownPin { .. }
         ));
     }
@@ -1400,7 +1358,7 @@ mod tests {
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, None),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), sysroot, None),
             Readiness::NotInstalled { .. }
         ));
     }
@@ -1412,7 +1370,7 @@ mod tests {
         let id = ToolchainId::parse("v0.0.0").unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, None),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), sysroot, None),
             Readiness::Unsupported { .. }
         ));
     }

@@ -775,9 +775,9 @@ mod tests {
             restarts_in_window: Some(1),
             window_millis: Some(60_000),
             runtime,
-            // A no-record / suspect worker carries an open-time advisory; it must
-            // survive onto the semantic issue channel, not vanish when the worker dies.
-            toolchain_advisories: vec!["worker for v4.30.0 has no runtime smoke record".to_owned()],
+            // A suspect worker carries an open-time advisory; it must survive
+            // onto the semantic issue channel, not vanish when the worker dies.
+            toolchain_advisories: vec!["lean-toolchain pins nightly-2026-05-20".to_owned()],
         });
         let ServerError::WorkerUnavailable(info) = error else {
             unreachable!("constructed a WorkerUnavailable error")
@@ -806,7 +806,7 @@ mod tests {
         // The open-time advisory is preserved as a warning issue.
         assert_eq!(
             json.pointer("/errors/1/message").and_then(serde_json::Value::as_str),
-            Some("worker for v4.30.0 has no runtime smoke record")
+            Some("lean-toolchain pins nightly-2026-05-20")
         );
     }
 

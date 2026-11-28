@@ -59,8 +59,8 @@ pub struct Freshness {
     pub imports: Vec<String>,
     pub session_id: String,
     pub lean_toolchain: String,
-    /// Project-lifetime toolchain-provenance advisories (unknown pin, missing
-    /// provenance sidecar). Carried to the envelope, where one drain
+    /// Project-lifetime toolchain advisories (an unknown pin). Carried to the
+    /// envelope, where one drain
     /// ([`Response::drain_advisories`], called by [`crate::server`]) moves them
     /// into the top-level `warnings` array, so "warnings are top-level" holds.
     pub(crate) toolchain_advisories: Vec<String>,

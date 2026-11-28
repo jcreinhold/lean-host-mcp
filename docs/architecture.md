@@ -192,42 +192,46 @@ Consumers do not declare, link, or import either support package.
 
 ### Toolchain-Readiness Gate
 
-`WorkerBinary::resolve_ready` checks the supported table, elan/worker layout, recorded header digest, wire protocol, and
-runtime smoke result before spawn. It looks in the project's worker directory, which `toolchain::workers_dir` picks for
-both the server and `install`: `LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir` from the project's config
-files, then `.local/lean-host-mcp/workers` under the Lake root. Project discovery first checks the lakefile and
-manifest, so readiness tests need a real pinned Lake root.
+`WorkerBinary::resolve_ready` checks the supported table, the elan toolchain, the generation that `current-generation`
+selects, and that generation's `worker.json` before spawn. It looks in the project's worker directory, which
+`toolchain::workers_dir` picks for both the server and `install`: `LEAN_HOST_MCP_WORKERS_DIR`, then
+`[install] workers_dir` from the project's config files, then `.local/lean-host-mcp/workers` under the Lake root.
+Project discovery first checks the lakefile and manifest, so readiness tests need a real pinned Lake root.
 
 | Verdict | Meaning |
 | --- | --- |
 | `Unsupported` | Numbered pin absent from the supported table; returned before filesystem probes, with the nearest supported version (ties prefer newer) |
-| `ToolchainNotInstalled` / `NotInstalled` | Missing elan toolchain or worker binary |
+| `ToolchainNotInstalled` / `NotInstalled` | Missing elan toolchain, or no worker in a selected generation |
 | `Stale` | Current `lean.h` differs from the recorded build digest |
 | `Incompatible` | Recorded worker wire protocol differs from this parent |
-| `Unusable` | Recorded post-install runtime smoke failed despite a matching header |
+| `Unusable` | The record does not load, holds no passing smoke test, or differs from the generation |
 | `UnknownPin` | Installed non-numbered pin, allowed with an advisory |
-| `Ready` | May spawn, with an advisory if provenance or runtime smoke evidence is missing |
+| `Ready` | May spawn |
 
-Header drift takes precedence over protocol mismatch, which precedes failed smoke. Hard verdicts refuse before spawn
-with one line that names the worker directory and the fix, `SERVER install --lake-root PROJECT`. Protocol mismatch maps
-to `IncompatibleWorker` with that command as its recovery command; the other hard verdicts map to `BadProject`.
-Advisories survive runtime failure and are projected into public warning issues. Installation checks the pure
-supported-window verdict before building. Resident actor selection uses metadata and health, while source-option
-resolution also rechecks worker readiness, including the current header digest.
+The gate reads no other layout: a worker in the toolchain's directory itself or at the top of the worker directory is
+`NotInstalled`, and both that refusal and a record that does not load say that an install by an older lean-host-mcp must
+be redone. After the record loads, header drift takes precedence over protocol mismatch, which precedes a missing smoke
+verdict and a generation that differs from its record. Hard verdicts refuse before spawn with one line that names the
+worker directory and the fix, `SERVER install --lake-root PROJECT`. Protocol mismatch maps to `IncompatibleWorker` with
+that command as its recovery command; the other hard verdicts map to `BadProject`. Advisories survive runtime failure
+and are projected into public warning issues. Installation checks the pure supported-window verdict before building.
+Resident actor selection uses metadata and health, while source-option resolution also rechecks worker readiness,
+including the current header digest.
 
 ### Worker Provenance Sidecar
 
-`install-worker` writes `worker.json` beside the installed binary: toolchain id, full `lean.h` SHA-256, build-time Lean
-version, host version, worker protocol, digest support at build time, and runtime smoke outcome. Protocol determines
-wire compatibility, so the server serves a worker that another host version built. `install` and `install-worker --auto`
-rebuild such a worker: the worker and host crates release together, and a release can keep the protocol. A legacy
-sidecar without protocol information leaves the worker handshake authoritative. The installer builds the shims with
-plain Lake in the generation's own directory, and the digests of the shim files bind that build.
+`install-worker` writes `worker.json` in each generation, beside the binary: toolchain id, the deployment (the worker's
+digest, the Lean prefix, the shims and the digest of each file the worker loads), full `lean.h` SHA-256, build-time Lean
+version, host version, worker protocol, digest support at build time, and the smoke verdict. Every field but the smoke
+verdict is required, so a record that an older release wrote without one does not load. Protocol determines wire
+compatibility, so the server serves a worker that another host version built. `install` and `install-worker --auto`
+rebuild such a worker: the worker and host crates release together, and a release can keep the protocol. The installer
+builds the shims with plain Lake in the generation's own directory, and the digests of the shim files bind that build.
 
-The smoke test opens a worker session importing `Init` and inspects `Nat.add_zero`. Failure exits installation nonzero
-but retains the binary and failed record so `--list` and readiness can explain the problem. Missing provenance or smoke
-evidence produces an advisory rather than an automatic refusal. `install-worker --list` reports independent support,
-header/build, runtime, and protocol columns; a digest match alone does not establish runtime ABI compatibility.
+The smoke test opens a worker session importing `Init` and inspects `Nat.add_zero`. Install writes the record without a
+verdict before the test and records `passed` after it, then selects the generation. A failure exits installation nonzero
+and selects nothing, so the generation selected before stays in place. `install-worker --list` reports independent
+support, header/build, runtime, and protocol columns; a digest match alone does not establish runtime ABI compatibility.
 
 ## Declaration-Centric Proof API
 

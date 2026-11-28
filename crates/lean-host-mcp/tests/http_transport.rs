@@ -1118,24 +1118,34 @@ async fn streamable_http_dropped_startup_preserves_coalesced_worker_at_capacity(
         .expect("exact installed worker path");
     let starts = scratch.path().join("worker-starts");
     let release = scratch.path().join("release-startup");
-    let wrapper = scratch.path().join("lean-host-mcp-worker");
+    // Install the wrapper as a generation of its own. The server admits it
+    // through a copy of the installed record that names the wrapper's digest,
+    // and the installed worker it execs checks its own installation.
+    let slot = scratch.path().join(toolchain.as_str());
+    let generation = slot.join("generation-wrapper");
+    std::fs::create_dir_all(&generation).unwrap();
+    let wrapper = generation.join("lean-host-mcp-worker");
     // Delay the worker handshake, not a Lean command, so the first caller
     // still holds the project's opening lock when its client leaves. Bound
     // the wait so a failed assertion cannot leave a child stuck. Each caller
     // that finds no worker first runs this file with the readiness flag,
     // before it takes the opening lock. That run checks the installed shims
     // and opens no Lean, so it goes straight through, and `starts` counts
-    // worker children only. The server runs a worker file at the top of its
-    // worker directory as it finds it, and the installed worker it execs
-    // checks its own installation.
+    // worker children only.
     let script = format!(
         "#!/bin/sh\n[ \"$1\" != --lean-rs-ready-host-artifacts ] || exec {worker} \"$@\"\nprintf '%s\\n' \"$$\" >> {starts}\nremaining=500\nwhile [ ! -f {release} ]; do\n  remaining=$((remaining - 1))\n  [ \"$remaining\" -gt 0 ] || exit 75\n  sleep 0.01\ndone\nexec {worker} \"$@\"\n",
         starts = shell_quote_path(&starts),
         release = shell_quote_path(&release),
         worker = shell_quote_path(&worker),
     );
-    std::fs::write(&wrapper, script).unwrap();
+    std::fs::write(&wrapper, &script).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let installed_record = worker.parent().expect("installed generation").join("worker.json");
+    let mut record: Value =
+        serde_json::from_slice(&std::fs::read(installed_record).expect("installed record")).expect("record JSON");
+    record["deployment"]["worker_sha256"] = sha256_hex(script.as_bytes()).into();
+    std::fs::write(generation.join("worker.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::write(slot.join("current-generation"), "generation-wrapper").unwrap();
     let root_s = root.to_string_lossy();
     let wrapper_dir = scratch.path().to_str().expect("UTF-8 test path");
     let server = HttpMcpServer::start_with_env(

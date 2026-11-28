@@ -19,6 +19,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   each resident worker kept from its last completed call on its current generation. The field is absent when no resident
   worker has one, and `lean_status` still opens no worker. The status and compatibility types no longer derive
   `JsonSchema`, and a receipt's `loaded` facts use lean-rs's `LeanWorkerHostRuntimeMetadata`.
+- The server runs only the worker in the generation that `<workers>/<id>/current-generation` selects, and only when that
+  generation's `worker.json` holds every field this release writes. An install made by an older lean-host-mcp must be
+  redone with `install` or `install-worker`: a worker in the toolchain's directory itself or at the top of the worker
+  directory counts as missing, and a record without a deployment, host version, protocol version or passing smoke test,
+  or with an absolute shim path, makes the worker unusable. Both refusals say so. Before, the server ran such a worker
+  with a note to reinstall. `install-worker --prune` removes only workers outside the supported window, since no release
+  since 0.17.0 selects a generation that failed its smoke test, and `--list` and `--prune` skip a directory with no
+  `current-generation`. In the library, `WorkerBinary::resolve_ready` and `resolve_ready_with` lose their `fix` argument
+  and `Readiness::Ready` loses its `note`.
 
 ### Changed
 

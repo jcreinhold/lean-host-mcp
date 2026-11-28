@@ -568,11 +568,14 @@ elan; the freshly built worker is smoke-tested before it is recorded as usable.
 
 ### Keeping workers compatible with the host
 
-The provenance sidecar records the worker wire-protocol version and, apart from it, the `lean-host-mcp` version that
-built the worker:
+Each worker lives in a generation, `DIR/<id>/generation-<name>/`, and `DIR/<id>/current-generation` names the one the
+server runs. The generation's `worker.json` records the worker wire-protocol version and, apart from it, the
+`lean-host-mcp` version that built the worker. The server runs no other layout, so an install made by an older
+lean-host-mcp must be redone. A worker in the toolchain's directory itself or at the top of the worker directory counts
+as missing, and a record that lacks a field this release requires counts as unusable.
 
 - `install-worker --auto` (the default) scans `toolchains/` in the elan home and (re)builds any worker that is **missing
-  or stale** — protocol mismatch, `lean.h` header drift, a failed/absent runtime smoke record, or a build by another
+  or stale** — a record that does not load, `lean.h` header drift, protocol mismatch, or a build by another
   `lean-host-mcp` release — and skips ones that are current. The worker and host crates release together, and a release
   can keep the protocol version. The server still serves a worker whose protocol matches. Out-of-window toolchains are
   skipped (a worker for them could never load). `--force` rebuilds current workers too (e.g. to re-run the smoke test or
@@ -580,25 +583,27 @@ built the worker:
 - `install-worker --toolchain <id>` builds a fresh generation in its final directory. The new worker writes the shim
   sources compiled into it to the generation's `shims/` directory and builds them there with plain Lake; the installer
   records their digests in `worker.json`. After the builtin `Nat.add_zero` inspection and successful shutdown it
-  atomically updates `current-generation`. Existing workers retain their original paths. Installs without a selector
-  continue to use the legacy directory. The installed shims and their compiled Lean imports run without the source
-  checkout or Cargo source cache. To use a different worker root, reinstall there. The SDK manifest records absolute
-  paths for its generation.
-- `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
-  `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
-- `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are
-  rebuildable artifacts, so this only deletes from the install root and never touches source. Use it for disk hygiene or
-  to force a clean rebuild after a `lean-rs` ABI change.
-- `install-worker --prune` removes only *unservable* workers — those outside the supported window or with a recorded
-  smoke-test failure. Other stale workers are kept; rebuild those with `--auto`.
+  atomically updates `current-generation`. A failed build or smoke test fails the install and leaves the selected
+  generation in place. Existing workers retain their original paths. The installed shims and their compiled Lean imports
+  run without the source checkout or Cargo source cache. To use a different worker root, reinstall there. The SDK
+  manifest records absolute paths for its generation.
+- `install-worker --list` prints the selected generation of each toolchain; the `protocol` column reads `compatible` or
+  `incompatible`, and the status columns read `unknown` when the record does not load.
+- `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one, with any files an
+  older release left in its directory. Workers are rebuildable artifacts, so this only deletes from the install root and
+  never touches source. Use it for disk hygiene or to force a clean rebuild after a `lean-rs` ABI change.
+- `install-worker --prune` removes only *unservable* workers: those outside the supported window. Other stale workers
+  are kept, since another release may still serve them; rebuild those with `--auto`. `--list` and `--prune` skip a
+  directory with no `current-generation`.
 
 At runtime, package-version skew is silent when the protocol matches. A recorded protocol mismatch is a non-retryable
 `runtime_unavailable` response whose recovery command is `SERVER install --lake-root PROJECT`, where `SERVER` is the
-running executable. A missing worker, header drift and smoke failure are also hard refusals. Each is one line that names
-the worker directory and ends with the same command:
+running executable. A missing worker, a record that does not load, header drift, a generation with no passing smoke test
+and a generation that differs from its record are also hard refusals. Each is one line that names the worker directory
+and ends with the same command:
 
 ```text
-no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/workers; run: /work/project/.local/lean-host-mcp/bin/lean-host-mcp install --lake-root /work/project
+no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/workers (an install by an older lean-host-mcp must be redone); run: /work/project/.local/lean-host-mcp/bin/lean-host-mcp install --lake-root /work/project
 ```
 
 ### Upgrading to 0.18
@@ -711,7 +716,7 @@ uv run scripts/memory_stability.py \
   --project-root /path/to/lake/project \
   --workload scripts/memory_stability.kanproofs.json \
   --server-bin target/release/lean-host-mcp \
-  --workers-dir target/release \
+  --workers-dir /path/to/installed/workers \
   --repeats 15
 ```
 

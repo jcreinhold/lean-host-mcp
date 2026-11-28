@@ -56,7 +56,7 @@ impl VerifierShims {
         let (worker, sysroot, _) = crate::project::resolve_worker(meta)?;
         let generation = worker.parent().ok_or_else(|| invalid("missing worker generation"))?;
         let installed = crate::toolchain::WorkerSidecar::load(generation)
-            .and_then(crate::toolchain::WorkerSidecar::into_deployment)
+            .map(crate::toolchain::WorkerSidecar::into_deployment)
             .ok_or_else(|| invalid("missing installed shim deployment"))?;
         if installed.sysroot != sysroot {
             return Err(invalid("incomplete prepared import selection"));

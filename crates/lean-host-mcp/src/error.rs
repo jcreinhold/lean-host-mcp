@@ -39,8 +39,8 @@ pub struct WorkerUnavailable {
     pub(crate) restarts_in_window: Option<u64>,
     pub(crate) window_millis: Option<u64>,
     pub(crate) runtime: RuntimeFacts,
-    /// Project-lifetime toolchain advisories (unknown pin, missing provenance
-    /// sidecar, no smoke record) captured at open. Carried here so a worker
+    /// Project-lifetime toolchain advisories (an unknown pin) captured at
+    /// open. Carried here so a worker
     /// that dies mid-call still surfaces them on the `runtime_unavailable`
     /// envelope — the moment a suspect worker is most worth flagging. Internal;
     /// drained into the envelope's top-level `warnings`, never the error wire

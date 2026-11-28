@@ -9,9 +9,9 @@
 //!
 //! - `--toolchain <id>`: build for one toolchain (always overwrites).
 //! - no flag / `--auto`: scan `<elan home>/toolchains/leanprover--lean4---*`
-//!   and build for any that are missing or stale (protocol mismatch, header
-//!   drift, failed/absent smoke, built by another release); `--force`
-//!   rebuilds current ones too. The elan home is [`toolchain::elan_home`],
+//!   and build for any that are missing or stale (a record that does not
+//!   load, header drift, protocol mismatch, built by another release);
+//!   `--force` rebuilds current ones too. The elan home is [`toolchain::elan_home`],
 //!   which with `--lake-root` includes the root's recorded
 //!   `[install] elan_home`.
 //!
@@ -20,8 +20,8 @@
 //! - `--list`: print a table of currently-installed workers, including a
 //!   `protocol` column that reports wire compatibility.
 //! - `--clean [--toolchain <id>]`: remove all installed workers, or just one.
-//! - `--prune`: remove only unservable workers (outside the supported window,
-//!   or with a failed smoke test), keeping servable-but-stale ones.
+//! - `--prune`: remove only workers outside the supported window, which can
+//!   never load, keeping the others.
 //!
 //! With `--lake-root`, every action but `--list` holds the root's store, as
 //! `install` does, so it refuses while a server serves the root and its
@@ -77,9 +77,10 @@ pub struct InstallWorkerArgs {
     pub toolchain: Option<String>,
 
     /// Scan the elan home's `toolchains` and install a worker for every supported
-    /// Lean toolchain that is missing or stale (host-version skew, header
-    /// drift, or a failed/absent smoke record). This is the default when no
-    /// action flag is supplied. Use `--force` to rebuild current ones too.
+    /// Lean toolchain that is missing or stale (a record that does not load,
+    /// header drift, protocol mismatch, or a build by another release). This
+    /// is the default when no action flag is supplied. Use `--force` to
+    /// rebuild current ones too.
     #[arg(long)]
     pub auto: bool,
 
@@ -93,9 +94,8 @@ pub struct InstallWorkerArgs {
     #[arg(long)]
     pub clean: bool,
 
-    /// Remove only *unservable* workers — those outside the supported window
-    /// or with a failed runtime smoke test. Servable-but-stale workers (header
-    /// drift, host skew) are kept; rebuild them with `--auto`.
+    /// Remove only workers outside the supported window, which can never
+    /// load. Other stale workers are kept; rebuild them with `--auto`.
     #[arg(long)]
     pub prune: bool,
 
@@ -234,7 +234,9 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
         let Some(id) = id_path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        let selected = WorkerBinary::selected_dir(&id_path)?;
+        let Some(selected) = WorkerBinary::selected_dir(&id_path)? else {
+            continue;
+        };
         let bin = selected.join(WORKER_FILE_NAME);
         if !bin.is_file() {
             continue;
@@ -262,7 +264,7 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
         let header = sidecar
             .as_ref()
             .map_or("unknown", |s| s.header_status(current.as_deref()));
-        let smoke = sidecar.as_ref().map_or("untested", WorkerSidecar::smoke_status);
+        let smoke = sidecar.as_ref().map_or("unknown", WorkerSidecar::smoke_status);
         let protocol = sidecar.as_ref().map_or("unknown", WorkerSidecar::protocol_status);
         rows.push(ListRow {
             id: id.to_owned(),
@@ -384,14 +386,16 @@ pub(super) enum Freshness {
 
 /// Freshness of the worker for `id` in the worker directory `root`.
 pub(super) fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
-    let Ok(dir) = WorkerBinary::selected_dir(&root.join(id.as_str())) else {
-        return Freshness::Stale("invalid generation selector");
+    let dir = match WorkerBinary::selected_dir(&root.join(id.as_str())) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return Freshness::Absent,
+        Err(_) => return Freshness::Stale("invalid generation selector"),
     };
     if !dir.join(WORKER_FILE_NAME).is_file() {
         return Freshness::Absent;
     }
     let Some(sidecar) = WorkerSidecar::load(&dir) else {
-        return Freshness::Stale("no provenance record");
+        return Freshness::Stale("unreadable worker.json");
     };
     // Header drift trumps everything: the toolchain's lean.h changed under it.
     if let Ok(elan) = id.elan_dir()
@@ -400,15 +404,10 @@ pub(super) fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
     {
         return Freshness::Stale("header drift");
     }
-    match sidecar.smoke() {
-        Some(s) if s.failure_detail().is_some() => return Freshness::Stale("failed smoke test"),
-        None => return Freshness::Stale("no smoke record"),
-        Some(_) => {}
+    if sidecar.smoke().is_none() {
+        return Freshness::Stale("no smoke record");
     }
-    if sidecar
-        .protocol_version()
-        .is_some_and(|version| version != lean_rs_worker_protocol::protocol::PROTOCOL_VERSION)
-    {
+    if sidecar.protocol_version() != lean_rs_worker_protocol::protocol::PROTOCOL_VERSION {
         return Freshness::Stale("protocol mismatch");
     }
     if !sidecar.built_by_this_host() {
@@ -427,7 +426,7 @@ fn clean_in(root: &Path, target: Option<&ToolchainId>) -> anyhow::Result<()> {
     if let Some(id) = target {
         let dir = root.join(id.as_str());
         if dir.is_dir() {
-            retire_slot(&dir, &WorkerBinary::selected_dir(&dir)?)?;
+            retire_slot(&dir, WorkerBinary::selected_dir(&dir)?.as_deref())?;
             println!("removed worker for {id}");
         } else {
             println!("no worker installed for {id}");
@@ -442,7 +441,7 @@ fn clean_in(root: &Path, target: Option<&ToolchainId>) -> anyhow::Result<()> {
             continue;
         }
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
-        retire_slot(&path, &WorkerBinary::selected_dir(&path)?)?;
+        retire_slot(&path, WorkerBinary::selected_dir(&path)?.as_deref())?;
         println!("removed worker for {name}");
         removed = removed.saturating_add(1);
     }
@@ -493,19 +492,19 @@ fn verify_named_handle(path: &Path, file: &fs::File, directory: bool) -> anyhow:
 }
 
 /// Remove the worker slot `slot`, under its slot lock, while its selected
-/// generation is still `expected`.
-fn retire_slot(slot: &Path, expected: &Path) -> anyhow::Result<()> {
+/// generation is still `expected` (`None` for a slot with no selector).
+fn retire_slot(slot: &Path, expected: Option<&Path>) -> anyhow::Result<()> {
     let _mutation = lock_slot(slot)?;
     anyhow::ensure!(
-        WorkerBinary::selected_dir(slot)? == expected,
+        WorkerBinary::selected_dir(slot)?.as_deref() == expected,
         "selected generation changed before retirement"
     );
     fs::remove_dir_all(slot)?;
     Ok(())
 }
 
-/// `--prune`: remove only *unservable* worker install dirs under `root`,
-/// leaving servable ones (even if stale) in place. Idempotent.
+/// `--prune`: remove only the worker install dirs under `root` that can never
+/// load, leaving the others (even if stale) in place. Idempotent.
 fn prune_in(root: &Path) -> anyhow::Result<()> {
     if !root.is_dir() {
         println!("(no workers installed under {})", root.display());
@@ -522,13 +521,15 @@ fn prune_in(root: &Path) -> anyhow::Result<()> {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Only consider real worker installs (a binary present); skip strays.
-        let selected = WorkerBinary::selected_dir(&path)?;
+        // Only consider real worker installs (a selected binary); skip strays.
+        let Some(selected) = WorkerBinary::selected_dir(&path)? else {
+            continue;
+        };
         if !selected.join(WORKER_FILE_NAME).is_file() {
             continue;
         }
-        if let Some(reason) = prune_reason(name, &selected) {
-            retire_slot(&path, &selected)?;
+        if let Some(reason) = prune_reason(name) {
+            retire_slot(&path, Some(&selected))?;
             println!("pruned {name}: {reason}");
             removed = removed.saturating_add(1);
         } else {
@@ -539,23 +540,14 @@ fn prune_in(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Why an installed worker is unservable, or `None` if it can be served. Only
-/// the two definitively-dead classes: a toolchain outside the supported window
-/// (can never load), and a recorded smoke-test failure (loads but crashes).
-/// Servable-but-stale workers (header drift, host skew) are deliberately kept —
-/// `--auto` rebuilds those; pruning them would delete a possibly-working binary.
-fn prune_reason(name: &str, install_dir: &Path) -> Option<&'static str> {
-    if let Ok(id) = ToolchainId::parse(name)
-        && matches!(id.window_verdict(), WindowVerdict::OutOfWindow { .. })
-    {
-        return Some("outside the supported window");
-    }
-    if let Some(sidecar) = WorkerSidecar::load(install_dir)
-        && sidecar.smoke().is_some_and(|s| s.failure_detail().is_some())
-    {
-        return Some("failed runtime smoke test");
-    }
-    None
+/// Why the worker in slot `name` can never load, or `None`. Only one class
+/// qualifies: a toolchain outside the supported window. Stale workers (header
+/// drift, host skew, a record this release cannot read) are kept — `--auto`
+/// rebuilds those, and another release may still serve them.
+fn prune_reason(name: &str) -> Option<&'static str> {
+    ToolchainId::parse(name)
+        .is_ok_and(|id| matches!(id.window_verdict(), WindowVerdict::OutOfWindow { .. }))
+        .then_some("outside the supported window")
 }
 
 /// Build, qualify and select a worker for `id` in the worker directory `root`.
@@ -912,23 +904,32 @@ mod tests {
     };
     use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WorkerSidecar};
 
-    /// Create a fake worker install dir `<root>/<id>/` with a binary stub and a
-    /// sidecar recorded against `digest`, for the clean/prune tests.
-    fn fake_worker(root: &std::path::Path, id: &str, digest: &str) {
-        let dir = root.join(id);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("binary stub");
+    /// Install a stub generation for `id` under `root`, recorded against the
+    /// `lean.h` digest `digest`, for the clean/prune tests. Returns the
+    /// generation.
+    fn fake_worker(root: &std::path::Path, id: &str, digest: &str) -> std::path::PathBuf {
         let tid = ToolchainId::parse(id).expect("parse id");
-        WorkerSidecar::record(&dir, &tid, digest.to_owned(), crate::smoke::SmokeOutcome::Passed).expect("sidecar");
+        WorkerSidecar::install_stub(root, &tid, digest, root)
+            .expect("stub generation")
+            .0
+    }
+
+    /// Set `key` to `value` in the record in `generation`.
+    fn edit_record(generation: &std::path::Path, key: &str, value: serde_json::Value) {
+        let path = generation.join("worker.json");
+        let mut record: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&path).expect("read record")).expect("record JSON");
+        record.insert(key.to_owned(), value);
+        std::fs::write(&path, serde_json::to_vec(&record).expect("encode record")).expect("write record");
     }
 
     #[test]
     fn failed_upgrade_preserves_installed_worker_and_sidecar() -> anyhow::Result<()> {
         let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let id = ToolchainId::parse("v4.36.0")?;
-        fake_worker(root.path(), id.as_str(), "old");
+        let installed = fake_worker(root.path(), id.as_str(), "old");
         let slot = root.path().join(id.as_str());
-        let sidecar = std::fs::read(slot.join("worker.json"))?;
+        let sidecar = std::fs::read(installed.join("worker.json"))?;
         for fail_build in [true, false] {
             let failed = super::prepare_generation(&slot, &id, root.path(), |dir| {
                 anyhow::ensure!(!fail_build, "build failed");
@@ -936,9 +937,12 @@ mod tests {
                 Ok(())
             });
             assert!(failed.is_err());
-            assert_eq!(crate::toolchain::WorkerBinary::selected_dir(&slot)?, slot);
-            assert_eq!(std::fs::read(slot.join(WORKER_FILE_NAME))?, b"#!/bin/sh\n");
-            assert_eq!(std::fs::read(slot.join("worker.json"))?, sidecar);
+            assert_eq!(
+                crate::toolchain::WorkerBinary::selected_dir(&slot)?,
+                Some(installed.clone())
+            );
+            assert_eq!(std::fs::read(installed.join(WORKER_FILE_NAME))?, b"#!/bin/sh\n");
+            assert_eq!(std::fs::read(installed.join("worker.json"))?, sidecar);
         }
         Ok(())
     }
@@ -972,7 +976,7 @@ mod tests {
     fn candidate_worker_replaced_after_probe_is_not_published() -> anyhow::Result<()> {
         let id = ToolchainId::parse("v4.36.0")?;
         let deployment = WorkerSidecar::test_deployment("before", std::path::Path::new("/lean"));
-        let mut record = WorkerSidecar::new(&id, "header".into(), Some(deployment));
+        let mut record = WorkerSidecar::new(&id, "header".into(), deployment);
         let error = record
             .complete("after", crate::smoke::SmokeOutcome::Passed)
             .expect_err("replacement refused");
@@ -1034,7 +1038,7 @@ mod tests {
             std::fs::write(dir.join(WORKER_FILE_NAME), b"worker")?;
             super::select_generation(&slot, &dir)?;
         }
-        assert!(super::retire_slot(&slot, &slot.join("generation-old")).is_err());
+        assert!(super::retire_slot(&slot, Some(&slot.join("generation-old"))).is_err());
         assert!(slot.join("generation-old").join(WORKER_FILE_NAME).is_file());
         super::prune_in(&root)?;
         assert!(!slot.exists());
@@ -1227,20 +1231,14 @@ mod tests {
 
     #[test]
     fn prune_targets_only_definitively_unservable_workers() {
-        // Out-of-window: prunable regardless of any sidecar.
-        let tmp = std::env::temp_dir().join("lhm-prune-no-such-dir");
         assert_eq!(
-            prune_reason("v4.23.0", &tmp),
+            prune_reason("v4.23.0"),
             Some("outside the supported window"),
             "a toolchain below the supported window is unservable"
         );
-        // Unparseable directory name: not a recognized toolchain, no sidecar —
-        // keep it, never prune unknown content.
-        assert_eq!(
-            prune_reason("not-a-toolchain", &tmp),
-            None,
-            "unrecognized / servable workers are kept"
-        );
+        // Unparseable directory name: not a recognized toolchain — keep it,
+        // never prune unknown content.
+        assert_eq!(prune_reason("not-a-toolchain"), None, "unrecognized workers are kept");
     }
 
     #[test]
@@ -1271,32 +1269,20 @@ mod tests {
     }
 
     #[test]
-    fn prune_removes_unservable_keeps_servable() {
+    fn prune_removes_only_workers_outside_the_window() {
         let root = tempfile::tempdir().expect("tmp root");
         // Out-of-window → pruned (never loadable).
         fake_worker(root.path(), "v4.23.0", "d");
-        // Supported + passing smoke → kept.
+        // Supported → kept, even when this release cannot read its record.
+        // Must be in-window ids, or the window alone would prune them.
         fake_worker(root.path(), "v4.30.0", "d");
-        // Supported but smoke FAILED → pruned (loads but crashes). Must be an
-        // in-window toolchain — an out-of-window id would be pruned regardless,
-        // which would let a smoke-failure regression pass silently.
-        let failed_dir = root.path().join("v4.31.0");
-        std::fs::create_dir_all(&failed_dir).expect("mkdir");
-        std::fs::write(failed_dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
-        WorkerSidecar::record(
-            &failed_dir,
-            &ToolchainId::parse("v4.31.0").expect("parse"),
-            "d".to_owned(),
-            crate::smoke::SmokeOutcome::Failed {
-                detail: "signal: 11 (SIGSEGV)".to_owned(),
-            },
-        )
-        .expect("sidecar");
+        let unreadable = fake_worker(root.path(), "v4.31.0", "d");
+        std::fs::write(unreadable.join("worker.json"), "{}").expect("record");
 
         prune_in(root.path()).expect("prune");
         assert!(!root.path().join("v4.23.0").exists(), "out-of-window pruned");
-        assert!(!root.path().join("v4.31.0").exists(), "smoke-failed pruned");
         assert!(root.path().join("v4.30.0").exists(), "servable worker kept");
+        assert!(root.path().join("v4.31.0").exists(), "unreadable record kept");
     }
 
     #[test]
@@ -1308,10 +1294,10 @@ mod tests {
 
     #[test]
     fn freshness_current_when_built_by_this_host() {
-        // `fake_worker` records via `WorkerSidecar::record`, which stamps this
-        // host's version and a passing smoke. Use an id with no elan dir on this
-        // machine so the header-drift check (which hashes the toolchain's real
-        // lean.h) is skipped and the test isolates the host-version path.
+        // `fake_worker` writes a record with this host's version and a passing
+        // smoke. Use an id with no elan dir on this machine so the header-drift
+        // check (which hashes the toolchain's real lean.h) is skipped and the
+        // test isolates the host-version path.
         let root = tempfile::tempdir().expect("tmp root");
         fake_worker(root.path(), "v4.99.99", "digest");
         let id = ToolchainId::parse("v4.99.99").expect("parse");
@@ -1319,23 +1305,33 @@ mod tests {
     }
 
     #[test]
-    fn freshness_stale_without_sidecar() {
+    fn freshness_stale_without_a_readable_record() {
         let root = tempfile::tempdir().expect("tmp root");
-        let dir = root.path().join("v4.30.0");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
+        let generation = fake_worker(root.path(), "v4.30.0", "d");
+        std::fs::remove_file(generation.join("worker.json")).expect("remove record");
         let id = ToolchainId::parse("v4.30.0").expect("parse");
-        assert!(matches!(worker_freshness_in(root.path(), &id), Freshness::Stale(_)));
+        assert!(matches!(
+            worker_freshness_in(root.path(), &id),
+            Freshness::Stale("unreadable worker.json")
+        ));
+    }
+
+    #[test]
+    fn freshness_absent_for_a_slot_without_a_selector() {
+        // An older release put the worker in the slot itself.
+        let root = tempfile::tempdir().expect("tmp root");
+        let slot = root.path().join("v4.30.0");
+        std::fs::create_dir_all(&slot).expect("mkdir");
+        std::fs::write(slot.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
+        let id = ToolchainId::parse("v4.30.0").expect("parse");
+        assert!(matches!(worker_freshness_in(root.path(), &id), Freshness::Absent));
     }
 
     #[test]
     fn freshness_stale_on_protocol_mismatch() {
         let root = tempfile::tempdir().expect("tmp root");
-        let dir = root.path().join("v4.99.99");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
-        let skewed = r#"{"toolchain":"v4.99.99","header_digest":"d","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","worker_protocol_version":999,"digest_supported_at_build":true,"smoke":{"result":"passed"}}"#;
-        std::fs::write(dir.join("worker.json"), skewed).expect("sidecar");
+        let generation = fake_worker(root.path(), "v4.99.99", "d");
+        edit_record(&generation, "worker_protocol_version", 999.into());
         let id = ToolchainId::parse("v4.99.99").expect("parse");
         assert!(matches!(
             worker_freshness_in(root.path(), &id),
@@ -1348,14 +1344,8 @@ mod tests {
         // A release can keep the protocol version, as the move from lean-rs
         // 0.10 to 0.11 did, so a matching protocol is not enough.
         let root = tempfile::tempdir().expect("tmp root");
-        let dir = root.path().join("v4.99.99");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
-        let other = format!(
-            r#"{{"toolchain":"v4.99.99","header_digest":"d","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","worker_protocol_version":{},"digest_supported_at_build":true,"smoke":{{"result":"passed"}}}}"#,
-            lean_rs_worker_protocol::protocol::PROTOCOL_VERSION
-        );
-        std::fs::write(dir.join("worker.json"), other).expect("sidecar");
+        let generation = fake_worker(root.path(), "v4.99.99", "d");
+        edit_record(&generation, "built_by_host_version", "0.0.1-old".into());
         let id = ToolchainId::parse("v4.99.99").expect("parse");
         assert!(matches!(
             worker_freshness_in(root.path(), &id),
