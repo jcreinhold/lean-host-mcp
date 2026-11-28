@@ -92,6 +92,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
     file outside every library has no module.
   - Proof search from a file takes the goal's module from the setup Lake gives the file, so it works for a file under a
     library's own `srcDir` or outside every library; before, it failed with "cannot select semantic source module".
+- Project-scope references no longer compare each contributing source's mtime with its `.ilean`. Their `ilean` /
+  `project` trust row now reads `unknown` and says the references come from the last build; the `build_fresh` and
+  `stale_build` rows, and the stale warning and its hint, are gone. Lake's own check, `lake build --no-build` on the
+  modules with hits, walks each module's import closure: about 1 s for one Proofs module and 3 s for Mathlib, as much as
+  the lookup or more.
 
 ## [0.18.0] - 2026-11-27
 

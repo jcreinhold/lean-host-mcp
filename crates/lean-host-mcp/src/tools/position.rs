@@ -1210,8 +1210,9 @@ async fn find_references_in_file(
 /// Project scope: read the on-disk `.ilean` reference index for the whole
 /// project (build-fresh) in milliseconds, with no worker query, and ask Lake
 /// for the source file of each module that recorded a hit. Returns the
-/// complete answer up to `limit`; an unbuilt project degrades to `needs_build`
-/// and an index stale relative to current source rides a freshness note.
+/// complete answer up to `limit`; an unbuilt project degrades to `needs_build`.
+/// The answer is the last build's: the reply says so and does not compare the
+/// indexes with current sources.
 ///
 /// The scan is file I/O and JSON parsing from first byte to last — hundreds of
 /// milliseconds on a large project even after the reader stopped materializing
@@ -1248,7 +1249,7 @@ async fn find_references_in_project(
     // no hits, Lake does not run.
     let modules: Vec<&str> = index.modules.iter().map(|hits| hits.module.as_str()).collect();
     let sources = ctx.broker.module_sources(root, &modules).await?;
-    // The reply reads the times of each source and index, so it too runs on a
+    // The reply resolves each requested file on disk, so it too runs on a
     // blocking thread.
     let (root, req) = (root.to_path_buf(), req.clone());
     tokio::task::spawn_blocking(move || project_references(&root, &req, &index, sources, freshness, runtime, limit))
@@ -1296,7 +1297,6 @@ fn project_references(
     });
 
     let mut hits: Vec<ReferenceHit> = Vec::new();
-    let mut stale: Vec<String> = Vec::new();
     let mut sourceless: Vec<&str> = Vec::new();
     for (module, source) in index.modules.iter().zip(sources) {
         let Ok(source) = source else {
@@ -1308,9 +1308,6 @@ fn project_references(
         }
         let display = display_path(root, &source);
         hits.extend(module.references.iter().map(|loc| index_reference(&display, loc)));
-        if crate::ilean::source_newer_than_index(&source, &module.index) {
-            stale.push(display);
-        }
     }
 
     // Sort then cap so the `limit` truncation is deterministic — a stable
@@ -1334,24 +1331,9 @@ fn project_references(
         missing_imports_files: Vec::new(),
         semantic_based: true,
     };
-    let mut response = Response::ok(result, freshness).with_runtime(runtime);
-    if stale.is_empty() {
-        response = response.with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_build_fresh());
-    } else {
-        stale.sort();
-        let names = first_few(&stale);
-        response = response
-            .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_stale_build(format!(
-                "{} contributing module(s) have source newer than their .ilean ({names})",
-                stale.len()
-            )))
-            .warn(format!(
-                "reference index is build-fresh, not edit-fresh: {} contributing module(s) have source newer than \
-                 their .ilean ({names}); results come from the last build.",
-                stale.len()
-            ))
-            .hint("run lean_build() to refresh the reference index for edited modules");
-    }
+    let mut response = Response::ok(result, freshness)
+        .with_runtime(runtime)
+        .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_last_build());
     if !sourceless.is_empty() {
         sourceless.sort_unstable();
         response = response.warn(format!(
@@ -2052,9 +2034,9 @@ mod tests {
     }
 
     /// A project whose last build indexed each `(module, source, fixture)`:
-    /// the source file comes first, and the module's `.ilean` comes later
-    /// under the build tree. Returns the directory and its canonical path,
-    /// which is how Lake names files.
+    /// the source file, and the module's `.ilean` under the build tree.
+    /// Returns the directory and its canonical path, which is how Lake names
+    /// files.
     fn built_project(modules: &[(&str, &str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -2063,7 +2045,6 @@ mod tests {
             std::fs::create_dir_all(source.parent().unwrap()).unwrap();
             std::fs::write(&source, "-- source stub\n").unwrap();
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
         for (module, _, fixture) in modules {
             let relative: std::path::PathBuf = module.split('.').collect();
             let index = root.join(".lake/build/lib/lean").join(relative).with_extension("ilean");
@@ -2254,44 +2235,38 @@ import Init -- comment
         ));
     }
 
+    /// The reply says its references come from the last build and does not
+    /// compare the indexes with the sources: a source edited after the build
+    /// changes nothing.
     #[test]
-    fn project_references_report_build_fresh_ilean_fact_when_current() {
+    fn project_references_say_they_come_from_the_last_build() {
         let (_tmp, root) = built_project(&[("Demo.A", "Demo/A.lean", "demo_a.ilean")]);
-
-        let response = project_reply(&root, &references_request(), &[("Demo.A", "Demo/A.lean")]);
-
-        assert_eq!(reference_rows(&response), [("Demo/A.lean".to_owned(), 4, 5, "def")]);
-        assert!(has_artifact(
-            &response,
-            ArtifactKind::Ilean,
-            TrustScope::Project,
-            TrustStatus::BuildFresh
-        ));
-        assert!(response.warnings.is_empty(), "{:?}", response.warnings);
-    }
-
-    #[test]
-    fn project_references_report_stale_ilean_fact_when_source_is_newer() {
-        let (_tmp, root) = built_project(&[("Demo.A", "Demo/A.lean", "demo_a.ilean")]);
+        let before = project_reply(&root, &references_request(), &[("Demo.A", "Demo/A.lean")]);
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(root.join("Demo/A.lean"), "-- edited after build\n").unwrap();
+        let after = project_reply(&root, &references_request(), &[("Demo.A", "Demo/A.lean")]);
 
-        let response = project_reply(&root, &references_request(), &[("Demo.A", "Demo/A.lean")]);
-
-        assert!(has_artifact(
-            &response,
-            ArtifactKind::Ilean,
-            TrustScope::Project,
-            TrustStatus::StaleBuild
-        ));
-        assert!(
-            response
-                .warnings
+        for response in [&before, &after] {
+            assert_eq!(reference_rows(response), [("Demo/A.lean".to_owned(), 4, 5, "def")]);
+            let facts: Vec<_> = response
+                .trust_artifacts
                 .iter()
-                .any(|warning| warning.contains("(Demo/A.lean)")),
-            "{:?}",
-            response.warnings
-        );
+                .map(|fact| (fact.artifact, fact.scope, fact.status, fact.detail.as_deref()))
+                .collect();
+            assert_eq!(
+                facts,
+                [(
+                    ArtifactKind::Ilean,
+                    TrustScope::Project,
+                    TrustStatus::Unknown,
+                    Some(
+                        "references come from the .ilean indexes of the last build; the server does not compare \
+                         them with current sources"
+                    )
+                )]
+            );
+            assert!(response.warnings.is_empty(), "{:?}", response.warnings);
+        }
     }
 
     /// The file a hit names is the one Lake reads for its module, here under
@@ -2303,12 +2278,6 @@ import Init -- comment
         let response = project_reply(&root, &references_request(), &[("Demo.A", "src/Demo/A.lean")]);
 
         assert_eq!(reference_rows(&response), [("src/Demo/A.lean".to_owned(), 4, 5, "def")]);
-        assert!(has_artifact(
-            &response,
-            ArtifactKind::Ilean,
-            TrustScope::Project,
-            TrustStatus::BuildFresh
-        ));
     }
 
     /// An index whose module Lake no longer knows, as one left by a deleted

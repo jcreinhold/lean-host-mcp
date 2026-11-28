@@ -95,8 +95,6 @@ pub(crate) struct ReferenceIndex {
 pub(crate) struct ModuleHits {
     /// The module, as its index names it.
     pub module: String,
-    /// The `.ilean` file that recorded the hits.
-    pub index: PathBuf,
     pub references: Vec<ReferenceLocation>,
 }
 
@@ -191,7 +189,6 @@ pub(crate) fn references_to(project_root: &Path, name: &str) -> ReferenceIndex {
         }
         found.modules.push(ModuleHits {
             module: module.module,
-            index: index_path.to_path_buf(),
             references: module
                 .hits
                 .iter()
@@ -919,23 +916,6 @@ mod tests {
         assert_eq!(b_refs, vec![(5, 2, 5, 5), (6, 8, 6, 11)]);
 
         assert_eq!(every_hit(&index).count(), 3);
-
-        // Each group names the index that recorded it, which is where a
-        // freshness check looks.
-        let build = project.path().join(BUILD_LIB_REL);
-        let mut groups: Vec<_> = index
-            .modules
-            .iter()
-            .map(|hits| (hits.module.as_str(), hits.index.clone()))
-            .collect();
-        groups.sort();
-        assert_eq!(
-            groups,
-            vec![
-                ("Demo.A", build.join("Demo/A.ilean")),
-                ("Demo.B", build.join("Demo/B.ilean"))
-            ]
-        );
     }
 
     #[test]

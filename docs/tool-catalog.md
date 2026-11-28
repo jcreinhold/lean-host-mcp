@@ -336,8 +336,8 @@ The five semantic tools return this response baseline:
       {
         "artifact": "ilean",
         "scope": "project",
-        "status": "build_fresh",
-        "detail": "project reference index is current for contributing modules"
+        "status": "unknown",
+        "detail": "references come from the .ilean indexes of the last build; the server does not compare them with current sources"
       }
     ]
   }
@@ -357,10 +357,11 @@ when a worker did.
 Rows may also carry `path`, `module`, `detail`, `next_action`, and a source `content_sha256`. Paths are rendered
 project-relative when the file is inside the resolved Lake root, and absolute only for files outside that root.
 Source-overlay tools and source-backed declaration inventory report the source file snapshot as `source` / `file` /
-`edit_fresh`; project reference lookup and index-backed declaration inventory report `.ilean` build freshness or
-missing/stale build state; `needs_build` degradations report missing `.olean` artifacts, or a `stale_build` row for each
-module Lake lists as out of date when it sets up a file. Duplicate trust rows are collapsed while preserving first
-occurrence order. Runtime counters, cache timings, and import lists remain telemetry, not trust.
+`edit_fresh`; project reference lookup reports that its `.ilean` indexes come from the last build, with status
+`unknown`, or `missing_build`; index-backed declaration inventory reports `.ilean` build freshness or missing/stale
+build state; `needs_build` degradations report missing `.olean` artifacts, or a `stale_build` row for each module Lake
+lists as out of date when it sets up a file. Duplicate trust rows are collapsed while preserving first occurrence order.
+Runtime counters, cache timings, and import lists remain telemetry, not trust.
 
 A `needs_build` reply tells an import that names no module from one that is not built. When Lake fails to set up a file,
 or Lean cannot load a module's `.olean`, the server asks `lake query +MODULE:lean` about each module the failure names,
@@ -904,9 +905,10 @@ worker session id plus a `source` / `file` / `edit_fresh` trust fact:
 
 Project scope reads the on-disk `.ilean` reference index without opening a worker (see
 [reader architecture](architecture.md#reference-indices)), then one `lake query +MODULE:lean` names the source file of
-each module with hits. `files` keeps the references in those files; every index is read either way. Results reflect the
-last build, with stale contributing sources reported in `trust` and warnings. A module Lake names no source for, as one
-a deleted file leaves, contributes no hits, and a warning names it:
+each module with hits. `files` keeps the references in those files; every index is read either way. Results come from
+the last build: the server does not compare the indexes with current sources, so the `ilean` / `project` row reads
+`unknown` and says so, and an edit since the build shows only after `lean_build`. A module Lake names no source for, as
+one a deleted file leaves, contributes no hits, and a warning names it:
 
 ```json
 {
@@ -947,7 +949,7 @@ Use `include` to request cheap status sections. The default is all sections:
 
 `lean_status` reads Lake metadata and cheap filesystem facts only: it does not run `lake`, does not read source files,
 and does not open a worker. When the project build tree is absent it reports `olean` and `ilean` `missing_build` facts;
-when the build tree exists but no semantic query has checked source mtimes it reports artifact freshness as `unknown`.
+when the build tree exists it reports artifact freshness as `unknown`, since it compares no source with its build.
 Worker runtime generation is likewise `not_applicable` because this status mode deliberately avoids opening a worker.
 The `worker` section's `compatibility` holds the receipts that resident workers kept from their last completed calls;
 see [native compatibility](#native-compatibility).

@@ -314,14 +314,18 @@ when the build directory is absent, or `Present` after a scan. Declaration queri
 tree, an absent/unreadable module index, and a parsed index. Callers translate these outcomes into public statuses,
 warnings, and artifact trust facts.
 
-`ReferenceIndex` groups hits by module, each group with its index path, and counts parsed and skipped modules. An
-unreadable, malformed, or unsupported individual index is skipped and counted. `ReferenceLocation` carries the
-definition/reference kind and 0-based LSP coordinates.
+`ReferenceIndex` groups hits by module and counts parsed and skipped modules. An unreadable, malformed, or unsupported
+individual index is skipped and counted. `ReferenceLocation` carries the definition/reference kind and 0-based LSP
+coordinates.
 
 The caller asks Lake for the source of every module with hits in one `lake query`, which runs only when there are hits.
-Staleness checks compare source/index mtimes only for those modules; missing metadata is treated as not stale. This is a
-limited build-freshness observation, not an exact source-content binding. A module Lake names no source for, as one a
-deleted or renamed file leaves, contributes no hits, and a warning names it.
+A module Lake names no source for, as one a deleted or renamed file leaves, contributes no hits, and a warning names it.
+
+The reply comes from the last build, and its `ilean` / `project` trust row says so with status `unknown`: the server
+does not compare the indexes with current sources. It once compared each contributing source's mtime with its index's.
+Lake's own answer, `lake build --no-build` on the modules with hits, walks the import closure of each one and costs as
+much as the lookup or more (see below), so the reply makes no check. The declaration inventory still compares one
+module's source and index mtimes before it adds the index's declarations to a source outline.
 
 A `files` restriction filters hits by the source Lake names; every index is still read. The recursive walk covers the
 project's build directory, excluding dependency indices under `.lake/packages/`.
@@ -344,6 +348,25 @@ that corpus. It retains no cache between calls.
 A request for one file once read only that file's index, in about 0.5 ms. That narrowing turned paths into module names
 by hand, which fails for a library with its own `srcDir`, so it is gone: such a request now reads every index, then runs
 one `lake query` for the sources, about 0.4 s on the test projects.
+
+A freshness check with `lake build --no-build +MODULE:ilean` costs Lake's workspace load plus a walk of each named
+module's import closure: Lake reads and hashes every source in it and compares each trace. Measured in November 2026:
+
+| Project and targets | Lake jobs | Time |
+| --- | --- | --- |
+| Test project, one module with no imports | 2 | 0.39–0.41 s |
+| Test project, closure of 501 modules | 1,002 | 0.38–0.41 s |
+| Test project, closure of 2,001 modules | 4,002 | 0.49–0.61 s |
+| Proofs, `lake build` of one up-to-date module | 1,990–2,460 | 0.98–1.04 s |
+| Proofs, `lake build` of one up-to-date module | 5,258 | 1.32 s |
+| Proofs, `lake build --no-build @mathlib/+Mathlib:olean` | 18,247 | 2.8–4.4 s, 7.5 s once |
+
+The test-project rows come from a one-off probe on 2,500 generated modules of about 12 KB each, with 12 cores; on the
+same project a whole references reply, with its `lake query`, took 0.49–0.58 s. The Proofs rows come from the build
+steps the Proofs server recorded. A `lake query` of 2,000 sources cost no more than one, 0.39 s, since it reads no
+closure. On Proofs a check would add about 1–4 s to each reply. By the same figures the reply without it, one scan and
+one `lake query`, takes an estimated 1.3 s there; no one has timed it. When a source changed, Lake named only the module
+whose own source changed, not the modules that import it, so one run cannot say which modules in a reply are affected.
 
 The scan remains serial and runs under `spawn_blocking` to keep file I/O and parsing off tokio workers. The reply sorts
 hits and the names in its warnings, so their order does not depend on the walk. Revisit parallelism if a real

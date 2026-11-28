@@ -151,15 +151,13 @@ impl ArtifactTrust {
             .detail("source snapshot was read from disk for this call")
     }
 
-    pub fn ilean_project_build_fresh() -> Self {
-        Self::new(ArtifactKind::Ilean, TrustScope::Project, TrustStatus::BuildFresh)
-            .detail("project reference index is current for contributing modules")
-    }
-
-    pub fn ilean_project_stale_build(detail: impl Into<String>) -> Self {
-        Self::new(ArtifactKind::Ilean, TrustScope::Project, TrustStatus::StaleBuild)
-            .detail(detail)
-            .next_action(build_action::<&str>(&[]))
+    /// The project's `.ilean` reference indexes, as the last build left them.
+    /// Whether that build is current would take a `lake build --no-build`
+    /// over the import closure of every module with hits, which costs more
+    /// than the lookup, so the server does not ask.
+    pub fn ilean_project_last_build() -> Self {
+        Self::new(ArtifactKind::Ilean, TrustScope::Project, TrustStatus::Unknown)
+            .detail("references come from the .ilean indexes of the last build; the server does not compare them with current sources")
     }
 
     pub fn ilean_project_missing_build() -> Self {
@@ -367,7 +365,7 @@ mod tests {
     fn trust_deduplication_preserves_first_occurrence_order() {
         let source =
             ArtifactTrust::source_file_edit_fresh(Path::new("/tmp/project"), Path::new("/tmp/project/A.lean"), [7; 32]);
-        let ilean = ArtifactTrust::ilean_project_build_fresh();
+        let ilean = ArtifactTrust::ilean_project_last_build();
         let deduped = dedupe_artifacts([source.clone(), ilean.clone(), source.clone()]);
         assert_eq!(deduped, vec![source, ilean]);
     }
@@ -376,7 +374,7 @@ mod tests {
     fn a_reply_names_a_source_digest_only_for_one_text() {
         let root = Path::new("/tmp/project");
         let first = ArtifactTrust::source_file_edit_fresh(root, Path::new("/tmp/project/A.lean"), [0xab; 32]);
-        let ilean = ArtifactTrust::ilean_project_build_fresh();
+        let ilean = ArtifactTrust::ilean_project_last_build();
         assert_eq!(
             checked_source_sha256(&[ilean.clone(), first.clone()]),
             Some("ab".repeat(32))
