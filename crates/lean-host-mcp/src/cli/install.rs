@@ -420,4 +420,31 @@ mod tests {
         assert!(!local.join("bin").exists(), "install stopped before it built anything");
         Ok(())
     }
+
+    /// Install takes the store as a server does, so while a server holds it,
+    /// install names that server and writes neither the server copy nor the
+    /// local file.
+    #[test]
+    fn install_refuses_while_a_server_serves_the_root() -> anyhow::Result<()> {
+        let fixture = fixture()?;
+        let args = args(&fixture, None);
+        let plan = Plan::resolve(&args, &config_file::process_env, toolchain::elan_home())?;
+        let _server = store::StoreLock::acquire(&plan.store_dir, &plan.root)?;
+
+        let refusal = run(&args).err().map(|error| error.to_string());
+
+        let expected = format!(
+            "another lean-host-mcp (pid {}, lake root {}) holds the store {}; stop it first",
+            std::process::id(),
+            plan.root.display(),
+            plan.store_dir.display()
+        );
+        assert_eq!(refusal, Some(expected));
+        assert!(!plan.binary().exists(), "install copied the server");
+        assert!(
+            !config_file::local_file(&plan.root).exists(),
+            "install wrote the local file"
+        );
+        Ok(())
+    }
 }
