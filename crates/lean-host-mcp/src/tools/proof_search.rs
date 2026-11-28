@@ -629,19 +629,9 @@ fn rank_results(
         if semantic.goal_rows == 0 {
             warnings.push("semantic proof search produced no proof-goal features".to_owned());
         }
+        // Retrieval decides which matches admit a candidate; a broad head alone
+        // admits none. Keep every candidate it returns.
         for candidate in semantic.candidates {
-            let mut admitted_evidence = Vec::new();
-            for evidence in candidate.evidence {
-                if semantic_evidence_admits_candidate(&evidence) {
-                    admitted_evidence.push(evidence);
-                } else {
-                    broad_pruning.push(evidence);
-                }
-            }
-            if admitted_evidence.is_empty() {
-                broad_pruning.push(format!("semantic:diagnostic_only:{}", candidate.name));
-                continue;
-            }
             let row = DeclarationSummary {
                 name: candidate.name,
                 kind: candidate.kind.as_str().to_owned(),
@@ -670,9 +660,7 @@ fn rank_results(
             });
             entry.score = entry.score.max(score);
             entry.reasons.insert("semantic".to_owned());
-            for evidence in admitted_evidence {
-                entry.reasons.insert(evidence);
-            }
+            entry.reasons.extend(candidate.evidence);
         }
     }
 
@@ -860,10 +848,6 @@ fn is_corroborated(reasons: &BTreeSet<String>) -> bool {
             || reason.starts_with("semantic:conclusion_fingerprint:")
             || reason.starts_with("semantic:role_conclusion_const:")
     })
-}
-
-fn semantic_evidence_admits_candidate(evidence: &str) -> bool {
-    !evidence.starts_with("semantic:role_head:")
 }
 
 fn candidate_score(
@@ -1758,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_head_only_semantic_evidence_is_diagnostic_only() {
+    fn head_only_semantic_candidates_stay_below_corroborated_ones() {
         let profile = profile_from_text(
             "⊢ x = y".to_owned(),
             None,
@@ -1768,16 +1752,21 @@ mod tests {
             Vec::new(),
             None,
         );
+        let candidate = |name: &str, score, evidence: &str| crate::semantic_search::SemanticProofCandidate {
+            name: name.to_owned(),
+            module: "Fixture".to_owned(),
+            kind: lean_semantic_search_contract::DeclarationKind::Theorem,
+            score,
+            evidence: vec![evidence.to_owned()],
+        };
+        // Retrieval admitted both; only the shared constant corroborates.
         let semantic = SemanticProofSearchResult {
-            candidates: vec![crate::semantic_search::SemanticProofCandidate {
-                name: "Eq.generic_noise".to_owned(),
-                module: "Fixture".to_owned(),
-                kind: lean_semantic_search_contract::DeclarationKind::Theorem,
-                score: 180,
-                evidence: vec!["semantic:role_head:1".to_owned()],
-            }],
+            candidates: vec![
+                candidate("Fixture.head_only", 180, "semantic:role_head:1"),
+                candidate("Fixture.shares_a_constant", 130, "semantic:role_conclusion_const:2"),
+            ],
             diagnostics: Vec::new(),
-            declaration_rows: 1,
+            declaration_rows: 2,
             goal_rows: 1,
         };
         let result = rank_results(
@@ -1790,15 +1779,20 @@ mod tests {
             Vec::new(),
             true,
         );
-        assert!(result.candidates.is_empty());
+        let names = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Fixture.shares_a_constant", "Fixture.head_only"]);
+        let head_only = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.name == "Fixture.head_only")
+            .expect("head-only candidate");
+        assert!(head_only.match_reason.contains("semantic:role_head:1"));
         let funnel = result.diagnostics.funnel.expect("full telemetry funnel");
-        assert!(funnel.broad_pruning.iter().any(|item| item == "semantic:role_head:1"));
-        assert!(
-            funnel
-                .broad_pruning
-                .iter()
-                .any(|item| item == "semantic:diagnostic_only:Eq.generic_noise")
-        );
+        assert!(funnel.broad_pruning.is_empty(), "{:?}", funnel.broad_pruning);
     }
 
     #[test]

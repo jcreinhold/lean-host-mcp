@@ -113,6 +113,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `search_for_proof` candidate that semantic search found carries the kind and module of its declaration, such as
   `definition` or `instance`; before, its kind always read `theorem`. Only a theorem gets a `suggested_snippet` and the
   ranking's theorem bonus, as with the other searches.
+- `search_for_proof` keeps every candidate that semantic search returns, and lists its head evidence,
+  `semantic:role_head:N`, in `match_reason`. Before, the server moved that evidence to the funnel's `broad_pruning` and
+  dropped a candidate that had no other, listing it there as `semantic:diagnostic_only:NAME`. lean-semantic-search still
+  drops a candidate that matched only a broad head such as `Eq`. One that matched only a specific head now appears,
+  below every candidate that a shared constant, a statement fingerprint, or a head or required-constants search
+  supports.
 - `[build] timeout_secs` also limits the semantic search runtime: install's build and a server's open each wait at most
   that long for the cache entry's lock, and then for Lake. Install reads the build tables before it changes anything, so
   a broken one stops it first, and a server's semantic search that must open the runtime fails with the problems they
