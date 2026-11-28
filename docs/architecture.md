@@ -133,6 +133,16 @@ checkout, and it stops the worker before each build. A child that exits before i
 30-second startup deadline it gives the SDK. The server refuses to start with `LEAN_PATH` set, since the worker would
 refuse it before connecting. The host copies no files, hashes no build outputs, and writes no import plan.
 
+A tool that reads a client's file picks the worker session by the file's imports. `read_query_file`
+(`tools/source_input.rs`) takes them from a scan of `import` lines in the bytes it hashes and sends, so the imports, the
+hash and the source come from one read. The scan skips `--` comments but not block comments. lean-rs 0.12's worker
+parses the header with Lean only inside a request to a session that is already open, and reports the imports that
+session lacks. To parse first, the server would need a session opened before the file's own: one more import profile in
+the worker, one more round trip on every call and, on a cold project, a worker start before the one the file needs. A
+short `lean` run could parse it too, at the cost of a process start on every call. A request that parses a header
+without a session would be new lean-rs API; until lean-rs has one, the scan stays. When the scan misses an import that
+Lean finds, the worker reports it missing and the reply asks for a build.
+
 Before it takes an opening turn or a worker slot, the broker asks the worker's readiness mode for the descriptor of the
 shims `install` built (`broker/host_artifacts.rs`), and the worker loads the shims that descriptor names. The mode reads
 and builds nothing. If the shims are missing or stale, the open fails with the install command; the server never builds
