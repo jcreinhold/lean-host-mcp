@@ -46,6 +46,19 @@ done
 A test that ranks proofs needs the search runtime in that cache first; `examples/prepare_semantic_smoke.rs` builds it.
 The empty-`HOME` test clears its children's environment, so it runs under `cargo test`.
 
+Seven ignored tests fail in that loop, since they read inputs it does not give; each one's ignore reason names them. The
+four in `tests/kanproofs_eval.rs` read the KanProofs checkout that `LEAN_HOST_MCP_KANPROOFS_EVAL` or
+`LEAN_HOST_MCP_KANPROOFS_UNBUILT_EVAL` names, and two of them take minutes and several GB. The three in
+`src/cli/installed_shims.rs` run in the library's test binary with these variables in place of the loop's:
+
+- `rejected_probe_retires_its_generation`: `R2_GENERATION`, a `generation-*` directory that `install-worker` put in a
+  new `--workers-dir`. The test adds and removes an `Init` directory inside it.
+- `isolated_installed_init`: the same `R2_GENERATION`, under `/usr/bin/sandbox-exec` with a profile that allows all but
+  reads of `crates/`, `~/.cargo/git/checkouts` and `~/.cargo/registry/src`. `R2_HOST_CANARY`, `R2_SDK_CANARY` and
+  `R2_CARGO_CANARY` each name a file in one of those trees, and the test checks that the sandbox refuses each.
+- `installed_init_candidate_and_refusals`: `R2_CANDIDATE`, a new empty directory, and `R2_WORKER`, the
+  `lean-host-mcp-worker` of an installed generation.
+
 For another toolchain, export `LEAN_SYSROOT=${ELAN_HOME:-$HOME/.elan}/toolchains/leanprover--lean4---<id>` for the whole
 build and test run, and `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` for the worker build, which sets its rpath. A header that
 does not match fails with `lean_rs.loader.unsupported_toolchain_fingerprint`. CI's environment setup does both.

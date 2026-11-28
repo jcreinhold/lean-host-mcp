@@ -231,10 +231,13 @@ the import roots (`ProjectBroker::import_roots`): it runs lean-toolchain's `lake
 turn and reads the answer with `read_lean_path`. The roots come in Lean's search order, dependencies first and the root
 package last, without Lake's own library directory, and the broker keeps them until the lakefile, the toolchain pin or
 the manifest changes. The worker gets them at launch and hands them to lean-rs through `project_import_roots`, so its
-child runs no Lake. It admits an import only when the request's roots are exactly the launch roots, in order, then the
-shim roots, and no root holds a package whose compiled code the worker runs, such as `Init`. No lock guards these roots:
-only the server that launched the worker builds the checkout, and it stops the worker first. The server copies no files
-and hashes no build outputs.
+child runs no Lake. Before a call reaches a live worker, the broker asks Lake again if one of those files changed since
+Lake last answered, and retires each worker launched with other roots, so the call starts a new one. While Lake cannot
+load the workspace, the call fails with Lake's error. The worker admits an import only when the request's roots are
+exactly the launch roots, in order, then the shim roots, and no root holds a package whose compiled code the worker
+runs, such as `Init`. lean-rs passes the worker exactly those roots, so no test can reach the refusal of other roots;
+that check guards against a change in lean-rs. No lock guards these roots: only the server that launched the worker
+builds the checkout, and it stops the worker first. The server copies no files and hashes no build outputs.
 
 **Session choice.** A tool that reads a client's file picks the worker session by the file's imports. `read_query_file`
 (`tools/source_input.rs`) takes them from a scan of the header in the same bytes it hashes and sends. The scan reads the
@@ -291,7 +294,8 @@ and background cycling all count as activity (`broker/control.rs`).
 | The parent binary never links `libleanshared`. | `scripts/check-parent-link.sh`, run by CI's "Check the parent link set" step |
 | A worker serves trials, proof positions, lookups and checks of modules without a source file from the project's own build, path dependencies included. | `tests/project_workers.rs`: `a_trial_imports_a_dependency_module_and_prints_its_axioms`, `a_proof_position_and_a_lookup_answer_from_the_project_build`, `a_module_without_a_source_file_is_checked_in_a_worker` |
 | The import roots are what `lake env` reports, the broker asks again after a lakefile edit, and Lake builds nothing. | `broker/module_setup.rs`: `import_roots_are_what_lake_env_reports` |
-| A worker admits an import only through its launch roots, in order, then the shim roots, while no root holds `Init`; the server refuses to start with `LEAN_PATH` set. | `tests/project_workers.rs`: `an_import_through_other_roots_is_refused`, `an_import_root_that_holds_init_is_refused`; `tests/http_transport.rs`: `an_inherited_lean_path_refuses_startup` |
+| A call reaches only a worker launched with the roots Lake gives now: a lakefile edit that reorders them replaces the worker, and the same lakefile written again keeps it. | `tests/project_workers.rs`: `a_lakefile_edit_that_reorders_the_roots_replaces_the_worker` |
+| A worker refuses an import while one of its roots holds `Init`, and the server refuses to start with `LEAN_PATH` set. | `tests/project_workers.rs`: `an_import_root_that_holds_init_is_refused`; `tests/http_transport.rs`: `an_inherited_lean_path_refuses_startup` |
 | The header scan finds the imports Lean's parser finds, from the bytes the server hashes. | `tools/source_input.rs`: `header_imports_handles_public_meta_and_all`, `header_imports_skips_a_copyright_block_before_module`, `header_imports_skips_a_comment_inside_a_line`, `header_imports_skips_nested_block_comments`, `header_imports_stops_at_the_first_token_after_the_header`; `tools/position.rs`: `read_query_file_imports_are_the_header_scan_of_its_source` |
 | The heap ceiling stays above every residue budget, and the pool size and the budget are set apart. | `project/runtime_config.rs`: `the_heap_ceiling_stays_above_every_residue_budget_the_resolver_can_produce`, `pool_capacity_and_the_residue_budget_are_independent_knobs`, `the_residue_budget_defaults_to_one_childs_share_of_this_machine` |
 | Repeated calls on held import profiles never recycle the worker; a project under its soft budget never cycles for residue, and an idle one over it cycles between calls. | `tests/smoke_perf.rs`: `repeated_calls_on_one_import_profile_never_recycle_the_worker`, `alternating_import_profiles_reuse_pooled_sessions_and_never_recycle`; `tests/e2e.rs`: `a_project_under_its_soft_budget_never_cycles_for_residue`, `an_idle_project_over_its_soft_budget_cycles_between_calls` |

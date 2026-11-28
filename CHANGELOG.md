@@ -168,9 +168,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `broker.max_lean_runs` permit, and hands them to each worker, which gives them to lean-rs through
   `project_import_roots`; the worker child runs no Lake. The roots come in Lake's order, dependencies first and the root
   package last, and the server asks again after a change to the lakefile, the toolchain pin or `lake-manifest.json`. The
-  first call after a start or such a change waits for that run, about 0.3 s on the test fixture. Before, the server
-  built the roots from the manifest's package list, the root package first, each under `.lake/build/lib/lean`, so a
-  package that moved its `buildDir` lost its modules. `lake_meta.rs` no longer parses the manifest.
+  server replaces a worker whose launch roots differ from the new answer before the next call reaches it, and while Lake
+  cannot load the workspace, a call that needs a worker fails with Lake's error. The first call after a start or such a
+  change waits for that run, about 0.3 s on the test fixture, even while a worker runs. Before, the server built the
+  roots from the manifest's package list, the root package first, each under `.lake/build/lib/lean`, so a package that
+  moved its `buildDir` lost its modules. `lake_meta.rs` no longer parses the manifest.
 - The server finds a module's `.ilean` as Lean finds its `.olean`: on the first import root that holds the module's
   first name component. Project-scope references scan the root package's import directory, the last root, and
   `lean_imports` names a source for a module whose `.olean` lies there. Before, all three looked under `.lake/build`.
