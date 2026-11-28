@@ -1,10 +1,11 @@
 //! Workers that load a Lake project's own build: a trial that imports a module
 //! of a path dependency and prints its axioms, a proof position and a
-//! declaration lookup, a check of a module that has no source file, the
-//! refusal of an import whose roots differ from the worker's launch roots or
-//! hold `Init`, builds that stop the project's workers before Lake starts,
-//! checks that wait for a build in the server, and a server killed while a
-//! worker starts that leaves the next server every worker slot.
+//! declaration lookup, a check of a module that has no source file, a new
+//! worker when a lakefile edit reorders Lake's import roots, the refusal of an
+//! import whose roots hold `Init`, builds that stop the project's workers
+//! before Lake starts, checks that wait for a build in the server, and a
+//! server killed while a worker starts that leaves the next server every
+//! worker slot.
 //!
 //! The tests are ignored: each builds a chain project (`support::chain`) and
 //! needs an installed worker. Set `LEAN_HOST_MCP_TEST_FIXTURE` or
@@ -31,6 +32,8 @@ const STARTUP: Duration = Duration::from_mins(2);
 /// How long a test waits for a request to end or a file to appear.
 const PATIENCE: Duration = Duration::from_mins(5);
 const SAMPLE_EVERY: Duration = Duration::from_millis(50);
+/// How long a retired worker may take to exit.
+const RETIRED_EXIT: Duration = Duration::from_secs(30);
 /// The new text of `Chain/A.lean`, in which `a` has another type.
 const EDITED_A: &str = "def a : Int := 1\n";
 /// A recipe whose first step holds the write turn for two seconds before Lake
@@ -43,6 +46,12 @@ steps = [["env", "sh", "-c", "touch building.txt; sleep 2"], ["build", "Chain.A"
 /// The chain's lakefile with a second path dependency, `dep2`.
 const TWO_DEPENDENCIES: &str = "import Lake\nopen Lake DSL\n\npackage chain\n\nrequire dep from \"dep\"\nrequire dep2 from \
                                 \"dep2\"\n\n@[default_target]\nlean_lib Chain\n";
+
+/// [`TWO_DEPENDENCIES`] with its `require` lines swapped. Lake orders the
+/// packages on `LEAN_PATH` by these lines and ignores the order of the
+/// manifest's list.
+const TWO_DEPENDENCIES_SWAPPED: &str = "import Lake\nopen Lake DSL\n\npackage chain\n\nrequire dep2 from \"dep2\"\nrequire \
+                                        dep from \"dep\"\n\n@[default_target]\nlean_lib Chain\n";
 
 /// A built chain project. Fails unless an installed worker is named.
 fn project() -> TestResult<Chain> {
@@ -134,71 +143,25 @@ async fn wait_for(path: &Path) -> TestResult {
     Ok(())
 }
 
-/// Wait until one worker holds `jobs` jobs, the running one included. A job
-/// counts once its request has chosen that worker.
-async fn wait_for_jobs(client: &Client, jobs: u64) -> TestResult {
-    let until = Instant::now().checked_add(PATIENCE).ok_or("patience is too long")?;
+/// Look up `dep` from `Dep` on server `server`, wait until none of the
+/// `retired` workers runs, and return the server's workers then.
+async fn dep_workers(client: &Client, server: u32, retired: &[u32]) -> TestResult<Vec<u32>> {
+    let statement = statement(client, "dep", &["Dep"]).await?;
+    assert!(statement.contains("Nat"), "{statement}");
+    let until = Instant::now()
+        .checked_add(RETIRED_EXIT)
+        .ok_or("the exit bound is too long")?;
     loop {
-        let status = client.runtime().await?;
-        let held = status
-            .pointer("/pool/projects")
-            .and_then(Value::as_array)
-            .and_then(|projects| {
-                projects
-                    .iter()
-                    .filter_map(|project| project.get("outstanding_jobs")?.as_u64())
-                    .max()
-            });
-        if held >= Some(jobs) {
-            return Ok(());
+        let mut workers = worker_ids(server)?;
+        if workers.iter().all(|id| !retired.contains(id)) {
+            workers.sort_unstable();
+            return Ok(workers);
         }
         if Instant::now() >= until {
-            return Err(format!("no worker held {jobs} jobs within {PATIENCE:?}: {status}").into());
+            return Err(format!("the workers {retired:?} still run after {RETIRED_EXIT:?}: {workers:?}").into());
         }
         tokio::time::sleep(SAMPLE_EVERY).await;
     }
-}
-
-/// Send trial `second` while another trial holds the chain's one worker, and
-/// write `changed` to the chain's manifest once `second` has joined that
-/// worker's queue. The worker reads the manifest at `second`'s import. Returns
-/// the response to `second` once the manifest is back as it was.
-async fn behind_a_manifest_change(chain: &Chain, client: &Client, changed: &Value, second: Value) -> TestResult<Value> {
-    let manifest = chain.root.join("lake-manifest.json");
-    let original = std::fs::read_to_string(&manifest)?;
-    let started = chain.root.join("started.txt");
-    let release = chain.root.join("release.txt");
-    let finished = chain.root.join("finished.txt");
-    let first = spawn_send(
-        client,
-        "lean_trial",
-        trial(&["Chain.A"], &holder(&started, &release, &finished)?),
-    );
-    wait_for(&started).await?;
-    let second = spawn_send(client, "lean_trial", second);
-    // Each check runs Lake to read the project's options before it chooses a
-    // worker, which can take seconds.
-    wait_for_jobs(client, 2).await?;
-    std::fs::write(&manifest, changed.to_string())?;
-    std::fs::write(&release, "release")?;
-    let first = first.await??;
-    let second = second.await??;
-    std::fs::write(&manifest, &original)?;
-    data(result(&first)?)?;
-    assert!(finished.exists(), "the first trial did not finish: {first}");
-    Ok(second)
-}
-
-/// The chain's manifest, with `change` applied to its package list.
-fn manifest_with(chain: &Chain, change: impl FnOnce(&mut Vec<Value>)) -> TestResult<Value> {
-    let mut manifest: Value = serde_json::from_str(&std::fs::read_to_string(chain.root.join("lake-manifest.json"))?)?;
-    change(
-        manifest
-            .get_mut("packages")
-            .and_then(Value::as_array_mut)
-            .ok_or("the manifest lists no packages")?,
-    );
-    Ok(manifest)
 }
 
 /// The ids of the worker processes under server `server` now.
@@ -335,15 +298,15 @@ async fn a_module_without_a_source_file_is_checked_in_a_worker() -> TestResult {
     Ok(())
 }
 
-/// A worker admits an import only through the roots it was launched with, in
-/// their order. The project gains a second path dependency, `dep2`. A trial
-/// that waits behind another on the project's one worker runs after the
-/// manifest has swapped `dep` and `dep2`: the same packages, so the same
-/// artifact domains, but Lean would search their roots in another order. The
-/// worker refuses that import. With the manifest restored, the import answers.
+/// A call reaches only a worker launched with the import roots Lake gives
+/// now. The project gains a second path dependency, `dep2`. When the lakefile
+/// swaps the `require` lines of `dep` and `dep2`, Lake lists the same roots in
+/// the other order, the order Lean would search them in, so the next lookup
+/// starts a new worker and the old one exits; swapping them back does the
+/// same. Writing the lakefile again with the same text keeps the worker.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-async fn an_import_through_other_roots_is_refused() -> TestResult {
+async fn a_lakefile_edit_that_reorders_the_roots_replaces_the_worker() -> TestResult {
     let chain = project()?;
     chain.write("lakefile.lean", TWO_DEPENDENCIES)?;
     chain.write(
@@ -358,25 +321,26 @@ async fn an_import_through_other_roots_is_refused() -> TestResult {
     )?;
     chain.lake(&["update"])?;
     chain.lake(&["build", "+Dep2"])?;
-    let mut packages = 0;
-    let swapped = manifest_with(&chain, |list| {
-        packages = list.len();
-        list.reverse();
-    })?;
-    assert_eq!(packages, 2, "{swapped}");
     let scratch = Scratch::new()?;
     let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let pid = server.pid()?;
     let client = Client::new(&server.url, "roots")?;
-    let second = behind_a_manifest_change(&chain, &client, &swapped, trial(&["Dep"], "#check dep")).await?;
-    assert!(
-        second
-            .to_string()
-            .contains("import roots differ from this worker's launch roots"),
-        "{second}\n{}",
+    let first = dep_workers(&client, pid, &[]).await?;
+    assert!(!first.is_empty(), "no worker after the first lookup");
+    chain.write("lakefile.lean", TWO_DEPENDENCIES_SWAPPED)?;
+    let swapped = dep_workers(&client, pid, &first).await?;
+    assert!(!swapped.is_empty(), "no worker after the swap");
+    chain.write("lakefile.lean", TWO_DEPENDENCIES)?;
+    let restored = dep_workers(&client, pid, &swapped).await?;
+    assert!(!restored.is_empty(), "no worker after the swap back");
+    chain.write("lakefile.lean", TWO_DEPENDENCIES)?;
+    let rewritten = dep_workers(&client, pid, &[]).await?;
+    assert_eq!(
+        rewritten,
+        restored,
+        "the same lakefile text replaced the worker\n{}",
         server.log()
     );
-    let statement = statement(&client, "dep", &["Dep"]).await?;
-    assert!(statement.contains("Nat"), "{statement}");
     server.stop().await?;
     Ok(())
 }

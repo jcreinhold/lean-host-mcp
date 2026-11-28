@@ -64,6 +64,7 @@ fn queued_test_project(limit: Duration) -> (LeanProject, mpsc::Receiver<ProjectM
         canonical_root: PathBuf::from("/test"),
         toolchain: "test".into(),
         manifest_hash: String::new(),
+        import_roots: Arc::from([]),
         session_id: String::new(),
         open_warnings: Vec::new(),
         actor_tx: Mutex::new(Some(tx)),

@@ -791,6 +791,17 @@ impl ProjectBroker {
             .map(|known| Arc::clone(&known.roots))
     }
 
+    /// Keep `roots` as Lake's answer for `root` as its files stand now, as
+    /// [`Self::import_roots`] does once Lake answers.
+    #[cfg(test)]
+    pub(super) fn test_keep_import_roots(&self, root: &Path, roots: Arc<[PathBuf]>) {
+        self.inner.lock().import_roots = Some(ImportRoots {
+            root: root.to_owned(),
+            stamp: crate::lake_meta::input_stamp(root),
+            roots,
+        });
+    }
+
     /// Run the project's `lake --no-build --no-cache ARGS` in `root`; see
     /// [`Self::lake_run`].
     async fn lake_reader(

@@ -206,6 +206,7 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
         canonical_root: root.to_path_buf(),
         toolchain: "leanprover/lean4:v4.35.0".into(),
         manifest_hash: "fixture".into(),
+        import_roots: Arc::from([]),
         session_id: uuid::Uuid::new_v4().to_string(),
         open_warnings: Vec::new(),
         actor_tx: Mutex::new(None),

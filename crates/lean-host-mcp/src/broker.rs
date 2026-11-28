@@ -284,8 +284,11 @@ impl ProjectBroker {
     #[cfg(test)]
     pub(crate) fn test_register_actor(&self, project: Arc<LeanProject>) {
         let root = project.canonical_root().to_path_buf();
+        // As after `acquire`, the broker keeps the import roots the actor
+        // opened with as Lake's answer, and the actor's root has a project
+        // lock.
+        self.test_keep_import_roots(&root, project.import_roots().into());
         let mut inner = self.inner.lock();
-        // As after `acquire`, the actor's root has a project lock.
         inner.locks.get(&root);
         inner.registry.insert(WorkerKey { root, lane: 0 }, project);
     }
@@ -893,8 +896,14 @@ impl ProjectBroker {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
         let epoch = self.inner.lock().shutdown_epoch;
-        if let Some(project) = self.select_worker(&root)? {
-            return Ok(project);
+        // A live worker serves only through the roots Lake gives now. Lake
+        // runs only when a lakefile, the pin or the manifest changed since it
+        // last answered.
+        if self.serves_workers(&root) {
+            let roots = self.import_roots(&root).await?;
+            if let Some(project) = self.select_worker(&root, &roots)? {
+                return Ok(project);
+            }
         }
 
         // Read the installed shims before retaining an opening Arc or slot.
@@ -909,10 +918,13 @@ impl ProjectBroker {
         let prepared =
             host_artifacts::installed_host_artifacts(&root, &worker, &sysroot, deadline, &cancellation).await?;
         let open_guard = self.acquire_opening_guard(&root, deadline, &cancellation).await?;
+        // A call that opened a worker while this one waited may have asked
+        // Lake since; its answer is newer. Lake does not run under the guard.
+        let import_roots = self.known_import_roots(&root).unwrap_or(import_roots);
 
         // Root-local startup serialization closes the race between callers that
         // both saw spare capacity. Selection pins the returned actor with an Arc.
-        if let Some(project) = self.select_worker(&root)? {
+        if let Some(project) = self.select_worker(&root, &import_roots)? {
             return Ok(project);
         }
         let (lane, growing) = {
@@ -1024,10 +1036,18 @@ impl ProjectBroker {
         Ok(guard)
     }
 
+    /// Whether an actor for `root` is registered.
+    fn serves_workers(&self, root: &Path) -> bool {
+        self.inner.lock().registry.keys().any(|key| key.root == root)
+    }
+
     /// Prefer a free actor; grow only while the global pool has spare capacity.
     /// A busy actor remains a valid queue, not a reason to refuse a request.
-    fn select_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
-        if !self.inner.lock().registry.iter().any(|(key, _)| key.root == root) {
+    /// First retire each actor for `root` that is unhealthy, or that opened
+    /// on another manifest or with import roots other than `roots`, Lake's
+    /// answer now.
+    fn select_worker(&self, root: &Path, roots: &[PathBuf]) -> Result<Option<Arc<LeanProject>>> {
+        if !self.serves_workers(root) {
             return Ok(None);
         }
         let manifest_hash = self.meta(root)?.manifest_hash;
@@ -1035,7 +1055,10 @@ impl ProjectBroker {
         let stale: Vec<_> = inner
             .registry
             .iter()
-            .filter(|(key, actor)| key.root == root && (!actor.is_healthy() || actor.manifest_hash() != manifest_hash))
+            .filter(|(key, actor)| {
+                key.root == root
+                    && (!actor.is_healthy() || actor.manifest_hash() != manifest_hash || actor.import_roots() != roots)
+            })
             .map(|(key, _)| key.clone())
             .collect();
         for key in stale {

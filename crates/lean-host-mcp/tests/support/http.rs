@@ -526,18 +526,11 @@ pub(crate) fn descendants_in(all: &[Process], pid: u32) -> Vec<Process> {
     found
 }
 
-/// The processes of `all` under server `server` that run the worker binary,
-/// at any depth.
+/// The workers of `all` under server `server`, at any depth.
 pub(crate) fn worker_processes(all: &[Process], server: u32) -> Vec<Process> {
     descendants_in(all, server)
         .into_iter()
-        .filter(|process| {
-            process
-                .command
-                .split_whitespace()
-                .next()
-                .is_some_and(|program| program.ends_with("lean-host-mcp-worker"))
-        })
+        .filter(|process| is_worker(&process.command))
         .collect()
 }
 
@@ -581,8 +574,9 @@ pub(crate) fn watch_until_gone(processes: &[Process], since: Instant, limit: Dur
 
 /// The Lake build steps of the server whose store is `store`, even after
 /// that server has died. Each step leads a process group that a file in
-/// `<store>/children/` names. Only the server's short runs and its build
-/// guard pass `--no-build`, and neither writes build products.
+/// `<store>/children/` names. The server's other Lake runs build nothing:
+/// its `setup-file` and `query` runs and its build guard pass `--no-build`,
+/// and it learns the import roots from a bare `lake env`.
 pub(crate) fn lake_builds<'a>(processes: &'a [Process], store: &Path) -> Vec<&'a Process> {
     let groups: BTreeSet<u32> = std::fs::read_dir(store.join("children"))
         .into_iter()
@@ -593,11 +587,20 @@ pub(crate) fn lake_builds<'a>(processes: &'a [Process], store: &Path) -> Vec<&'a
     processes
         .iter()
         .filter(|process| {
-            groups.contains(&process.pgid)
-                && is_lake(&process.command)
-                && !process.command.split_whitespace().any(|word| word == "--no-build")
+            groups.contains(&process.pgid) && is_lake(&process.command) && !builds_nothing(&process.command)
         })
         .collect()
+}
+
+/// Whether Lake command `command` builds nothing: it passes `--no-build`, or
+/// it is `lake env` with no program to run, which prints Lake's environment.
+fn builds_nothing(command: &str) -> bool {
+    let mut subcommand = command
+        .split_whitespace()
+        .skip(1)
+        .skip_while(|word| word.starts_with('-'));
+    command.split_whitespace().any(|word| word == "--no-build")
+        || (subcommand.next() == Some("env") && subcommand.next().is_none())
 }
 
 /// Whether `command` runs Lake.
@@ -608,19 +611,27 @@ fn is_lake(command: &str) -> bool {
         .is_some_and(|program| program == "lake" || program.ends_with("/lake"))
 }
 
+/// The flags that run the worker binary's shim preparation, which checks or
+/// builds the shims, starts no Lean and serves no request. The server runs
+/// the check before it opens a worker.
+const PREPARATION_FLAGS: [&str; 2] = ["--lean-rs-ready-host-artifacts", "--lean-rs-prepare-host-artifacts"];
+
+/// Whether `command` runs a worker: the worker binary without a
+/// [`PREPARATION_FLAGS`] flag.
+fn is_worker(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    words
+        .next()
+        .is_some_and(|program| program.ends_with("lean-host-mcp-worker"))
+        && !words.next().is_some_and(|flag| PREPARATION_FLAGS.contains(&flag))
+}
+
 /// The workers server `parent` runs, which count against
 /// `broker.max_workers`.
 pub(crate) fn workers(processes: &[Process], parent: u32) -> Vec<&Process> {
     processes
         .iter()
-        .filter(|process| {
-            process.ppid == parent
-                && process
-                    .command
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|program| program.ends_with("lean-host-mcp-worker"))
-        })
+        .filter(|process| process.ppid == parent && is_worker(&process.command))
         .collect()
 }
 

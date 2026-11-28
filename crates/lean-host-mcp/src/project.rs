@@ -341,6 +341,9 @@ pub(crate) struct LeanProject {
     canonical_root: PathBuf,
     toolchain: String,
     manifest_hash: String,
+    /// The import roots Lake gave when this project opened. Each worker it
+    /// starts gets them at launch.
+    import_roots: Arc<[PathBuf]>,
     session_id: String,
     /// Toolchain advisories captured at open: a pin outside lean-rs's numbered
     /// releases. Surfaced into every response's envelope warnings via
@@ -431,7 +434,7 @@ impl LeanProject {
         };
         config.maintenance = maintenance;
         config.prepared_host_artifacts = Some(prepared_host_artifacts);
-        config.import_roots = import_roots;
+        config.import_roots = Arc::clone(&import_roots);
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
@@ -472,6 +475,7 @@ impl LeanProject {
             canonical_root: meta.canonical_root,
             toolchain: runtime_toolchain,
             manifest_hash: meta.manifest_hash,
+            import_roots,
             session_id,
             open_warnings,
             actor_tx: Mutex::new(Some(actor_tx)),
@@ -795,6 +799,11 @@ impl LeanProject {
 
     pub(crate) fn manifest_hash(&self) -> &str {
         &self.manifest_hash
+    }
+
+    /// The import roots this project's workers launch with.
+    pub(crate) fn import_roots(&self) -> &[PathBuf] {
+        &self.import_roots
     }
 
     pub(crate) fn toolchain(&self) -> &str {

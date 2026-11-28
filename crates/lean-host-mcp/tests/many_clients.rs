@@ -207,8 +207,9 @@ async fn on_fixture() -> TestResult {
     assert_eq!(http::state(killed_reply), Some("done"), "{killed_reply}");
     // Every build holds Lake for two seconds and every check runs Lean, so a
     // sampler that saw neither would prove nothing.
-    assert_eq!(
-        sampled.most_writers, 1,
+    // `assert_common` checks that it never saw two.
+    assert!(
+        sampled.most_writers > 0,
         "the sampler never saw a Lake writer: {sampled:?}"
     );
     assert!(sampled.most_workers > 0, "the sampler never saw a worker: {sampled:?}");
