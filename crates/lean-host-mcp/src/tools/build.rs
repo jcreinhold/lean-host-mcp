@@ -174,8 +174,9 @@ pub struct Import {
     /// The `.olean` Lake loads for it.
     pub olean: String,
     /// The module's source file, as Lake names it from its library's
-    /// `srcDir`, when its `.olean` lies under the Lake root's `.lake/build`.
-    /// Null for a dependency's module.
+    /// `srcDir`, when its `.olean` lies in the root package's import
+    /// directory, the last one `lake env` puts on `LEAN_PATH`. Null for a
+    /// dependency's module.
     pub source: Option<String>,
 }
 
@@ -193,8 +194,9 @@ pub struct FailureDetail {
     /// read, `unknown_import` when a file's import names no module Lake
     /// knows, `setup_file_failed` when Lake gave no setup for a file for
     /// another reason, for example because an import is stale,
-    /// `module_sources_failed` when Lake named no source for a module the
-    /// root built, or `module_inputs_failed` when Lake answered for none of
+    /// `module_sources_failed` when Lake named no import directories or no
+    /// source for a module the root built, or `module_inputs_failed` when
+    /// Lake answered for none of
     /// the named modules. For one module: `unknown_module` or
     /// `module_header_failed`.
     pub code: String,
@@ -320,7 +322,6 @@ async fn module_headers(
 /// Each file's whole import closure, with the sources of the modules the
 /// root built.
 async fn file_imports(ctx: &ToolContext, root: &Path, files: Vec<String>) -> Result<Vec<FileImports>, ImportsError> {
-    let build = root.join(".lake").join("build");
     let mut closures = Vec::with_capacity(files.len());
     for file in files {
         let query = read_query_file(root, Path::new(&file))
@@ -335,11 +336,23 @@ async fn file_imports(ctx: &ToolContext, root: &Path, files: Vec<String>) -> Res
             Err(error) => return Err(ImportsError::file("setup_file_failed", &file, &error)),
         }
     }
+    // The root built the modules whose .olean lies in its own import
+    // directory. Each setup above asked Lake for the roots, so this runs no
+    // Lake unless a lakefile changed since.
+    let package_dir = if closures.is_empty() {
+        None
+    } else {
+        match ctx.broker.import_roots(root).await {
+            Ok(roots) => crate::broker::module_setup::package_import_dir(&roots).map(Path::to_owned),
+            Err(error @ ServerError::WorkerUnavailable(_)) => return Err(McpError::from(error).into()),
+            Err(error) => return Err(ImportsError::failure("module_sources_failed", error.to_string())),
+        }
+    };
     // One Lake query names the sources of every module the root built.
     let built: Vec<&str> = closures
         .iter()
         .flat_map(|(_, _, imports)| imports)
-        .filter(|(_, olean)| olean.starts_with(&build))
+        .filter(|(_, olean)| package_dir.as_ref().is_some_and(|dir| olean.starts_with(dir)))
         .map(|(module, _)| module.as_str())
         .collect::<BTreeSet<_>>()
         .into_iter()

@@ -362,8 +362,9 @@ impl Job {
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .env("LEAN_SYSROOT", &self.sysroot)
-            // Keep build products under each package's `.lake/build`, where
-            // setup-file and the workers read them.
+            // Keep build products in each package's own build directory,
+            // among the import roots where setup-file and the workers read
+            // them.
             .env("LAKE_ARTIFACT_CACHE", "false");
         crate::toolchain::pass_elan_home(&mut command);
         command

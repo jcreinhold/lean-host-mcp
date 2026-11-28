@@ -358,7 +358,39 @@ async fn imports_list_the_whole_closure_with_first_party_sources() -> TestResult
     assert_eq!(a.source, Some(path("Chain/A.lean")));
     let dep = import("Dep")?;
     assert_eq!(dep.olean, path("dep/.lake/build/lib/lean/Dep.olean"));
-    assert_eq!(dep.source, None, "Dep's olean lies outside the root's .lake/build");
+    assert_eq!(dep.source, None, "Dep's olean lies outside the root's import directory");
+    Ok(())
+}
+
+/// A package that moves its `buildDir` keeps its modules first-party: Lake
+/// names the import directory, so no build layout decides.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
+async fn imports_name_sources_under_a_moved_build_dir() -> TestResult {
+    let (chain, ctx) = project()?;
+    chain.write(
+        "lakefile.lean",
+        "import Lake\nopen Lake DSL\n\npackage chain where\n  buildDir := \"out\"\n\nrequire dep from \"dep\"\n\n\
+         @[default_target]\nlean_lib Chain\n",
+    )?;
+    chain.lake(&["build"])?;
+    let reply = imports(&ctx, &["Chain/C.lean"])
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let [file] = reply.files.as_slice() else {
+        return Err(format!("expected one file: {reply:?}").into());
+    };
+    let import = |module: &str| {
+        file.imports
+            .iter()
+            .find(|import| import.module == module)
+            .ok_or_else(|| format!("C lists no {module}: {reply:?}"))
+    };
+    let path = |relative: &str| chain.root.join(relative).display().to_string();
+    let b = import("Chain.B")?;
+    assert_eq!(b.olean, path("out/lib/lean/Chain/B.olean"));
+    assert_eq!(b.source, Some(path("Chain/B.lean")));
+    assert_eq!(import("Dep")?.source, None);
     Ok(())
 }
 
