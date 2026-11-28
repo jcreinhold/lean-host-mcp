@@ -142,11 +142,9 @@ pub(crate) fn invalid(message: impl std::fmt::Display) -> ServerError {
     ServerError::BadProject(message.to_string())
 }
 
-/// An [`std::io::ErrorKind::InvalidData`] error saying `message`: a file or
-/// a tool's output holds what the server refuses to read.
-pub(crate) fn invalid_data(message: impl std::fmt::Display) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string())
-}
+/// The one helper for an [`std::io::ErrorKind::InvalidData`] error, shared
+/// with the worker crate.
+pub(crate) use lean_host_mcp_worker::invalid_data;
 
 impl From<ServerError> for McpError {
     fn from(err: ServerError) -> Self {

@@ -17,6 +17,9 @@ version = "0.18.0"
 # here (members reference them via `.workspace = true`) removes per-crate drift;
 # `deny.toml` enforces the no-duplicate-version invariant across the full graph.
 [workspace.dependencies]
+# The worker's deployment record, which the server reads too. Without default
+# features it links no Lean; keep its version equal to the workspace's.
+lean-host-mcp-worker = { default-features = false, path = "crates/lean-host-mcp-worker", version = "=0.18.0" }
 lean-rs = "=0.12.0"
 lean-rs-host = "=0.12.0"
 lean-rs-worker-child = "=0.12.0"

@@ -971,7 +971,8 @@ mod tests {
     #[test]
     fn candidate_worker_replaced_after_probe_is_not_published() -> anyhow::Result<()> {
         let id = ToolchainId::parse("v4.36.0")?;
-        let mut record = WorkerSidecar::candidate(&id, "header".into(), Some("before".into()));
+        let deployment = WorkerSidecar::test_deployment("before", std::path::Path::new("/lean"));
+        let mut record = WorkerSidecar::new(&id, "header".into(), Some(deployment));
         let error = record
             .complete("after", crate::smoke::SmokeOutcome::Passed)
             .expect_err("replacement refused");

@@ -1,7 +1,7 @@
 [package]
 authors.workspace = true
 categories = ["development-tools"]
-description = "Worker-child binary for lean-host-mcp (links libleanshared; spawned by the parent)"
+description = "Worker-child binary for lean-host-mcp (links libleanshared; spawned by the parent), and the deployment record both read"
 edition.workspace = true
 keywords = ["lean", "lean4", "mcp"]
 license.workspace = true
@@ -17,17 +17,20 @@ required-features = ["native-worker"]
 
 [features]
 default = ["native-worker"]
-native-worker = ["dep:lean-rs", "dep:lean-rs-host", "dep:lean-rs-worker-child", "dep:lean-rs-worker-protocol"]
+native-worker = ["dep:lean-rs", "dep:lean-rs-host", "dep:lean-rs-worker-child"]
 
 [dependencies]
 lean-rs = { workspace = true, optional = true }
 lean-rs-host = { workspace = true, optional = true }
 lean-rs-worker-child = { workspace = true, optional = true }
-lean-rs-worker-protocol = { workspace = true, optional = true }
+lean-rs-worker-protocol.workspace = true
 lean-toolchain.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
 
 # Cargo cannot override just one inherited lint. Mirror workspace groups, permitting
 # only individually justified native attestation sites in the worker.

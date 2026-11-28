@@ -27,6 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   presentation settings in the library.
 - A reply that one `lean` process elaborated names its session `short-run-<uuid>`. It was `native-reader-<uuid>`, after
   the native reader that 0.18.0 removed.
+- `lean-host-mcp` now depends on `lean-host-mcp-worker`, at the same version and with default features off, for the
+  deployment record in `worker.json`. The server and the worker read that record through one type, and the server no
+  longer keeps its own copy. The library links no Lean; the worker binary still needs the `native-worker` feature.
 
 ## [0.18.0] - 2026-11-27
 

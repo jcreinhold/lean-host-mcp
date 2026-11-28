@@ -45,14 +45,19 @@ for package in lean-host-mcp lean-host-mcp-worker; do
 done
 parent_manifest="$pair/lean-host-mcp-$version/Cargo.toml"
 worker_source="$pair/lean-host-mcp-worker-$version"
+# The packaged parent asks crates.io for the worker's library. The patch points
+# it at the unpacked worker instead, so the pair builds from these archives.
 cat >"$pair/Cargo.toml" <<EOF
 [workspace]
 members = ["lean-host-mcp-$version", "lean-host-mcp-worker-$version"]
 resolver = "3"
+
+[patch.crates-io]
+lean-host-mcp-worker = { path = "lean-host-mcp-worker-$version" }
 EOF
 cp "$pair/lean-host-mcp-$version/Cargo.lock" "$pair/Cargo.lock"
-# The parent does not depend on the worker, so its lock lacks the worker's
-# entries. Add them and leave every locked package as it is.
+# The parent's lock holds only what the worker's library needs, not the Lean
+# runtime its binary links. Add the rest and leave every locked package as it is.
 cargo update --offline --manifest-path "$pair/Cargo.toml" --workspace
 python3 - "$pair" "$version" "$LOCAL_SDK_PREFIXES" <<'PY_LOCK'
 import pathlib

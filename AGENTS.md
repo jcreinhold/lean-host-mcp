@@ -78,8 +78,9 @@ Otherwise add one check at the one point where the requirement can fail, and del
   process group. Lake decides what to build and in which order; the server checks only the words it hands to Lake. A
   test fails if the build path queries Lake's import graph. A raw `lake build` is outside the contract.
 - Only `crates/lean-host-mcp-worker` links `libleanshared`. The parent uses the link-free worker-parent/protocol and
-  toolchain APIs; Lean runtime types and opaque handles stay in the child. The parent's `build.rs` embeds Git identity
-  only; the worker's `build.rs` emits the Lean rpath.
+  toolchain APIs and the worker crate's library, which it takes with default features off; Lean runtime types and opaque
+  handles stay in the child. The parent's `build.rs` embeds Git identity only; the worker's `build.rs` emits the Lean
+  rpath.
 - `LeanProject` owns a private serialized controller on a dedicated OS thread. Its bounded mailbox carries typed
   `ProjectMessage` requests with reply channels. Keep worker handles owned by that controller, and keep borrowed
   `LeanWorkerSession<'_>` values inside their owning stack frame. Do not hold a session across `.await` or share a

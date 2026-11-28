@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 
 use crate::config_file::{self, ConfigFile, Env};
 use crate::smoke::SmokeOutcome;
+use lean_host_mcp_worker::Deployment;
 
 /// Env var that names elan's home, as elan itself reads it.
 pub const ELAN_HOME_ENV: &str = "ELAN_HOME";
@@ -424,10 +425,7 @@ impl WorkerBinary {
                 record.toolchain == pin.as_str()
                     && matches!(record.smoke(), Some(SmokeOutcome::Passed))
                     && record.deployment.as_ref().is_some_and(|deployment| {
-                        deployment
-                            .runtime
-                            .as_ref()
-                            .is_some_and(|runtime| runtime.sysroot == lean_sysroot)
+                        deployment.sysroot == lean_sysroot
                             && std::fs::symlink_metadata(&worker.path).is_ok_and(|meta| meta.is_file())
                             && crate::cli::install_worker::sha256_prefix(&worker.path, 64)
                                 .is_ok_and(|digest| digest == deployment.worker_sha256)
@@ -676,21 +674,18 @@ pub(crate) fn hash_lean_header(elan_dir: &Path) -> std::io::Result<String> {
     crate::digest::file_sha256_hex(&elan_dir.join("include").join("lean").join("lean.h"))
 }
 
-/// File name of the per-worker provenance sidecar inside
-/// `<workers_dir>/<id>/`.
-const SIDECAR_FILE_NAME: &str = "worker.json";
-
 /// Private provenance record written next to an installed worker binary.
 ///
 /// Records what the worker was built against so [`WorkerBinary::resolve_ready`]
 /// can detect header drift (the toolchain's `lean.h` changing under a worker
-/// that keeps being selected). Fields stay private; callers go through the
-/// query methods.
+/// that keeps being selected). Its `deployment` is the
+/// [`lean_host_mcp_worker::Deployment`] the worker checks itself against.
+/// Fields stay private; callers go through the query methods.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct WorkerSidecar {
     toolchain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    deployment: Option<WorkerDeployment>,
+    deployment: Option<Deployment>,
     /// Full SHA-256 of the `lean.h` the worker was built against.
     header_digest: String,
     /// `lean_toolchain::LEAN_VERSION` the host was built against.
@@ -715,53 +710,6 @@ pub(crate) struct WorkerSidecar {
     smoke: Option<SmokeOutcome>,
 }
 
-/// Candidate executable binding. This alone grants no native operation.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct WorkerDeployment {
-    worker_sha256: String,
-    #[serde(flatten)]
-    runtime: Option<InstalledRuntime>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct InstalledRuntime {
-    pub(crate) sysroot: PathBuf,
-    pub(crate) prepared: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts,
-    pub(crate) files: std::collections::BTreeMap<PathBuf, String>,
-}
-
-impl InstalledRuntime {
-    /// Convert between installed paths and SDK inputs at the generation boundary.
-    pub(crate) fn map_generation_paths(
-        &mut self,
-        map: impl Fn(&Path) -> std::io::Result<PathBuf>,
-    ) -> std::io::Result<()> {
-        let string = |value: &mut String| -> std::io::Result<()> {
-            *value = map(Path::new(value))?
-                .into_os_string()
-                .into_string()
-                .map_err(|_| std::io::Error::other("non-UTF8 shim path"))?;
-            Ok(())
-        };
-        let p = &mut self.prepared;
-        string(&mut p.shim_manifest_path)?;
-        for path in &mut p.shim_search_paths {
-            string(path)?;
-        }
-        self.files = std::mem::take(&mut self.files)
-            .into_iter()
-            .map(|(path, hash)| {
-                if path.starts_with(&self.sysroot) {
-                    Ok((path, hash))
-                } else {
-                    Ok((map(&path)?, hash))
-                }
-            })
-            .collect::<std::io::Result<_>>()?;
-        Ok(())
-    }
-}
-
 /// Non-builtin modules used to bootstrap the installed one-shot batch verifier.
 pub const VERIFIER_MODULES: &[&str] = &[
     "LeanRsHostShims.InfoTree",
@@ -773,8 +721,8 @@ pub const VERIFIER_MODULES: &[&str] = &[
 ];
 
 impl WorkerSidecar {
-    pub(crate) fn into_runtime(self) -> Option<InstalledRuntime> {
-        self.deployment?.runtime
+    pub(crate) fn into_deployment(self) -> Option<Deployment> {
+        self.deployment
     }
 
     /// Write `<install_dir>/worker.json` recording `header_digest`, the host's
@@ -787,17 +735,33 @@ impl WorkerSidecar {
         header_digest: String,
         smoke: SmokeOutcome,
     ) -> std::io::Result<()> {
-        let mut sidecar = Self::candidate(id, header_digest, None);
+        let mut sidecar = Self::new(id, header_digest, None);
         sidecar.smoke = Some(smoke);
         sidecar.write(install_dir)
     }
 
-    pub(crate) fn candidate(id: &ToolchainId, header_digest: String, worker_sha256: Option<String>) -> Self {
+    /// A deployment of the worker with digest `worker_sha256`, built against
+    /// `sysroot`, with an empty shim set.
+    #[cfg(test)]
+    pub(crate) fn test_deployment(worker_sha256: &str, sysroot: &Path) -> Deployment {
+        Deployment {
+            worker_sha256: worker_sha256.to_owned(),
+            sysroot: sysroot.to_owned(),
+            prepared: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts {
+                protocol: 1,
+                shim_manifest_path: "shims/test".into(),
+                shim_manifest_json: "{}".into(),
+                shim_search_paths: vec![],
+            },
+            files: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The record of a generation that runs `deployment`, before its smoke
+    /// test.
+    pub(crate) fn new(id: &ToolchainId, header_digest: String, deployment: Option<Deployment>) -> Self {
         Self {
-            deployment: worker_sha256.map(|worker_sha256| WorkerDeployment {
-                worker_sha256,
-                runtime: None,
-            }),
+            deployment,
             toolchain: id.as_str().to_owned(),
             digest_supported_at_build: lean_toolchain::supported_by_digest(&header_digest).is_some(),
             built_against_lean_version: lean_toolchain::LEAN_VERSION.to_owned(),
@@ -806,15 +770,6 @@ impl WorkerSidecar {
             header_digest,
             smoke: None,
         }
-    }
-
-    pub(crate) fn bind_runtime(&mut self, runtime: InstalledRuntime) -> std::io::Result<()> {
-        let deployment = self
-            .deployment
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("missing candidate worker identity"))?;
-        deployment.runtime = Some(runtime);
-        Ok(())
     }
 
     pub(crate) fn complete(&mut self, digest: &str, smoke: SmokeOutcome) -> std::io::Result<()> {
@@ -827,27 +782,18 @@ impl WorkerSidecar {
 
     pub(crate) fn write(&self, install_dir: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(install_dir.join(SIDECAR_FILE_NAME), json)
+        std::fs::write(install_dir.join(lean_host_mcp_worker::RECORD_FILE_NAME), json)
     }
 
     /// Load `<install_dir>/worker.json`. `None` when absent or unparseable —
     /// an older host left no record, which is unknown provenance, not an error.
     pub(crate) fn load(install_dir: &Path) -> Option<Self> {
-        let bytes = std::fs::read(install_dir.join(SIDECAR_FILE_NAME)).ok()?;
+        let bytes = lean_host_mcp_worker::read_record(install_dir).ok()?;
         let mut record: Self = serde_json::from_slice(&bytes).ok()?;
-        if let Some(runtime) = record.deployment.as_mut().and_then(|d| d.runtime.as_mut())
-            && Path::new(&runtime.prepared.shim_manifest_path).is_relative()
+        if let Some(deployment) = record.deployment.as_mut()
+            && Path::new(&deployment.prepared.shim_manifest_path).is_relative()
         {
-            runtime
-                .map_generation_paths(|path| {
-                    if !path.starts_with("shims")
-                        || path.components().any(|c| !matches!(c, std::path::Component::Normal(_)))
-                    {
-                        return Err(std::io::Error::other("invalid generation-relative path"));
-                    }
-                    Ok(install_dir.join(path))
-                })
-                .ok()?;
+            deployment.resolve_in(install_dir).ok()?;
         }
         Some(record)
     }
@@ -1261,7 +1207,7 @@ mod tests {
             "built_against_lean_version": "4.30.0",
             "digest_supported_at_build": true
         }"#;
-        fs::write(tmp.path().join(SIDECAR_FILE_NAME), legacy).unwrap();
+        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), legacy).unwrap();
         let loaded = WorkerSidecar::load(tmp.path()).expect("legacy sidecar should load");
         assert_eq!(loaded.smoke(), None);
         assert_eq!(loaded.smoke_status(), "untested");
@@ -1280,19 +1226,8 @@ mod tests {
         let ready = || WorkerBinary::resolve_ready_with(&pin, root.path(), FIX, root.path().to_owned(), Some("header"));
         assert!(matches!(ready(), Readiness::Unusable { .. }));
         let digest = crate::cli::install_worker::sha256_prefix(&worker, 64).unwrap();
-        let mut record = WorkerSidecar::candidate(&pin, "header".into(), Some(digest.clone()));
-        record
-            .bind_runtime(InstalledRuntime {
-                sysroot: root.path().to_owned(),
-                prepared: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts {
-                    protocol: 1,
-                    shim_manifest_path: "shims/test".into(),
-                    shim_manifest_json: "{}".into(),
-                    shim_search_paths: vec![],
-                },
-                files: std::collections::BTreeMap::new(),
-            })
-            .unwrap();
+        let deployment = WorkerSidecar::test_deployment(&digest, root.path());
+        let mut record = WorkerSidecar::new(&pin, "header".into(), Some(deployment));
         record.complete(&digest, SmokeOutcome::Passed).unwrap();
         record.write(&generation).unwrap();
         assert!(matches!(ready(), Readiness::Ready { .. }));
@@ -1335,7 +1270,7 @@ mod tests {
             r#"{{"toolchain":"{}","header_digest":"digest","built_against_lean_version":"x","digest_supported_at_build":true}}"#,
             id.as_str()
         );
-        fs::write(tmp.path().join(SIDECAR_FILE_NAME), legacy).unwrap();
+        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), legacy).unwrap();
         let sysroot = tmp.path().to_path_buf();
         let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
         let Readiness::Ready { note: Some(note), .. } = readiness else {
@@ -1374,7 +1309,7 @@ mod tests {
         // provenance (serde default ""), never a spurious mismatch.
         let legacy = tempfile::tempdir().unwrap();
         let json = r#"{"toolchain":"v4.30.0","header_digest":"abc","built_against_lean_version":"x","digest_supported_at_build":true,"smoke":{"result":"passed"}}"#;
-        fs::write(legacy.path().join(SIDECAR_FILE_NAME), json).unwrap();
+        fs::write(legacy.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), json).unwrap();
         let old = WorkerSidecar::load(legacy.path()).unwrap();
         assert_eq!(old.protocol_version(), None);
         assert_eq!(old.protocol_status(), "unknown");
@@ -1390,7 +1325,7 @@ mod tests {
             id.as_str(),
             lean_rs_worker_protocol::protocol::PROTOCOL_VERSION
         );
-        fs::write(tmp.path().join(SIDECAR_FILE_NAME), skewed).unwrap();
+        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), skewed).unwrap();
         let sysroot = tmp.path().to_path_buf();
         let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
         assert!(
@@ -1408,7 +1343,7 @@ mod tests {
             r#"{{"toolchain":"{}","header_digest":"digest","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","worker_protocol_version":999,"digest_supported_at_build":true,"smoke":{{"result":"passed"}}}}"#,
             id.as_str()
         );
-        fs::write(tmp.path().join(SIDECAR_FILE_NAME), skewed).unwrap();
+        fs::write(tmp.path().join(lean_host_mcp_worker::RECORD_FILE_NAME), skewed).unwrap();
         let readiness =
             WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, tmp.path().to_path_buf(), Some("digest"));
         assert!(matches!(

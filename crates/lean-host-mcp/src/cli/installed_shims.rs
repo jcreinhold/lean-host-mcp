@@ -15,7 +15,7 @@ const MODULE_SUFFIXES: [&str; 4] = [".olean", ".olean.private", ".olean.server",
 /// sources it was built with to `<candidate>/shims`, builds them there with
 /// plain Lake, and prints their descriptor.
 fn prepare(candidate: &Path, sysroot: &Path) -> Result<LeanWorkerPreparedHostArtifacts> {
-    let destination = candidate.join("shims");
+    let destination = candidate.join(lean_host_mcp_worker::SHIMS_DIR);
     let flags = [
         OsStr::new(crate::host_preparation::PREPARE_FLAG),
         destination.as_os_str(),
@@ -36,7 +36,7 @@ pub(super) fn bind(
     sysroot: &Path,
     prepared: LeanWorkerPreparedHostArtifacts,
 ) -> Result<crate::toolchain::WorkerSidecar> {
-    use crate::toolchain::{InstalledRuntime, WORKER_FILE_NAME, WorkerSidecar, hash_lean_header};
+    use crate::toolchain::{WORKER_FILE_NAME, WorkerSidecar, hash_lean_header};
     let project = candidate.join("smoke-project");
     fs::create_dir(&project)?;
     fs::create_dir_all(project.join(".lake/build/lib/lean"))?;
@@ -75,22 +75,15 @@ pub(super) fn bind(
         .map(|p| Ok((p.clone(), super::install_worker::sha256_prefix(&p, 64)?)))
         .collect::<Result<_>>()?;
 
-    let mut record = WorkerSidecar::candidate(
-        id,
-        hash_lean_header(sysroot)?,
-        Some(super::install_worker::sha256_prefix(
-            &candidate.join(WORKER_FILE_NAME),
-            64,
-        )?),
-    );
-    let mut runtime = InstalledRuntime {
+    let mut deployment = lean_host_mcp_worker::Deployment {
+        worker_sha256: super::install_worker::sha256_prefix(&candidate.join(WORKER_FILE_NAME), 64)?,
         sysroot: sysroot.into(),
         prepared,
         files,
     };
-    runtime.map_generation_paths(|path| Ok(path.strip_prefix(candidate).map_err(std::io::Error::other)?.to_owned()))?;
     // The SDK manifest was generated in this final directory. Preserve its exact bytes.
-    record.bind_runtime(runtime)?;
+    deployment.relative_to(candidate)?;
+    let record = WorkerSidecar::new(id, hash_lean_header(sysroot)?, Some(deployment));
     record.write(candidate)?;
     Ok(record)
 }
@@ -166,7 +159,7 @@ pub(super) fn qualify(candidate: &Path, id: &crate::toolchain::ToolchainId, sysr
     let prepared = prepare(candidate, sysroot)?;
     let mut record = bind(candidate, id, sysroot, prepared)?;
     let snapshot = crate::toolchain::WorkerSidecar::load(candidate)
-        .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+        .and_then(crate::toolchain::WorkerSidecar::into_deployment)
         .context("unreadable installed snapshot")?;
     probe(candidate, id, sysroot, snapshot.prepared)?;
     record.complete(
@@ -231,7 +224,7 @@ mod tests {
         let generation = std::path::PathBuf::from(std::env::var_os("R2_GENERATION").context("missing generation")?);
         let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
         let runtime = crate::toolchain::WorkerSidecar::load(&generation)
-            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+            .and_then(crate::toolchain::WorkerSidecar::into_deployment)
             .context("missing installed runtime")?;
         probe(&generation, &id, &id.elan_dir()?.canonicalize()?, runtime.prepared)
     }
@@ -245,7 +238,7 @@ mod tests {
         let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
         let sysroot = id.elan_dir()?.canonicalize()?;
         let runtime = crate::toolchain::WorkerSidecar::load(&generation)
-            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+            .and_then(crate::toolchain::WorkerSidecar::into_deployment)
             .context("missing installed runtime")?;
         let shadow = generation.join("smoke-project/.lake/build/lib/lean/Init");
         fs::create_dir(&shadow)?;

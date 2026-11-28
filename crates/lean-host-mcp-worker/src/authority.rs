@@ -11,6 +11,7 @@
 //! the release, and only while no launch root holds a module package whose
 //! compiled code this process runs: the release's or the shims'. It refuses
 //! project libraries, plugins, terms, kernel requests and worker commands.
+use lean_host_mcp_worker::{Deployment, SHIMS_DIR, invalid_data};
 use lean_rs::host_bridge::{
     HostCachedModuleBatch, HostModuleBatch, HostModuleQuery, HostSourceOptions, TrustedHostKernelRequest,
     TrustedHostTerm, TrustedModuleSource,
@@ -24,10 +25,8 @@ use lean_rs::{LeanResult, LeanRuntime};
 use lean_rs_host::host::LeanPreparedHostArtifacts;
 use lean_rs_worker_child::{WorkerAuthority, WorkerManifestRead, WorkerSourceContext};
 use lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts;
-use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::BTreeMap,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -39,49 +38,6 @@ const BUILD_LIB: &str = ".lake/build/lib/lean";
 /// Lake workspace. A worker launched with more refuses every import.
 const MAX_LAUNCH_ROOTS: usize = 32;
 
-#[derive(Deserialize)]
-struct Sidecar {
-    deployment: Deployment,
-}
-#[derive(Deserialize)]
-struct Deployment {
-    worker_sha256: String,
-    sysroot: PathBuf,
-    prepared: LeanWorkerPreparedHostArtifacts,
-    files: BTreeMap<PathBuf, String>,
-}
-impl Deployment {
-    fn resolve_generation(&mut self, dir: &Path) -> io::Result<()> {
-        let resolve = |path: &Path| {
-            if !path.starts_with("shims") || path.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-                return Err(invalid("invalid installed generation-relative path"));
-            }
-            Ok(dir.join(path))
-        };
-        let expand = |path: &str| -> io::Result<String> {
-            resolve(Path::new(path))?
-                .into_os_string()
-                .into_string()
-                .map_err(|_| invalid("invalid installed path encoding"))
-        };
-        let p = &mut self.prepared;
-        p.shim_manifest_path = expand(&p.shim_manifest_path)?;
-        for path in &mut p.shim_search_paths {
-            *path = expand(path)?;
-        }
-        self.files = std::mem::take(&mut self.files)
-            .into_iter()
-            .map(|(path, hash)| {
-                if path.starts_with(&self.sysroot) {
-                    Ok((path, hash))
-                } else {
-                    Ok((resolve(&path)?, hash))
-                }
-            })
-            .collect::<io::Result<_>>()?;
-        Ok(())
-    }
-}
 pub(super) struct Installed {
     record: Deployment,
     /// The roots every import names, in order: the launch roots, then the shim roots.
@@ -104,12 +60,9 @@ pub(super) fn deny() -> lean_rs::LeanError {
 fn refuse(error: &io::Error) -> lean_rs::LeanError {
     lean_rs::error::host_internal(format!("request refused: {error}"))
 }
-pub(super) fn invalid(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg)
-}
 pub(super) fn digest(path: &Path) -> io::Result<String> {
     if path.canonicalize()? != path || !path.is_file() {
-        return Err(invalid("expected canonical installed file"));
+        return Err(invalid_data("expected canonical installed file"));
     }
     let mut hash = Sha256::new();
     let mut file = fs::File::open(path)?;
@@ -119,7 +72,11 @@ pub(super) fn digest(path: &Path) -> io::Result<String> {
         if n == 0 {
             break;
         }
-        hash.update(buffer.get(..n).ok_or_else(|| invalid("invalid input byte count"))?);
+        hash.update(
+            buffer
+                .get(..n)
+                .ok_or_else(|| invalid_data("invalid input byte count"))?,
+        );
     }
     let mut text = String::with_capacity(64);
     for b in hash.finalize() {
@@ -138,7 +95,7 @@ fn launch_roots(dir: &Path) -> io::Result<Vec<String>> {
                 .join(BUILD_LIB)
                 .into_os_string()
                 .into_string()
-                .map_err(|_| invalid("invalid installed path encoding"))?,
+                .map_err(|_| invalid_data("invalid installed path encoding"))?,
         ],
     };
     if roots.is_empty()
@@ -147,7 +104,7 @@ fn launch_roots(dir: &Path) -> io::Result<Vec<String>> {
             .iter()
             .any(|root| !Path::new(root).is_absolute() || !Path::new(root).ends_with(BUILD_LIB))
     {
-        return Err(invalid("launch roots are not Lake build outputs"));
+        return Err(invalid_data("launch roots are not Lake build outputs"));
     }
     Ok(roots)
 }
@@ -193,27 +150,21 @@ impl Installed {
     /// the server wait out its startup deadline.
     pub(super) fn open() -> io::Result<Self> {
         let worker = std::env::current_exe()?.canonicalize()?;
-        let dir = worker.parent().ok_or_else(|| invalid("missing install directory"))?;
-        let mut bytes = Vec::new();
-        fs::File::open(dir.join("worker.json"))?
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 1024 * 1024 {
-            return Err(invalid("oversized installed sidecar"));
-        }
-        let mut record = serde_json::from_slice::<Sidecar>(&bytes)?.deployment;
-        record.resolve_generation(dir)?;
+        let dir = worker
+            .parent()
+            .ok_or_else(|| invalid_data("missing install directory"))?;
+        let record = Deployment::read(dir)?;
         if digest(&worker)? != record.worker_sha256 {
-            return Err(invalid("installed worker digest mismatch"));
+            return Err(invalid_data("installed worker digest mismatch"));
         }
         let (launch, refusal) = match launch_roots(dir) {
             Ok(roots) => (roots, None),
             Err(error) => (Vec::new(), Some(error)),
         };
         let compiled = option_env!("LEAN_HOST_COMPILED_SYSROOT")
-            .ok_or_else(|| invalid("worker build lacks stable Lean prefix"))?;
+            .ok_or_else(|| invalid_data("worker build lacks stable Lean prefix"))?;
         if record.sysroot != Path::new(compiled) {
-            return Err(invalid(
+            return Err(invalid_data(
                 "the installed Lean prefix differs from the one this worker was built with",
             ));
         }
@@ -225,28 +176,30 @@ impl Installed {
                     || matches!(k.as_str(), "LD_PRELOAD" | "LD_LIBRARY_PATH" | "LD_AUDIT")
             })
         {
-            return Err(invalid(&format!("unapproved Lean runtime environment: {name} is set")));
+            return Err(invalid_data(format!(
+                "unapproved Lean runtime environment: {name} is set"
+            )));
         }
         if std::env::var_os("LEAN_PATH").is_some() {
-            return Err(invalid("unapproved Lean runtime environment: LEAN_PATH is set"));
+            return Err(invalid_data("unapproved Lean runtime environment: LEAN_PATH is set"));
         }
         let sysroot = std::env::var("LEAN_SYSROOT").unwrap_or_default();
         if Path::new(&sysroot) != record.sysroot {
-            return Err(invalid(
+            return Err(invalid_data(
                 "unapproved Lean runtime environment: LEAN_SYSROOT is not the installed Lean prefix",
             ));
         }
         for (path, expected) in &record.files {
             if digest(path)? != *expected {
-                return Err(invalid("installed file digest mismatch"));
+                return Err(invalid_data("installed file digest mismatch"));
             }
         }
         let p = &record.prepared;
         let manifest = Path::new(&p.shim_manifest_path);
         let m = lean_toolchain::CapabilityManifest::from_bytes(manifest, p.shim_manifest_json.as_bytes())
-            .map_err(|e| invalid(e.message()))?;
+            .map_err(|e| invalid_data(e.message()))?;
         let [dep] = m.dependencies.as_slice() else {
-            return Err(invalid("wrong dependency count"));
+            return Err(invalid_data("wrong dependency count"));
         };
         if m.package != "lean_rs_host_shims"
             || m.module != "LeanRsHostShims"
@@ -254,24 +207,24 @@ impl Installed {
                 init.module_name() == "LeanRsInterop" && init.package_name() == "lean_rs_interop_shims"
             })
         {
-            return Err(invalid("unapproved installed initializer"));
+            return Err(invalid_data("unapproved installed initializer"));
         }
         let primary = m.primary_dylib.as_path();
         let interop = dep.path_ref();
         for asset in [primary, interop, manifest] {
-            if !asset.starts_with(dir.join("shims")) || !record.files.contains_key(asset) {
-                return Err(invalid("unbound installed image or manifest"));
+            if !asset.starts_with(dir.join(SHIMS_DIR)) || !record.files.contains_key(asset) {
+                return Err(invalid_data("unbound installed image or manifest"));
             }
         }
         let mut expected = Vec::new();
         for (image, package) in [(interop, "lean-rs-interop-shims"), (primary, "lean-rs-host-shims")] {
-            if !image.starts_with(dir.join("shims").join(package)) {
-                return Err(invalid("wrong image domain"));
+            if !image.starts_with(dir.join(SHIMS_DIR).join(package)) {
+                return Err(invalid_data("wrong image domain"));
             }
             expected.push(
                 image
                     .parent()
-                    .ok_or_else(|| invalid("missing image directory"))?
+                    .ok_or_else(|| invalid_data("missing image directory"))?
                     .join("lean")
                     .canonicalize()?,
             );
@@ -279,11 +232,11 @@ impl Installed {
         if p.shim_search_paths.iter().map(PathBuf::from).ne(expected)
             || fs::read(manifest)? != p.shim_manifest_json.as_bytes()
         {
-            return Err(invalid("installed manifest or ordered shim roots differ"));
+            return Err(invalid_data("installed manifest or ordered shim roots differ"));
         }
         for rel in ["include/lean/lean.h", "lib/lean/Init.olean"] {
             if !record.files.contains_key(&record.sysroot.join(rel)) {
-                return Err(invalid("unbound installed Lean release"));
+                return Err(invalid_data("unbound installed Lean release"));
             }
         }
         let release = module_packages(&record.sysroot.join("lib/lean"))?;
@@ -334,7 +287,11 @@ impl Installed {
                 ] {
                     match fs::symlink_metadata(&entry) {
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Ok(_) => return Err(invalid(&format!("import root {root} shadows compiled package {name}"))),
+                        Ok(_) => {
+                            return Err(invalid_data(format!(
+                                "import root {root} shadows compiled package {name}"
+                            )));
+                        }
                         Err(e) => return Err(e),
                     }
                 }

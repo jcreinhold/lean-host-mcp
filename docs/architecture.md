@@ -64,6 +64,7 @@ crates/lean-host-mcp/src/
   smoke.rs, diagnosis.rs the install smoke verdict in worker.json; resolution-health messages
 
 crates/lean-host-mcp-worker/src/
+  lib.rs                 the deployment record in worker.json, which the server writes and both sides check; no Lean
   main.rs, authority.rs  worker child; serves one Lake project from its own build through the roots named at launch
 ```
 

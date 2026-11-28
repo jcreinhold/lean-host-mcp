@@ -974,6 +974,7 @@ dependencies = [
  "clap",
  "criterion",
  "dirs",
+ "lean-host-mcp-worker",
  "lean-rs-worker-parent",
  "lean-rs-worker-protocol",
  "lean-semantic-search-contract",
@@ -1014,6 +1015,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

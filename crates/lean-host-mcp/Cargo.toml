@@ -75,6 +75,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
+lean-host-mcp-worker.workspace = true
 lean-rs-worker-parent.workspace = true
 lean-rs-worker-protocol.workspace = true
 lean-semantic-search-contract.workspace = true
