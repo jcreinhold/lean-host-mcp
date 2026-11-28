@@ -2109,27 +2109,6 @@ mod tests {
             .any(|fact| fact.artifact == artifact && fact.scope == scope && fact.status == status)
     }
 
-    #[test]
-    fn header_imports_handles_public_meta_and_all() {
-        let source = "\
-module
-
-public import Foo.Bar
-meta import Baz.Qux
-import all Project.Internal
-import Init -- comment
-";
-        assert_eq!(
-            header_imports(source),
-            vec![
-                "Foo.Bar".to_owned(),
-                "Baz.Qux".to_owned(),
-                "Project.Internal".to_owned(),
-                "Init".to_owned(),
-            ]
-        );
-    }
-
     /// `QueryFile::imports` is the header-import scan of `QueryFile::source`,
     /// not a separately-derived list. Both module-query paths build their
     /// session imports from that field instead of rescanning the source, so

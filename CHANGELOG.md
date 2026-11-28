@@ -123,6 +123,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   that long for the cache entry's lock, and then for Lake. Install reads the build tables before it changes anything, so
   a broken one stops it first, and a server's semantic search that must open the runtime fails with the problems they
   name.
+- The server takes a file's imports from its header alone, read as Lean reads it: whitespace, `--` comments and nested
+  `/- -/` comments may come before and between `module`, `prelude` and the `import` commands, and a doc comment or any
+  other word ends the header. Before, it took every line that began with `import`, even one inside a comment or after
+  the header, and missed an import that followed a block comment on its line.
 
 ## [0.18.0] - 2026-11-27
 
