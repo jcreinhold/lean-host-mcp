@@ -299,6 +299,10 @@ The five semantic tools return this response baseline:
 }
 ```
 
+`trust.session_id` names what answered: `request-invalid` when the server refused the request before any work,
+`metadata-only` when nothing elaborated, `short-run-<uuid>` when one `lean` process did, and the worker's session id
+when a worker did.
+
 `trust.artifacts` is omitted when empty. Rows use these stable tokens:
 
 - `artifact`: `source`, `olean`, `ilean`, `worker`

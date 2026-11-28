@@ -2,7 +2,7 @@
 //! ([`crate::lean_run`]) runs the semantic feature driver with the module
 //! setup that `lake setup-file` prints for that file.
 use super::verify_file::PreparedReader;
-use super::{BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, reader_freshness};
+use super::{BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, short_run_freshness};
 use crate::cancellation::CallCancellation;
 use crate::error::invalid;
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
@@ -94,7 +94,7 @@ impl ProjectBroker {
         Ok(BrokerCall {
             value: request.reader_result(&bytes)?,
             runtime: RuntimeFacts::default(),
-            freshness: reader_freshness(&meta, freshness),
+            freshness: short_run_freshness(&meta, freshness),
         })
     }
 }

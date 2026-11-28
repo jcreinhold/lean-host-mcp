@@ -25,6 +25,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - An environment variable that is empty or holds only spaces counts as unset for every setting. Before, an empty broker
   or runtime variable stopped startup while the others counted as unset. `ToolConfig::from_env_with_file` resolves the
   presentation settings in the library.
+- A reply that one `lean` process elaborated names its session `short-run-<uuid>`. It was `native-reader-<uuid>`, after
+  the native reader that 0.18.0 removed.
 
 ## [0.18.0] - 2026-11-27
 

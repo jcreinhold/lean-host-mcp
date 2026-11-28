@@ -3,7 +3,7 @@
 //! setup that `lake setup-file` prints for the file.
 use super::{
     BrokerCall, Duration, LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
-    LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, reader_freshness,
+    LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, short_run_freshness,
 };
 use crate::error::invalid;
 use serde::Deserialize;
@@ -181,7 +181,7 @@ impl ProjectBroker {
             .run_file_driver(&root, reader, activity, setup, entry, body)
             .await?;
         let mut runtime = RuntimeFacts::default();
-        let mut freshness = reader_freshness(&meta, freshness);
+        let mut freshness = short_run_freshness(&meta, freshness);
         let frame = decode_setup_verdict(&bytes, &freshness.lean_toolchain)?;
         if matches!(frame.outcome, LeanWorkerDeclarationVerificationBatchResult::Ok { .. }) {
             runtime.cli_file_verification = Some(Box::new(crate::envelope::CliFileVerification {
@@ -311,7 +311,7 @@ impl ProjectBroker {
             .map_err(invalid)?,
         );
         let value = serde_json::from_value(result).map_err(invalid)?;
-        let mut freshness = reader_freshness(&meta, imports);
+        let mut freshness = short_run_freshness(&meta, imports);
         freshness.elaboration_options = Some(crate::envelope::ElaborationOptions::from_worker(&options));
         Ok(super::CachedBrokerCall {
             freshly_processed: true,
@@ -379,7 +379,7 @@ impl ProjectBroker {
         .await
         .map_err(|failure| failure.error)?;
         let value = lean_messages(&output, file, &budgets)?;
-        let mut freshness = reader_freshness(&meta, imports);
+        let mut freshness = short_run_freshness(&meta, imports);
         freshness.elaboration_options = Some(crate::envelope::ElaborationOptions::from_worker(&options));
         Ok(BrokerCall {
             value,

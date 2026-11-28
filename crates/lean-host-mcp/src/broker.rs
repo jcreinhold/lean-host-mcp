@@ -1294,9 +1294,9 @@ fn freshness_from_meta(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshnes
 
 /// Freshness of a reply that a short run elaborated. Each run is one `lean`
 /// process, so each has its own session id.
-fn reader_freshness(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
+fn short_run_freshness(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
     Freshness {
-        session_id: format!("native-reader-{}", uuid::Uuid::new_v4()),
+        session_id: format!("short-run-{}", uuid::Uuid::new_v4()),
         ..freshness_from_meta(meta, imports)
     }
 }
@@ -1612,6 +1612,18 @@ mod tests {
             "identity path must not open a LeanProject"
         );
         drop(broker);
+    }
+
+    /// A short run's reply names the run in its session id, one id per run.
+    #[test]
+    fn short_run_replies_name_a_session_of_their_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = LakeProjectMeta::from_explicit(&make_lake_dir(tmp.path(), "short-run")).unwrap();
+        let first = short_run_freshness(&meta, Vec::new());
+        let second = short_run_freshness(&meta, Vec::new());
+        assert!(first.session_id.starts_with("short-run-"), "{}", first.session_id);
+        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(first.project_root, meta.canonical_root.to_string_lossy());
     }
 
     /// The metadata memo is a cost cache, so the contract is that no caller can

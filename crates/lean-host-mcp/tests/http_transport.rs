@@ -690,7 +690,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
     let server = HttpMcpServer::spawn(command, None).await;
     let mut session = server.new_session().await;
     // The installed worker serves no project request, so the semantic call is
-    // a proof search, which a native reader runs.
+    // a proof search, which a short run serves.
     for (name, arguments) in [
         ("lean_build", json!({})),
         (
