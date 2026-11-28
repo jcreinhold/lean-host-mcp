@@ -9,18 +9,21 @@
 
 #![cfg(unix)]
 
-mod support;
-
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use lean_host_mcp_test_support as support;
 use serde_json::{Value, json};
 use support::TestResult;
 use support::chain::{Chain, chain_project};
 use support::http::{self, Client, Launch, Process, Scratch, Server};
 
+/// The server binary Cargo built for this test run.
+const SERVER: &str = env!("CARGO_BIN_EXE_lean-host-mcp");
+/// The directory Cargo gives this suite for scratch files.
+const TMP: &str = env!("CARGO_TARGET_TMPDIR");
 /// How long a test waits for a server to listen. A restart first stops what
 /// the server it replaces left running, which takes up to 35 seconds.
 const STARTUP: Duration = Duration::from_mins(2);
@@ -35,9 +38,7 @@ fn empty_verify() -> Value {
 /// A Lake project with no Lean code. Its manifest lists its packages, none,
 /// as the read turn of a check needs.
 fn metadata_project() -> TestResult<tempfile::TempDir> {
-    let dir = tempfile::Builder::new()
-        .prefix("requests-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let dir = tempfile::Builder::new().prefix("requests-").tempdir_in(TMP)?;
     std::fs::write(dir.path().join("lakefile.toml"), "name = \"requests\"\n")?;
     std::fs::write(dir.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
     std::fs::write(dir.path().join("lake-manifest.json"), "{\"packages\":[]}\n")?;
@@ -61,8 +62,8 @@ fn table_ids(store: &Path) -> TestResult<Vec<String>> {
 #[tokio::test]
 async fn a_named_request_runs_once_and_keeps_its_result() -> TestResult {
     let project = metadata_project()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(project.path(), &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, project.path(), &scratch)?, STARTUP).await?;
     let first = Client::new(&server.url, "first")?;
     let id = "verify-empty-0001";
     let row = first.run(id, "lean_verify", &empty_verify()).await?;
@@ -123,8 +124,8 @@ async fn a_named_request_runs_once_and_keeps_its_result() -> TestResult {
 #[tokio::test]
 async fn another_call_on_an_id_fails_and_makes_no_row() -> TestResult {
     let project = metadata_project()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(project.path(), &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, project.path(), &scratch)?, STARTUP).await?;
     let client = Client::new(&server.url, "conflict")?;
     let id = "conflict-0001";
     client.run(id, "lean_verify", &empty_verify()).await?;
@@ -202,8 +203,8 @@ async fn another_call_on_an_id_fails_and_makes_no_row() -> TestResult {
 #[tokio::test]
 async fn an_ended_request_survives_a_server_kill() -> TestResult {
     let project = metadata_project()?;
-    let scratch = Scratch::new()?;
-    let launch = Launch::new(project.path(), &scratch)?;
+    let scratch = Scratch::new(TMP)?;
+    let launch = Launch::new(SERVER, project.path(), &scratch)?;
     let server = Server::start(&launch, STARTUP).await?;
     let id = "survivor-0001";
     let client = Client::new(&server.url, "before")?;
@@ -231,7 +232,7 @@ append = "last"
 
 /// A built chain project with the `mark` recipe.
 fn marked_chain() -> TestResult<Chain> {
-    let chain = chain_project()?;
+    let chain = chain_project(TMP)?;
     chain.write("lean-host-mcp.toml", MARK)?;
     Ok(chain)
 }
@@ -285,8 +286,8 @@ fn assert_passed(reply: &Value) {
 #[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn the_same_build_sent_three_times_at_once_starts_one_lake() -> TestResult {
     let chain = marked_chain()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let id = "twice-build-0001";
     let arguments = mark("once", 1);
     let (one, two, three) = (
@@ -322,8 +323,8 @@ async fn the_same_build_sent_three_times_at_once_starts_one_lake() -> TestResult
 #[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_build_outlives_its_killed_client() -> TestResult {
     let chain = marked_chain()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let id = "orphan-build-0001";
     let mut arguments = mark("orphan", 3);
     arguments
@@ -346,8 +347,8 @@ async fn a_build_outlives_its_killed_client() -> TestResult {
 #[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_killed_server_interrupts_its_build_and_runs_the_queued_one() -> TestResult {
     let chain = marked_chain()?;
-    let scratch = Scratch::new()?;
-    let launch = Launch::new(&chain.root, &scratch)?;
+    let scratch = Scratch::new(TMP)?;
+    let launch = Launch::new(SERVER, &chain.root, &scratch)?;
     let server = Server::start(&launch, STARTUP).await?;
     let client = Client::new(&server.url, "before")?;
     let (killed, queued) = ("killed-build-0001", "queued-build-0001");
@@ -410,10 +411,10 @@ fn signalled(log: &str, group: u32, signal: i32) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn the_next_server_serves_only_after_a_killed_servers_build_exits() -> TestResult {
-    let chain = chain_project()?;
+    let chain = chain_project(TMP)?;
     chain.write("lean-host-mcp.toml", &format!("{MARK}{STUCK}"))?;
-    let scratch = Scratch::new()?;
-    let launch = Launch::new(&chain.root, &scratch)?;
+    let scratch = Scratch::new(TMP)?;
+    let launch = Launch::new(SERVER, &chain.root, &scratch)?;
     let server = Server::start(&launch, STARTUP).await?;
     let client = Client::new(&server.url, "before")?;
     let id = "stuck-build-0001";
@@ -480,8 +481,8 @@ async fn a_killed_servers_workers_exit_and_the_next_build_runs() -> TestResult {
     std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
     let chain = marked_chain()?;
     chain.write("Slow.lean", "#eval IO.sleep 60000\n")?;
-    let scratch = Scratch::new()?;
-    let launch = Launch::new(&chain.root, &scratch)?;
+    let scratch = Scratch::new(TMP)?;
+    let launch = Launch::new(SERVER, &chain.root, &scratch)?;
     let server = Server::start(&launch, STARTUP).await?;
     let client = Client::new(&server.url, "warm")?;
     let trial = json!({"kind": "command", "imports": ["Chain.C"], "commands": "#check b_eq"});
@@ -647,7 +648,7 @@ async fn checks_at_once(server: &Server) -> TestResult<(Vec<(i64, i64)>, LeanRun
 
 /// A chain project with [`SLOW_FILES`].
 fn slow_chain() -> TestResult<Chain> {
-    let chain = chain_project()?;
+    let chain = chain_project(TMP)?;
     for file in SLOW_FILES {
         chain.write(file, SLOW)?;
     }
@@ -664,8 +665,8 @@ fn slow_chain() -> TestResult<Chain> {
 async fn two_file_checks_run_lean_at_once() -> TestResult {
     std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
     let chain = slow_chain()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let (_, runs) = checks_at_once(&server).await?;
     let overlap = runs.overlap()?;
     eprintln!("the Lean processes ran at once for {overlap} ms");
@@ -683,8 +684,8 @@ async fn two_file_checks_run_lean_at_once() -> TestResult {
 async fn with_one_lean_run_two_file_checks_take_turns() -> TestResult {
     std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
     let chain = slow_chain()?;
-    let scratch = Scratch::new()?;
-    let launch = Launch::new(&chain.root, &scratch)?.env("LEAN_HOST_MCP_MAX_LEAN_RUNS", "1");
+    let scratch = Scratch::new(TMP)?;
+    let launch = Launch::new(SERVER, &chain.root, &scratch)?.env("LEAN_HOST_MCP_MAX_LEAN_RUNS", "1");
     let server = Server::start(&launch, STARTUP).await?;
     let (spans, runs) = checks_at_once(&server).await?;
     assert_eq!(runs.together, 0, "a sample saw both Lean processes: {runs:?}");
@@ -706,9 +707,9 @@ async fn with_one_lean_run_two_file_checks_take_turns() -> TestResult {
 #[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
 async fn a_direct_verify_names_a_server_id() -> TestResult {
     std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
-    let chain = chain_project()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let chain = chain_project(TMP)?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let client = Client::new(&server.url, "verify")?;
     let verify = client
         .send(

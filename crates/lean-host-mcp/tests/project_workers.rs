@@ -14,19 +14,22 @@
 
 #![cfg(unix)]
 
-mod support;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use lean_host_mcp_test_support as support;
 use serde_json::{Value, json};
 use support::TestResult;
 use support::chain::{Chain, chain_project};
 use support::http::{self, Client, Launch, Scratch, Server};
 use tokio::task::JoinHandle;
 
+/// The server binary Cargo built for this test run.
+const SERVER: &str = env!("CARGO_BIN_EXE_lean-host-mcp");
+/// The directory Cargo gives this suite for scratch files.
+const TMP: &str = env!("CARGO_TARGET_TMPDIR");
 /// How long a test waits for a server to listen.
 const STARTUP: Duration = Duration::from_mins(2);
 /// How long a test waits for a request to end or a file to appear.
@@ -56,7 +59,7 @@ const TWO_DEPENDENCIES_SWAPPED: &str = "import Lake\nopen Lake DSL\n\npackage ch
 /// A built chain project. Fails unless an installed worker is named.
 fn project() -> TestResult<Chain> {
     std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
-    chain_project()
+    chain_project(TMP)
 }
 
 /// The `data` of semantic tool result `result`. Fails when the result is an
@@ -191,8 +194,8 @@ async fn a_trial_imports_a_dependency_module_and_prints_its_axioms() -> TestResu
         "def dep : Nat := 1\n\ntheorem dep_em (p : Prop) : p ∨ ¬p := Classical.em p\n",
     )?;
     chain.lake(&["build"])?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let client = Client::new(&server.url, "trial")?;
     let result = client
         .call("lean_trial", &trial(&["Dep"], "#check dep_em\n#print axioms dep_em"))
@@ -222,8 +225,8 @@ async fn a_proof_position_and_a_lookup_answer_from_the_project_build() -> TestRe
         "Chain/D.lean",
         "import Chain.B\n\ntheorem b_le : b ≤ b := by\n  exact Nat.le_refl b\n",
     )?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let client = Client::new(&server.url, "context")?;
     let result = client
         .call(
@@ -260,8 +263,8 @@ async fn a_proof_position_and_a_lookup_answer_from_the_project_build() -> TestRe
 async fn a_module_without_a_source_file_is_checked_in_a_worker() -> TestResult {
     let chain = project()?;
     std::fs::remove_file(chain.root.join("Chain/C.lean"))?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let client = Client::new(&server.url, "verify")?;
     let result = client
         .call(
@@ -321,8 +324,8 @@ async fn a_lakefile_edit_that_reorders_the_roots_replaces_the_worker() -> TestRe
     )?;
     chain.lake(&["update"])?;
     chain.lake(&["build", "+Dep2"])?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let pid = server.pid()?;
     let client = Client::new(&server.url, "roots")?;
     let first = dep_workers(&client, pid, &[]).await?;
@@ -351,8 +354,8 @@ async fn a_lakefile_edit_that_reorders_the_roots_replaces_the_worker() -> TestRe
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
 async fn an_import_root_that_holds_init_is_refused() -> TestResult {
     let chain = project()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let client = Client::new(&server.url, "init")?;
     let statement = statement(&client, "a", &["Chain.A"]).await?;
     assert!(statement.contains("Nat"), "{statement}");
@@ -377,8 +380,8 @@ async fn an_import_root_that_holds_init_is_refused() -> TestResult {
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
 async fn a_build_stops_the_project_workers_before_lake_starts() -> TestResult {
     let chain = project()?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let pid = server.pid()?;
     let client = Client::new(&server.url, "build")?;
     let before = statement(&client, "a", &["Chain.A"]).await?;
@@ -420,8 +423,8 @@ async fn a_build_stops_the_project_workers_before_lake_starts() -> TestResult {
 async fn a_check_sent_during_a_build_waits_and_answers_from_the_new_build() -> TestResult {
     let chain = project()?;
     chain.write("lean-host-mcp.toml", SLOW_BUILD)?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let scratch = Scratch::new(TMP)?;
+    let server = Server::start(&Launch::new(SERVER, &chain.root, &scratch)?, STARTUP).await?;
     let client = Client::new(&server.url, "during")?;
     let before = statement(&client, "a", &["Chain.A"]).await?;
     assert!(before.contains("Nat"), "{before}");
@@ -459,8 +462,8 @@ async fn a_check_sent_during_a_build_waits_and_answers_from_the_new_build() -> T
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
 async fn after_a_kill_during_worker_start_the_next_server_has_every_slot() -> TestResult {
     let chain = project()?;
-    let scratch = Scratch::new()?;
-    let launch = Launch::new(&chain.root, &scratch)?
+    let scratch = Scratch::new(TMP)?;
+    let launch = Launch::new(SERVER, &chain.root, &scratch)?
         .env("LEAN_HOST_MCP_MAX_WORKERS", "2")
         .env("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT", "2");
     let server = Server::start(&launch, STARTUP).await?;

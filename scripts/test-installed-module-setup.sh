@@ -34,9 +34,10 @@ export TMPDIR="$scratch/tmp"
 export LEAN_HOST_MCP_SEMANTIC_CACHE_DIR="$scratch/semantic-cache"
 mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache"
 # Verify the actual archives below with the dependency locks they ship. A checkout's crates are not
-# published yet, so the archives can only be made against it.
+# published yet, so the archives can only be made against it. Name the two published crates: Cargo
+# cannot package the unpublished test helper, whose path dependency has no version.
 local_sdk_enable "$scratch"
-local_sdk_cargo package --workspace --no-verify
+local_sdk_cargo package -p lean-host-mcp-worker -p lean-host-mcp --no-verify
 archives="$CARGO_TARGET_DIR/package"
 pair="$scratch/archives"
 mkdir "$pair"

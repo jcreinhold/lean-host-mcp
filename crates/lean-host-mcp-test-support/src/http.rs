@@ -22,26 +22,27 @@ use tokio::sync::watch;
 
 use super::TestResult;
 
-/// The server binary under test.
-pub(crate) const SERVER: &str = env!("CARGO_BIN_EXE_lean-host-mcp");
-
 /// The protocol the client speaks: one HTTP request per call, no session.
 const PROTOCOL: &str = "2026-07-28";
 
 /// The row states after which a request never changes.
-pub(crate) const FINAL_STATES: [&str; 3] = ["done", "timed_out", "interrupted"];
+pub const FINAL_STATES: [&str; 3] = ["done", "timed_out", "interrupted"];
 
 /// The store a test server keeps, removed when the value drops.
-pub(crate) struct Scratch {
+pub struct Scratch {
     /// The server's store: request table, build logs and child records.
-    pub(crate) store: PathBuf,
+    pub store: PathBuf,
     _store: tempfile::TempDir,
 }
 
 impl Scratch {
-    /// A new, empty store under the target directory.
-    pub(crate) fn new() -> TestResult<Self> {
-        let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    /// A new, empty store in a new directory under `tmp`, such as the suite's
+    /// `CARGO_TARGET_TMPDIR`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the directory cannot be made.
+    pub fn new(tmp: impl AsRef<Path>) -> TestResult<Self> {
         let store = tempfile::Builder::new().prefix("store-").tempdir_in(tmp)?;
         Ok(Self {
             store: store.path().canonicalize()?,
@@ -52,21 +53,29 @@ impl Scratch {
 
 /// How to start a server.
 #[derive(Clone, Debug)]
-pub(crate) struct Launch {
+pub struct Launch {
+    /// The server binary, such as the suite's `CARGO_BIN_EXE_lean-host-mcp`.
+    server: PathBuf,
     /// The Lake root it serves.
-    pub(crate) root: PathBuf,
+    root: PathBuf,
     /// Its store.
-    pub(crate) store: PathBuf,
+    store: PathBuf,
     /// The loopback address it listens on.
-    pub(crate) bind: SocketAddr,
+    bind: SocketAddr,
     /// More environment, set last.
-    pub(crate) envs: Vec<(String, String)>,
+    envs: Vec<(String, String)>,
 }
 
 impl Launch {
-    /// A launch for `root` with the store of `scratch`, on a free port.
-    pub(crate) fn new(root: &Path, scratch: &Scratch) -> TestResult<Self> {
+    /// A launch of the binary `server` for `root` with the store of
+    /// `scratch`, on a free port.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the test cannot bind a loopback socket to find a free port.
+    pub fn new(server: impl AsRef<Path>, root: &Path, scratch: &Scratch) -> TestResult<Self> {
         Ok(Self {
+            server: server.as_ref().to_path_buf(),
             root: root.to_path_buf(),
             store: scratch.store.clone(),
             bind: free_port()?,
@@ -76,13 +85,13 @@ impl Launch {
 
     /// This launch with `name` set to `value` in the server's environment.
     #[must_use]
-    pub(crate) fn env(mut self, name: &str, value: &str) -> Self {
+    pub fn env(mut self, name: &str, value: &str) -> Self {
         self.envs.push((name.to_owned(), value.to_owned()));
         self
     }
 
     /// The MCP endpoint of a server started from this launch.
-    pub(crate) fn url(&self) -> String {
+    pub fn url(&self) -> String {
         format!("http://{}/mcp", self.bind)
     }
 }
@@ -94,18 +103,23 @@ fn free_port() -> TestResult<SocketAddr> {
 }
 
 /// A running server. Dropping it kills the process.
-pub(crate) struct Server {
+pub struct Server {
     child: Child,
     /// Its MCP endpoint.
-    pub(crate) url: String,
+    pub url: String,
     log: Arc<Mutex<String>>,
 }
 
 impl Server {
     /// Start the server of `launch` and wait up to `patience` until it
     /// listens. Recovery runs before that, so a restart may take a while.
-    pub(crate) async fn start(launch: &Launch, patience: Duration) -> TestResult<Self> {
-        let mut command = Command::new(SERVER);
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server cannot start, exits before it listens, or does
+    /// not listen within `patience`; the error holds the server's log.
+    pub async fn start(launch: &Launch, patience: Duration) -> TestResult<Self> {
+        let mut command = Command::new(&launch.server);
         command
             .kill_on_drop(true)
             .current_dir(&launch.root)
@@ -156,25 +170,38 @@ impl Server {
     }
 
     /// The server's log so far.
-    pub(crate) fn log(&self) -> String {
+    pub fn log(&self) -> String {
         self.log.lock().clone()
     }
 
     /// The server's process id.
-    pub(crate) fn pid(&self) -> TestResult<u32> {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server has exited.
+    pub fn pid(&self) -> TestResult<u32> {
         Ok(self.child.id().ok_or("the server has exited")?)
     }
 
     /// Kill the server with SIGKILL, wait until it is gone, and return its log.
-    pub(crate) async fn kill(mut self) -> TestResult<String> {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the signal cannot be sent or the server is not gone within
+    /// 10 seconds.
+    pub async fn kill(mut self) -> TestResult<String> {
         self.child.start_kill()?;
         tokio::time::timeout(Duration::from_secs(10), self.child.wait()).await??;
         Ok(self.log())
     }
 
     /// Stop the server with SIGTERM, wait until it exits, and return its log.
-    /// Fails unless it exits with status 0.
-    pub(crate) async fn stop(mut self) -> TestResult<String> {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the signal cannot be sent, when the server does not exit
+    /// within 2 minutes, or when it exits with a status other than 0.
+    pub async fn stop(mut self) -> TestResult<String> {
         signal("-TERM", self.pid()?)?;
         let status = tokio::time::timeout(Duration::from_mins(2), self.child.wait()).await??;
         if status.success() {
@@ -186,7 +213,7 @@ impl Server {
 }
 
 /// Send `signal`, such as `-TERM`, to process `pid`.
-pub(crate) fn signal(signal: &str, pid: u32) -> TestResult {
+fn signal(signal: &str, pid: u32) -> TestResult {
     let status = std::process::Command::new("kill")
         .arg(signal)
         .arg(pid.to_string())
@@ -216,7 +243,7 @@ async fn keep_log(stderr: ChildStderr, log: Arc<Mutex<String>>, listening: watch
 
 /// A client that sends each call as one HTTP request, with no session.
 #[derive(Clone, Debug)]
-pub(crate) struct Client {
+pub struct Client {
     http: reqwest::Client,
     url: String,
     name: String,
@@ -225,7 +252,11 @@ pub(crate) struct Client {
 
 impl Client {
     /// A client for the endpoint `url` that calls itself `name`.
-    pub(crate) fn new(url: &str, name: &str) -> TestResult<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the HTTP client cannot be built.
+    pub fn new(url: &str, name: &str) -> TestResult<Self> {
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             url: url.to_owned(),
@@ -255,7 +286,13 @@ impl Client {
 
     /// Call `tool` and return the JSON-RPC response, which holds `result` or
     /// `error`.
-    pub(crate) async fn send(&self, tool: &str, arguments: &Value) -> TestResult<Value> {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the request fails, when the reply's HTTP status is not a
+    /// success, or when the reply holds no JSON-RPC message with the call's
+    /// id.
+    pub async fn send(&self, tool: &str, arguments: &Value) -> TestResult<Value> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let response = self
             .http
@@ -280,8 +317,12 @@ impl Client {
         Ok(response)
     }
 
-    /// Call `tool` and return its result. Fails on a JSON-RPC error.
-    pub(crate) async fn call(&self, tool: &str, arguments: &Value) -> TestResult<Value> {
+    /// Call `tool` and return its result.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::send`] does, and on a JSON-RPC error.
+    pub async fn call(&self, tool: &str, arguments: &Value) -> TestResult<Value> {
         let response = self.send(tool, arguments).await?;
         Ok(response
             .get("result")
@@ -290,7 +331,11 @@ impl Client {
     }
 
     /// `lean_run`: the tool result.
-    pub(crate) async fn run_result(&self, id: &str, tool: &str, arguments: &Value) -> TestResult<Value> {
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::call`] does.
+    pub async fn run_result(&self, id: &str, tool: &str, arguments: &Value) -> TestResult<Value> {
         self.call(
             "lean_run",
             &json!({"request_id": id, "tool": tool, "arguments": arguments}),
@@ -299,7 +344,11 @@ impl Client {
     }
 
     /// `lean_run`: start request `id` and return its row.
-    pub(crate) async fn run(&self, id: &str, tool: &str, arguments: &Value) -> TestResult<Value> {
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::call`] does, and when the result holds no row.
+    pub async fn run(&self, id: &str, tool: &str, arguments: &Value) -> TestResult<Value> {
         let result = self.run_result(id, tool, arguments).await?;
         Ok(structured(&result)?
             .get("request")
@@ -308,7 +357,12 @@ impl Client {
     }
 
     /// `lean_get` with a wait of up to `wait_seconds`: `{request, result}`.
-    pub(crate) async fn get(&self, id: &str, wait_seconds: u64) -> TestResult<Value> {
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::call`] does, and when the result has no structured
+    /// content.
+    pub async fn get(&self, id: &str, wait_seconds: u64) -> TestResult<Value> {
         let result = self
             .call("lean_get", &json!({"request_id": id, "wait_seconds": wait_seconds}))
             .await?;
@@ -317,7 +371,12 @@ impl Client {
 
     /// Wait up to `patience` until request `id` ends, and return `lean_get`'s
     /// `{request, result}`.
-    pub(crate) async fn ended(&self, id: &str, patience: Duration) -> TestResult<Value> {
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::get`] does, and when the request does not end within
+    /// `patience`.
+    pub async fn ended(&self, id: &str, patience: Duration) -> TestResult<Value> {
         let until = Instant::now().checked_add(patience).ok_or("patience is too long")?;
         loop {
             let reply = self.get(id, 30).await?;
@@ -331,14 +390,23 @@ impl Client {
     }
 
     /// `lean_runtime`'s structured reply: build, settings and worker activity.
-    pub(crate) async fn runtime(&self) -> TestResult<Value> {
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::call`] does, and when the result has no structured
+    /// content.
+    pub async fn runtime(&self) -> TestResult<Value> {
         let result = self.call("lean_runtime", &json!({})).await?;
         Ok(structured(&result)?.clone())
     }
 
     /// A `curl` process that calls `tool` with `arguments` and waits for the
     /// reply: a client the test can kill.
-    pub(crate) fn process(&self, tool: &str, arguments: &Value) -> TestResult<Child> {
+    ///
+    /// # Errors
+    ///
+    /// Fails when `curl` cannot start.
+    pub fn process(&self, tool: &str, arguments: &Value) -> TestResult<Child> {
         let mut command = Command::new("curl");
         command
             .kill_on_drop(true)
@@ -402,29 +470,33 @@ fn fill_structured(result: &mut Value) {
 }
 
 /// The structured content of a tool result.
-pub(crate) fn structured(result: &Value) -> TestResult<&Value> {
+///
+/// # Errors
+///
+/// Fails when the result has no structured content.
+pub fn structured(result: &Value) -> TestResult<&Value> {
     Ok(result
         .get("structuredContent")
         .ok_or_else(|| format!("no structured content: {result}"))?)
 }
 
 /// The state of the row in a `lean_get` reply.
-pub(crate) fn state(reply: &Value) -> Option<&str> {
+pub fn state(reply: &Value) -> Option<&str> {
     reply.pointer("/request/state").and_then(Value::as_str)
 }
 
 /// Whether the row in a `lean_get` reply has ended.
-pub(crate) fn is_final(reply: &Value) -> bool {
+pub fn is_final(reply: &Value) -> bool {
     state(reply).is_some_and(|state| FINAL_STATES.contains(&state))
 }
 
 /// The code of a request API error in a tool result.
-pub(crate) fn error_code(result: &Value) -> Option<&str> {
+pub fn error_code(result: &Value) -> Option<&str> {
     result.pointer("/structuredContent/error/code").and_then(Value::as_str)
 }
 
 /// The request id a tool result or a JSON-RPC error names.
-pub(crate) fn reply_id(response: &Value) -> Option<&str> {
+pub fn reply_id(response: &Value) -> Option<&str> {
     response
         .pointer("/result/structuredContent/request_id")
         .or_else(|| response.pointer("/error/data/request_id"))
@@ -432,7 +504,7 @@ pub(crate) fn reply_id(response: &Value) -> Option<&str> {
 }
 
 /// The hex SHA-256 of `bytes`, as replies name a checked file's text.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     Sha256::digest(bytes)
         .iter()
@@ -444,14 +516,18 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 /// One row of a request table.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TableRow {
-    pub(crate) id: String,
-    pub(crate) kind: String,
-    pub(crate) state: String,
+pub struct TableRow {
+    pub id: String,
+    pub kind: String,
+    pub state: String,
 }
 
 /// The rows of the request table in `store`, oldest first.
-pub(crate) fn table(store: &Path) -> TestResult<Vec<TableRow>> {
+///
+/// # Errors
+///
+/// Fails when the table cannot be opened or read.
+pub fn table(store: &Path) -> TestResult<Vec<TableRow>> {
     use rusqlite::OpenFlags;
     let path = store.join(lean_host_mcp::requests::store::DATABASE_NAME);
     let db = rusqlite::Connection::open_with_flags(
@@ -474,16 +550,20 @@ pub(crate) fn table(store: &Path) -> TestResult<Vec<TableRow>> {
 
 /// One process, as `ps` lists it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Process {
-    pub(crate) pid: u32,
-    pub(crate) ppid: u32,
+pub struct Process {
+    pub pid: u32,
+    ppid: u32,
     /// Its process group.
-    pub(crate) pgid: u32,
-    pub(crate) command: String,
+    pub pgid: u32,
+    pub command: String,
 }
 
 /// Every process on the machine.
-pub(crate) fn processes() -> TestResult<Vec<Process>> {
+///
+/// # Errors
+///
+/// Fails when `ps` cannot run, fails, or prints text that is not UTF-8.
+pub fn processes() -> TestResult<Vec<Process>> {
     let output = std::process::Command::new("ps")
         .args(["-axwwo", "pid=,ppid=,pgid=,command="])
         .output()?;
@@ -509,12 +589,16 @@ pub(crate) fn processes() -> TestResult<Vec<Process>> {
 }
 
 /// The processes under `pid`, found by parent.
-pub(crate) fn descendants(pid: u32) -> TestResult<Vec<Process>> {
+///
+/// # Errors
+///
+/// Fails as [`processes`] does.
+pub fn descendants(pid: u32) -> TestResult<Vec<Process>> {
     Ok(descendants_in(&processes()?, pid))
 }
 
 /// The processes of `all` under `pid`, found by parent.
-pub(crate) fn descendants_in(all: &[Process], pid: u32) -> Vec<Process> {
+fn descendants_in(all: &[Process], pid: u32) -> Vec<Process> {
     let mut parents = vec![pid];
     let mut found = Vec::new();
     while let Some(parent) = parents.pop() {
@@ -527,7 +611,7 @@ pub(crate) fn descendants_in(all: &[Process], pid: u32) -> Vec<Process> {
 }
 
 /// The workers of `all` under server `server`, at any depth.
-pub(crate) fn worker_processes(all: &[Process], server: u32) -> Vec<Process> {
+pub fn worker_processes(all: &[Process], server: u32) -> Vec<Process> {
     descendants_in(all, server)
         .into_iter()
         .filter(|process| is_worker(&process.command))
@@ -536,7 +620,7 @@ pub(crate) fn worker_processes(all: &[Process], server: u32) -> Vec<Process> {
 
 /// Watch `processes` every 50 ms, for up to `limit` after `since`, and say
 /// how long each lived.
-pub(crate) fn watch_until_gone(processes: &[Process], since: Instant, limit: Duration) -> Vec<String> {
+pub fn watch_until_gone(processes: &[Process], since: Instant, limit: Duration) -> Vec<String> {
     let mut left: Vec<&Process> = processes.iter().collect();
     let mut lines = Vec::new();
     while !left.is_empty() && since.elapsed() < limit {
@@ -573,11 +657,13 @@ pub(crate) fn watch_until_gone(processes: &[Process], since: Instant, limit: Dur
 }
 
 /// The Lake build steps of the server whose store is `store`, even after
-/// that server has died. Each step leads a process group that a file in
-/// `<store>/children/` names. The server's other Lake runs build nothing:
-/// its `setup-file` and `query` runs and its build guard pass `--no-build`,
-/// and it learns the import roots from a bare `lake env`.
-pub(crate) fn lake_builds<'a>(processes: &'a [Process], store: &Path) -> Vec<&'a Process> {
+/// that server has died.
+///
+/// Each step leads a process group that a file in `<store>/children/` names.
+/// The server's other Lake runs build nothing: its `setup-file` and `query`
+/// runs and its build guard pass `--no-build`, and it learns the import roots
+/// from a bare `lake env`.
+pub fn lake_builds<'a>(processes: &'a [Process], store: &Path) -> Vec<&'a Process> {
     let groups: BTreeSet<u32> = std::fs::read_dir(store.join("children"))
         .into_iter()
         .flatten()
@@ -628,7 +714,7 @@ fn is_worker(command: &str) -> bool {
 
 /// The workers server `parent` runs, which count against
 /// `broker.max_workers`.
-pub(crate) fn workers(processes: &[Process], parent: u32) -> Vec<&Process> {
+pub fn workers(processes: &[Process], parent: u32) -> Vec<&Process> {
     processes
         .iter()
         .filter(|process| process.ppid == parent && is_worker(&process.command))
@@ -636,7 +722,7 @@ pub(crate) fn workers(processes: &[Process], parent: u32) -> Vec<&Process> {
 }
 
 /// Whether a check's reply says that an import is missing or not built.
-pub(crate) fn names_missing_import(text: &str) -> bool {
+pub fn names_missing_import(text: &str) -> bool {
     let text = text.to_lowercase();
     [
         "needs_build",

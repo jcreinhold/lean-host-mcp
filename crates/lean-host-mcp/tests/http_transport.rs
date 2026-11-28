@@ -2,8 +2,6 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 
-mod support;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::net::{SocketAddr, TcpListener};
@@ -13,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use lean_host_mcp_test_support as support;
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

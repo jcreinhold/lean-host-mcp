@@ -2,13 +2,12 @@
 //! sees a dependency that `lean_build` rebuilt.
 //! Set `LEAN_HOST_MCP_TEST_FIXTURE` or `LEAN_SYSROOT` and install its matching worker.
 
-mod support;
-
 use lean_host_mcp::build::BuildRequest;
 use lean_host_mcp::tools::build::lean_build;
 use lean_host_mcp::tools::semantic::{SemanticResponse, SemanticToolRequest, lean_status};
 use lean_host_mcp::tools::{ToolConfig, ToolContext, as_call};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectRuntimeConfig};
+use lean_host_mcp_test_support as support;
 use serde_json::{Value, json};
 use support::TestResult;
 use support::chain::{Chain, chain_project};
@@ -70,7 +69,7 @@ fn assert_evaluated(response: &SemanticResponse<Value>, expected: &str) -> TestR
 #[tokio::test]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT and a matching installed worker"]
 async fn unchanged_query_sees_a_rebuilt_dependency() -> TestResult {
-    let chain = chain_project()?;
+    let chain = chain_project(env!("CARGO_TARGET_TMPDIR"))?;
     chain.write("Chain/Query.lean", "import Dep\n#eval dep\n")?;
     let ctx = ToolContext {
         broker: ProjectBroker::new_with_runtime_config(

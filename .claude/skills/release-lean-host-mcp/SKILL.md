@@ -40,9 +40,9 @@ Test the packaged pair and the search path:
 scripts/test-installed-module-setup.sh
 ```
 
-The smoke test runs `cargo package --workspace --locked` before installing from the unpacked archives. Check the parent
-archive for its crate-local README and the worker archive for Cargo.lock, as Verify does. External SDK and semantic
-dependencies must resolve from the configured registry.
+The smoke test runs `cargo package --locked -p lean-host-mcp-worker -p lean-host-mcp` before installing from the
+unpacked archives. Check the parent archive for its crate-local README and the worker archive for Cargo.lock, as Verify
+does. External SDK and semantic dependencies must resolve from the configured registry.
 
 Confirm `CARGO_REGISTRY_TOKEN` is configured for the workflow without printing its value. Dispatch the workflow from
 `main` to rehearse verification and packaging. Present the exact release commit, matching `vX.Y.Z` tag, changelog, and

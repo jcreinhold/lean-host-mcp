@@ -10,8 +10,6 @@
     clippy::significant_drop_tightening
 )]
 
-mod support;
-
 use std::path::PathBuf;
 
 use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectHint};

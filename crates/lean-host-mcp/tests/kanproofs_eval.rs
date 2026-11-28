@@ -9,8 +9,6 @@
     reason = "manual ignored field-eval harness prints compact JSON summaries and keeps one ToolContext per run"
 )]
 
-mod support;
-
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

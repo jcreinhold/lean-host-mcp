@@ -7,8 +7,6 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
-mod support;
-
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;

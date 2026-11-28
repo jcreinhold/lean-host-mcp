@@ -1,11 +1,13 @@
-//! Helpers the integration suites share: the fixture's Lean sysroot, the
-//! installed worker the tests name, the chain project (`chain`), the HTTP
-//! server harness (`http`), and the response sizes the smoke and performance
-//! baselines report against.
-
-// Each integration suite compiles its own copy of this module, so any item not
-// used by *that* suite reads as dead there. Expected by construction.
-#![allow(dead_code)]
+//! Helpers that lean-host-mcp's integration suites share: the fixture's Lean
+//! sysroot, the installed worker the tests name, the chain project (`chain`),
+//! the HTTP server harness (`http`), and the response sizes the smoke and
+//! performance baselines report against.
+//!
+//! lean-host-mcp takes this unpublished crate as a dev-dependency. Cargo sets
+//! `CARGO_BIN_EXE_lean-host-mcp` and `CARGO_TARGET_TMPDIR` only while it
+//! compiles that crate's integration tests and benches, so a suite passes them
+//! in: the server binary to `http::Launch::new`, and the directory for scratch
+//! files to `chain::chain_project` and `http::Scratch::new`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,11 +15,13 @@ use std::process::Command;
 
 use lean_host_mcp::ToolchainId;
 
-pub(crate) mod chain;
+pub mod chain;
 #[cfg(unix)]
-pub(crate) mod http;
+pub mod http;
 
-pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+/// The result of a test or a helper: any error fails the test with its
+/// message.
+pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// The Lean sysroot and `lean-toolchain` pin the ignored toolchain tests use:
 /// the fixture's pin from `LEAN_HOST_MCP_TEST_FIXTURE`, or the version of the
@@ -63,7 +67,11 @@ pub(crate) fn sysroot_and_pin() -> TestResult<(PathBuf, String)> {
 /// tree under test: a suite can pass, or measure other behaviour, against a
 /// worker built months earlier. One worker-memory measurement here was lost
 /// that way.
-pub(crate) fn installed_workers_dir() -> TestResult<PathBuf> {
+///
+/// # Errors
+///
+/// Fails when `LEAN_HOST_MCP_WORKERS_DIR` is not set.
+pub fn installed_workers_dir() -> TestResult<PathBuf> {
     let dir =
         std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
     Ok(PathBuf::from(dir))
@@ -71,11 +79,11 @@ pub(crate) fn installed_workers_dir() -> TestResult<PathBuf> {
 
 /// Lower end of the intended normal response-size range for model-controlled
 /// MCP calls.
-pub(crate) const MODEL_RESPONSE_TARGET_MIN_BYTES: usize = 16 * 1024;
+pub const MODEL_RESPONSE_TARGET_MIN_BYTES: usize = 16 * 1024;
 
 /// Upper end of the intended normal response-size range for model-controlled
 /// MCP calls.
-pub(crate) const MODEL_RESPONSE_TARGET_MAX_BYTES: usize = 32 * 1024;
+pub const MODEL_RESPONSE_TARGET_MAX_BYTES: usize = 32 * 1024;
 
 /// Default hard budget for ordinary model-facing MCP responses.
-pub(crate) const MODEL_RESPONSE_HARD_BUDGET_BYTES: usize = 64 * 1024;
+pub const MODEL_RESPONSE_HARD_BUDGET_BYTES: usize = 64 * 1024;

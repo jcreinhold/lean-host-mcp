@@ -5,10 +5,10 @@
 # is current. Lake decides where outputs live and whether they are current, so
 # ask Lake instead (docs/architecture.md, "Lake's answers").
 #
-# Shipped code is each crate's `src/` above `mod tests`, which clippy's
-# `items_after_test_module` keeps last, without the test-only `*tests.rs`
-# modules, plus the Lean programs the server runs. Tests may build a fake Lake
-# layout.
+# Shipped code is each published crate's `src/` above `mod tests`, which
+# clippy's `items_after_test_module` keeps last, without the test-only
+# `*tests.rs` modules, plus the Lean programs the server runs. Tests, and the
+# unpublished crate of helpers they share, may build a fake Lake layout.
 #
 # No pattern looks for these, which ask Lake nothing:
 # - `lake-manifest.json` by name. The server hashes and stats it to notice a
@@ -47,7 +47,7 @@ while IFS= read -r -d '' file; do
 		files+=("$file")
 	fi
 done < <(git ls-files -z --cached --others --exclude-standard -- 'crates/*/src/*.rs' 'crates/*/src/*.lean' \
-	':(exclude)crates/*/src/*tests.rs')
+	':(exclude)crates/*/src/*tests.rs' ':(exclude)crates/lean-host-mcp-test-support')
 if ((${#files[@]} == 0)); then
 	printf 'found no shipped source to check\n' >&2
 	exit 2

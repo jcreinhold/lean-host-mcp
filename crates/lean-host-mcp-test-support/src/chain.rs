@@ -2,22 +2,27 @@
 //! imports `Chain.A` and `Dep` from a path dependency in `dep/`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{TestResult, sysroot_and_pin};
 
-/// A built chain project in a temporary directory under the test target. The
-/// directory goes when the value drops.
-pub(crate) struct Chain {
-    pub(crate) root: PathBuf,
-    pub(crate) sysroot: PathBuf,
+/// A built chain project in a temporary directory. The directory goes when
+/// the value drops.
+pub struct Chain {
+    /// The project's Lake root.
+    pub root: PathBuf,
+    sysroot: PathBuf,
     _dir: tempfile::TempDir,
 }
 
 impl Chain {
     /// Write `text` to `relative` under the root.
-    pub(crate) fn write(&self, relative: &str, text: &str) -> TestResult {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file or its parent directory cannot be written.
+    pub fn write(&self, relative: &str, text: &str) -> TestResult {
         let path = self.root.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -27,8 +32,13 @@ impl Chain {
     }
 
     /// Run the toolchain's `lake` with `args` in the root, outside the server,
-    /// with the environment a build step gets. Fails unless Lake passes.
-    pub(crate) fn lake(&self, args: &[&str]) -> TestResult {
+    /// with the environment a build step gets.
+    ///
+    /// # Errors
+    ///
+    /// Fails when Lake cannot start or does not pass; the error holds Lake's
+    /// output.
+    pub fn lake(&self, args: &[&str]) -> TestResult {
         let output = Command::new(self.sysroot.join("bin/lake"))
             .args(args)
             .current_dir(&self.root)
@@ -49,7 +59,7 @@ impl Chain {
     }
 
     /// The `.olean` Lake builds for module `module` of the root package.
-    pub(crate) fn olean(&self, module: &str) -> PathBuf {
+    pub fn olean(&self, module: &str) -> PathBuf {
         self.root
             .join(".lake/build/lib/lean")
             .join(module.replace('.', "/"))
@@ -81,10 +91,16 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Write a chain project with the fixture's toolchain and build it.
-pub(crate) fn chain_project() -> TestResult<Chain> {
+/// Write a chain project with the fixture's toolchain in a new directory under
+/// `tmp`, such as the suite's `CARGO_TARGET_TMPDIR`, and build it.
+///
+/// # Errors
+///
+/// Fails when neither `LEAN_HOST_MCP_TEST_FIXTURE` nor `LEAN_SYSROOT` names a
+/// Lean, when a file cannot be written, or when `lake build` fails.
+pub fn chain_project(tmp: impl AsRef<Path>) -> TestResult<Chain> {
     let (sysroot, pin) = sysroot_and_pin()?;
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let dir = tempfile::tempdir_in(tmp)?;
     let chain = Chain {
         root: dir.path().canonicalize()?,
         sysroot: sysroot.canonicalize()?,

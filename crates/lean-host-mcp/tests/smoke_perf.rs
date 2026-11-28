@@ -10,14 +10,13 @@
 // tell the developer which measured call stopped producing usable data.
 #![allow(clippy::expect_used, clippy::panic)]
 
-mod support;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use lean_host_mcp_test_support as support;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

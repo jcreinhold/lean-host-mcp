@@ -5,8 +5,6 @@
 //! `LEAN_SYSROOT` to run them; the tests that check files also need a worker
 //! installed for the fixture's toolchain.
 
-mod support;
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroUsize;
@@ -18,6 +16,7 @@ use lean_host_mcp::tools::build::{ImportsError, ImportsReply, ImportsRequest, le
 use lean_host_mcp::tools::semantic::{SemanticResponse, SemanticToolRequest, lean_status, lean_trial, lean_verify};
 use lean_host_mcp::tools::{ToolConfig, ToolContext, as_call};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectRuntimeConfig, TrustStatus};
+use lean_host_mcp_test_support as support;
 use serde_json::{Value, json};
 use support::TestResult;
 use support::chain::{Chain, chain_project};
@@ -49,7 +48,7 @@ const PATIENCE: Duration = Duration::from_mins(2);
 /// A built chain project with [`CONFIG`], and a context set up as the server
 /// sets itself up for `--lake-root` there.
 fn project() -> TestResult<(Chain, ToolContext)> {
-    let chain = chain_project()?;
+    let chain = chain_project(env!("CARGO_TARGET_TMPDIR"))?;
     chain.write("lean-host-mcp.toml", CONFIG)?;
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {

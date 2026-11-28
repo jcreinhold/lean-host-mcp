@@ -22,14 +22,13 @@
 
 #![cfg(unix)]
 
-mod support;
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use lean_host_mcp_test_support as support;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use support::TestResult;
@@ -37,6 +36,10 @@ use support::chain::chain_project;
 use support::http::{self, Client, Launch, Scratch, Server};
 use tokio::task::JoinHandle;
 
+/// The server binary Cargo built for this test run.
+const SERVER: &str = env!("CARGO_BIN_EXE_lean-host-mcp");
+/// The directory Cargo gives this suite for scratch files.
+const TMP: &str = env!("CARGO_TARGET_TMPDIR");
 const CHECK_CLIENTS: usize = 8;
 const BUILD_CLIENTS: usize = 4;
 /// Requests each client sends, one after another.
@@ -127,11 +130,11 @@ async fn many_clients_share_one_project() -> TestResult {
 
 async fn on_fixture() -> TestResult {
     std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
-    let chain = chain_project()?;
+    let chain = chain_project(TMP)?;
     chain.write("lean-host-mcp.toml", CONFIG)?;
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new(TMP)?;
     let max = MAX_WORKERS.to_string();
-    let launch = Launch::new(&chain.root, &scratch)?
+    let launch = Launch::new(SERVER, &chain.root, &scratch)?
         .env("LEAN_HOST_MCP_MAX_WORKERS", &max)
         .env("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT", &max);
     let server = Server::start(&launch, RESTART).await?;

@@ -14,8 +14,6 @@
     clippy::arithmetic_side_effects
 )]
 
-mod support;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 

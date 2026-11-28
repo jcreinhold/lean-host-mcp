@@ -974,6 +974,7 @@ dependencies = [
  "clap",
  "criterion",
  "dirs",
+ "lean-host-mcp-test-support",
  "lean-host-mcp-worker",
  "lean-rs-worker-parent",
  "lean-rs-worker-protocol",
@@ -1001,6 +1002,20 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "lean-host-mcp-test-support"
+version = "0.19.1"
+dependencies = [
+ "lean-host-mcp",
+ "parking_lot",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

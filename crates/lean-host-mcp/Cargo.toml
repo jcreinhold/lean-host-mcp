@@ -93,6 +93,8 @@ rustix = { version = "1", features = ["event", "fs", "process"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+# Unpublished: with no version, Cargo leaves it out of the published manifest.
+lean-host-mcp-test-support = { path = "../lean-host-mcp-test-support" }
 reqwest = { version = "0.13", default-features = false }
 serial_test = "4"
 tokio = { version = "1", features = ["process", "test-util"] }
