@@ -263,7 +263,7 @@ pub(crate) async fn run_build(
             .ok_or_else(|| ServerError::Internal("build deadline is out of range".to_owned()))?;
         let sysroot = crate::toolchain::ToolchainId::from_lake_root(root)
             .and_then(|toolchain| toolchain.elan_dir())
-            .map_err(|error| ServerError::BadProject(error.to_string()))?
+            .map_err(crate::error::invalid)?
             .canonicalize()?;
         let mut capped = CappedLog::open(log, plan.log_limit)?;
         capped.append(format!("[lean-host-mcp: build {id} in {}]\n", root.display()).as_bytes())?;

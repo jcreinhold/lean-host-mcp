@@ -82,7 +82,7 @@ impl SemanticProofSearchRequest {
             goal: &self.goal,
             declarations: self.declarations(),
         })
-        .map_err(|e| ServerError::BadProject(e.to_string()))?;
+        .map_err(crate::error::invalid)?;
         if body.len() > 16 * 1024 * 1024 {
             return Err(ServerError::BadProject(
                 "semantic feature request exceeds adapter bound".into(),

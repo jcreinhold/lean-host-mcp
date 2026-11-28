@@ -311,7 +311,7 @@ impl WorkerBinary {
     pub(crate) fn selected_dir(slot: &Path) -> std::io::Result<PathBuf> {
         use std::io::Read as _;
         let selector = slot.join("current-generation");
-        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid installed worker generation");
+        let invalid = || crate::error::invalid_data("invalid installed worker generation");
         match std::fs::symlink_metadata(&selector) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(slot.to_owned()),
             Ok(meta) if meta.is_file() && meta.len() <= 80 => {}
@@ -808,10 +808,7 @@ impl WorkerSidecar {
 
     pub(crate) fn complete(&mut self, digest: &str, smoke: SmokeOutcome) -> std::io::Result<()> {
         if self.deployment.as_ref().is_none_or(|d| d.worker_sha256 != digest) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "candidate worker changed during smoke",
-            ));
+            return Err(crate::error::invalid_data("candidate worker changed during smoke"));
         }
         self.smoke = Some(smoke);
         Ok(())

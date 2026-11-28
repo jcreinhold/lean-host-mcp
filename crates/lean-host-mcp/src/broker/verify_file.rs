@@ -3,15 +3,12 @@
 //! setup that `lake setup-file` prints for the file.
 use super::{
     BrokerCall, Duration, LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
-    LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError,
-    reader_freshness,
+    LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, reader_freshness,
 };
+use crate::error::invalid;
 use serde::Deserialize;
 use std::{fs, io};
 
-fn invalid(message: impl std::fmt::Display) -> ServerError {
-    ServerError::BadProject(message.to_string())
-}
 fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     if path.canonicalize()? != path || !fs::symlink_metadata(path)?.is_file() {
         return Err(invalid("noncanonical prepared file"));

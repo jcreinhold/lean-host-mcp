@@ -989,7 +989,7 @@ struct ActorConfig {
 /// ([`crate::toolchain::workers_dir`]). Every refusal is one line that ends
 /// with the command that fixes it.
 pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf, Vec<String>)> {
-    let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
+    let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(crate::error::invalid)?;
     let dir = crate::toolchain::workers_dir(&meta.canonical_root, None).map_err(ServerError::BadProject)?;
     let fix = crate::toolchain::install_fix(&meta.canonical_root);
     let worker = format!("worker for leanprover/lean4:{toolchain_id} in {}", dir.display());
@@ -2523,9 +2523,7 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
             })
             .collect::<Result<Vec<_>>>()?;
         let input = serde_json::to_string(&roots).map_err(|error| ServerError::Internal(error.to_string()))?;
-        child = child
-            .application_launch_input(&input)
-            .map_err(|error| ServerError::BadProject(error.to_string()))?;
+        child = child.application_launch_input(&input).map_err(crate::error::invalid)?;
     }
     Ok(child)
 }

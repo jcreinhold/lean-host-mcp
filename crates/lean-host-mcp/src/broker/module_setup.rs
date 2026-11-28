@@ -2,6 +2,7 @@
 //! frame, including import visibility, plugin entry points and compiler
 //! options.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
+use crate::error::{invalid, invalid_data};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -17,10 +18,6 @@ const MODULE_SOURCES: &str = "Lake module sources";
 /// Lake's exit code when `--no-build` meets a target it would have to rebuild
 /// (`noBuildCode`, `Lake/Build/Run.lean`).
 const NO_BUILD_EXIT: i32 = 3;
-
-fn invalid(reason: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, reason)
-}
 
 /// The setup Lake printed, or [`ServerError::OutOfDate`] naming the targets
 /// Lake would have to rebuild first.
@@ -79,7 +76,7 @@ impl Identity {
         use std::os::unix::fs::MetadataExt as _;
         let m = fs::symlink_metadata(path)?;
         if !m.is_file() || path.canonicalize()? != path {
-            return Err(invalid("setup file no longer canonical"));
+            return Err(invalid_data("setup file no longer canonical"));
         }
         Ok(Self(m.dev(), m.ino(), m.len(), m.ctime(), m.ctime_nsec()))
     }
@@ -108,13 +105,13 @@ impl StagedSetup {
     /// this server that replaced an import.
     pub(super) fn check(&self, root: &Path, sysroot: &Path) -> io::Result<()> {
         if self.sysroot != sysroot || self.packages != crate::lake_meta::manifest_package_roots(root) {
-            return Err(invalid(
+            return Err(invalid_data(
                 "the project's packages or toolchain changed after Lake's setup",
             ));
         }
         for (p, identity) in &self.inputs {
             if Identity::read(p)? != *identity {
-                return Err(invalid("a file Lake's setup names changed after Lake answered"));
+                return Err(invalid_data("a file Lake's setup names changed after Lake answered"));
             }
         }
         Ok(())
@@ -124,29 +121,31 @@ impl StagedSetup {
 /// The `count` paths `lake query --json` printed, one JSON string a line, as
 /// canonical paths.
 fn parse_sources(stdout: &[u8], count: usize) -> io::Result<Vec<PathBuf>> {
-    let text = std::str::from_utf8(stdout).map_err(|_| invalid("Lake module sources are not UTF-8"))?;
+    let text = std::str::from_utf8(stdout).map_err(|_| invalid_data("Lake module sources are not UTF-8"))?;
     let sources = text
         .lines()
         .map(|line| {
-            let path: PathBuf =
-                serde_json::from_str(line).map_err(|error| invalid(&format!("invalid Lake module source: {error}")))?;
+            let path: PathBuf = serde_json::from_str(line)
+                .map_err(|error| invalid_data(format!("invalid Lake module source: {error}")))?;
             path.canonicalize()
         })
         .collect::<io::Result<Vec<_>>>()?;
     if sources.len() != count {
-        return Err(invalid("Lake named a different number of module sources than asked"));
+        return Err(invalid_data(
+            "Lake named a different number of module sources than asked",
+        ));
     }
     Ok(sources)
 }
 
 fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
     if bytes.len() > crate::lean_run::PROGRAM_OUTPUT_LIMIT {
-        return Err(invalid("Lake module setup exceeds capture limit"));
+        return Err(invalid_data("Lake module setup exceeds capture limit"));
     }
     let setup: ModuleSetup =
-        serde_json::from_slice(bytes).map_err(|error| invalid(&format!("invalid Lake module setup: {error}")))?;
+        serde_json::from_slice(bytes).map_err(|error| invalid_data(format!("invalid Lake module setup: {error}")))?;
     if setup.name.is_empty() {
-        return Err(invalid("missing Lake module name"));
+        return Err(invalid_data("missing Lake module name"));
     }
     Ok(setup)
 }
@@ -168,7 +167,7 @@ pub(crate) fn stage(
             || !p.is_file()
             || !(p.starts_with(&release_lib) || packages.iter().any(|r| p.starts_with(r.join(".lake/build"))))
         {
-            return Err(invalid(
+            return Err(invalid_data(
                 "Lake setup artifact outside the project's package outputs or the selected release",
             ));
         }
@@ -181,7 +180,7 @@ pub(crate) fn stage(
             || parts.first().is_none_or(|oleans| oleans.is_empty() || oleans.len() > 3)
             || parts.get(1).is_some_and(|ir| ir.len() > 2)
         {
-            return Err(invalid("unsupported Lake import artifact layout"));
+            return Err(invalid_data("unsupported Lake import artifact layout"));
         }
         for path in parts.iter().flatten() {
             validate(path)?;
@@ -195,7 +194,7 @@ pub(crate) fn stage(
             Plugin::Path(p) => validate(p)?,
             Plugin::Named { path, init_fn } => {
                 if init_fn.as_ref().is_some_and(String::is_empty) {
-                    return Err(invalid("empty plugin initializer"));
+                    return Err(invalid_data("empty plugin initializer"));
                 }
                 validate(path)?;
             }
@@ -319,17 +318,13 @@ impl ProjectBroker {
         args: Vec<OsString>,
         accepted: &'static [i32],
     ) -> Result<(PathBuf, crate::lake_options::ReaderOutput)> {
-        let id =
-            crate::toolchain::ToolchainId::from_lake_root(root).map_err(|e| ServerError::BadProject(e.to_string()))?;
+        let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(invalid)?;
         if id.window_verdict() != crate::toolchain::WindowVerdict::Supported {
             return Err(ServerError::BadProject(format!(
                 "{label} needs a supported toolchain, not {id}"
             )));
         }
-        let sysroot = id
-            .elan_dir()
-            .map_err(|e| ServerError::BadProject(e.to_string()))?
-            .canonicalize()?;
+        let sysroot = id.elan_dir().map_err(invalid)?.canonicalize()?;
         let activity = self.preparation_activity();
         let lake = sysroot.join("bin/lake");
         let cwd = root.to_owned();

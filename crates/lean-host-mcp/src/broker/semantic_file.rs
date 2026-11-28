@@ -2,8 +2,9 @@
 //! ([`crate::lean_run`]) runs the semantic feature driver with the module
 //! setup that `lake setup-file` prints for that file.
 use super::verify_file::PreparedReader;
-use super::{BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError, reader_freshness};
+use super::{BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, reader_freshness};
 use crate::cancellation::CallCancellation;
+use crate::error::invalid;
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
 use std::{
@@ -11,10 +12,6 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-
-fn invalid(error: impl std::fmt::Display) -> ServerError {
-    ServerError::BadProject(error.to_string())
-}
 
 impl ProjectBroker {
     /// Rank declarations that may close the goal at one proof position.
