@@ -1,28 +1,19 @@
-//! What a project-scope `find_references` actually costs, and where.
+//! What a project-scope `find_references` costs, and where.
 //!
-//! `find_references` with `scope = project` answers from the on-disk `.ilean`
-//! reference index rather than the worker, so its cost is entirely file I/O and
-//! JSON parsing. Nothing measured it. The one number on record —
-//! "~565 ms over a 500-module project" (`docs/architecture.md#reference-indices`)
-//! — is a single wall-clock sample from an `#[ignore]`d test, taken on a corpus
-//! about a third the size of a real one, and it is the sole justification for
-//! the reader being serial.
+//! `find_references` with `scope = project` answers from the `.ilean` indexes
+//! that `lake build` writes, not from a worker: it reads and parses every
+//! index, then runs one `lake query` for the sources of the modules with hits.
+//! Parsing takes most of the time, so the arms split the scan from the rest.
+//! `docs/architecture.md#reference-indices` records the current figure.
 //!
-//! A phase split over `~/Code/kan-proofs` (1431 `.ilean` files, 76 MB) puts the
-//! cost decisively in one place: `stat` every file 0.010 s, read every byte
-//! 0.066 s, **parse 1.32 s**. So the arms here are built to separate parse cost
-//! from result construction, because that is the distinction any fix has to
-//! move:
-//!
-//! - `whole_project` — the documented worst case: the most-referenced name in
-//!   the corpus. Parse plus the full hit set.
-//! - `whole_project_no_hits` — a name that cannot occur. Identical I/O and
-//!   identical parsing, zero results, so the gap between this arm and the one
-//!   above is what result construction costs and everything else is the scan
-//!   floor.
-//! - `narrowed_single_file` — the same query restricted to one file. Today this
-//!   reads the whole project anyway and filters afterwards, so it should track
-//!   `whole_project`; the point of the arm is that it stops doing so.
+//! - `whole_project` — a name with many hits: every index parsed, one
+//!   `lake query`, and the full hit set.
+//! - `whole_project_no_hits` — a name that cannot occur: the same reads and the
+//!   same parsing, but no hits, so no `lake query`. The gap between this arm
+//!   and the one above is the query and the reply; the rest is the scan.
+//! - `narrowed_single_file` — the same query restricted to one file. The reader
+//!   still parses every index and filters afterwards, so this arm tracks
+//!   `whole_project` until the reader reads only the files a request names.
 //!
 //! Gated on `LEAN_HOST_MCP_BENCH_FIXTURE` (falling back to
 //! `LEAN_HOST_MCP_TEST_FIXTURE`): a no-op when unset, so `cargo bench` still
@@ -50,8 +41,7 @@ use lean_host_mcp::tools::{ToolConfig, ToolContext};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, ResponseStatus};
 use tokio::runtime::Runtime;
 
-/// The most-referenced name in the kan-proofs corpus (9095 hits) and the
-/// documented worst case. Reachable from core in any Lean project.
+/// A name with many hits that every Lean project reaches through core.
 const DEFAULT_HOT_NAME: &str = "Fin";
 
 /// Cannot be a Lean identifier, so it matches nothing while costing the same
