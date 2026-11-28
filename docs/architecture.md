@@ -328,7 +328,9 @@ The reply comes from the last build, and its `ilean` / `project` trust row says 
 does not compare the indexes with current sources. It once compared each contributing source's mtime with its index's.
 Lake's own answer, `lake build --no-build` on the modules with hits, walks the import closure of each one and costs as
 much as the lookup or more (see below), so the reply makes no check. The declaration inventory still compares one
-module's source and index mtimes before it adds the index's declarations to a source outline.
+module's source and index mtimes before it adds the index's declarations to a source outline. It keeps that check
+because those rows carry spans in the source that was built, so after an edit they would point at the wrong text; a
+stale index only costs the outline its extra rows, and Lake's check would add about 1 s for one Proofs module.
 
 A `files` restriction filters hits by the source Lake names; every index is still read. The recursive walk covers the
 project's build directory, excluding dependency indices under `.lake/packages/`.
