@@ -214,11 +214,9 @@ pub(crate) fn session_expectation(
     toolchain: &str,
     contract: Option<&ExpectedContract>,
 ) -> Result<LeanWorkerHostRuntimeExpectation, String> {
-    let label = toolchain.strip_prefix("leanprover/lean4:").unwrap_or(toolchain);
-    let version = label.strip_prefix('v').unwrap_or(label);
-    let entry = lean_toolchain::SUPPORTED_TOOLCHAINS
-        .iter()
-        .find(|entry| entry.versions.contains(&version))
+    let id = crate::toolchain::ToolchainId::parse(toolchain).map_err(|error| error.to_string())?;
+    let entry = id
+        .supported()
         .ok_or_else(|| format!("native compatibility requires a supported pinned Lean toolchain: {toolchain}"))?;
     let compiled = ExpectedContract::compiled()?;
     if contract.is_some_and(|contract| contract != &compiled) {
@@ -226,7 +224,7 @@ pub(crate) fn session_expectation(
     }
     Ok(LeanWorkerHostRuntimeExpectation {
         compiled_header_sha256: Some(entry.header_digest.to_owned()),
-        runtime_lean_version: Some(version.to_owned()),
+        runtime_lean_version: Some(id.lean_version().to_owned()),
         checked_host_bindings: compiled.required_host_bindings,
     })
 }

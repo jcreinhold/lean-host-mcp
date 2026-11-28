@@ -93,14 +93,9 @@ struct SetupVerdict {
     outcome: LeanWorkerDeclarationVerificationBatchResult,
 }
 
-fn selected_lean_version(toolchain: &str) -> &str {
-    let label = toolchain.strip_prefix("leanprover/lean4:").unwrap_or(toolchain);
-    label.strip_prefix('v').unwrap_or(label)
-}
-
-fn decode_setup_verdict(bytes: &[u8], toolchain: &str) -> Result<SetupVerdict> {
+fn decode_setup_verdict(bytes: &[u8], expected_lean_version: &str) -> Result<SetupVerdict> {
     let frame: SetupVerdict = serde_json::from_slice(bytes).map_err(invalid)?;
-    if frame.runtime_lean_version != selected_lean_version(toolchain) {
+    if frame.runtime_lean_version != expected_lean_version {
         return Err(invalid("executing Lean version differs from the selected toolchain"));
     }
     Ok(frame)
@@ -121,6 +116,7 @@ impl ProjectBroker {
         };
         let root = self.resolve(&hint)?;
         let meta = self.meta(&root)?;
+        let toolchain = crate::toolchain::ToolchainId::parse(&meta.toolchain).map_err(invalid)?;
         let file = PathBuf::from(&options.file_label);
         if !file.starts_with(&root)
             || file.canonicalize()? != file
@@ -155,7 +151,7 @@ impl ProjectBroker {
             "optionsJson": lean_toolchain::lean_options_json(&options.lean_options),
             "heartbeats": options.heartbeat_limit,
             "diagnosticBytes": options.diagnostic_byte_limit,
-            "expectedRuntimeVersion": selected_lean_version(&meta.toolchain),
+            "expectedRuntimeVersion": toolchain.lean_version(),
         }))
         .map_err(invalid)?;
         let entry = {
@@ -182,7 +178,7 @@ impl ProjectBroker {
             .await?;
         let mut runtime = RuntimeFacts::default();
         let mut freshness = short_run_freshness(&meta, freshness);
-        let frame = decode_setup_verdict(&bytes, &freshness.lean_toolchain)?;
+        let frame = decode_setup_verdict(&bytes, toolchain.lean_version())?;
         if matches!(frame.outcome, LeanWorkerDeclarationVerificationBatchResult::Ok { .. }) {
             runtime.cli_file_verification = Some(Box::new(crate::envelope::CliFileVerification {
                 schema: "lean-host-cli-file-verification-v1",

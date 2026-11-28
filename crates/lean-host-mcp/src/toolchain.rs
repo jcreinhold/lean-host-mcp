@@ -213,6 +213,20 @@ impl ToolchainId {
         &self.0
     }
 
+    /// The Lean version this pin names: the id without one leading `v`
+    /// (`v4.31.0-rc1` gives `4.31.0-rc1`, the form lean-rs tabulates and Lean
+    /// reports at run time).
+    #[must_use]
+    pub fn lean_version(&self) -> &str {
+        self.0.strip_prefix('v').unwrap_or(&self.0)
+    }
+
+    /// The lean-rs supported-window entry for this pin, if it is in the window.
+    #[must_use]
+    pub fn supported(&self) -> Option<&'static lean_toolchain::SupportedToolchain> {
+        lean_toolchain::supported_for(self.lean_version())
+    }
+
     /// Total-order key for presenting toolchains in a sensible order: numbered
     /// releases sorted semantically (a release candidate sorts *before* its
     /// release, e.g. `v4.31.0-rc1 < v4.31.0`), then non-numbered pins
@@ -224,8 +238,7 @@ impl ToolchainId {
     /// `v4.31.0-rc1` *after* `v4.31.0` (the release is a prefix of the rc).
     #[must_use]
     pub fn sort_key(&self) -> (u8, (u32, u32, u32, u8, u32), String) {
-        let bare = self.0.strip_prefix('v').unwrap_or(&self.0);
-        match version_key(bare) {
+        match version_key(self.lean_version()) {
             Some(k) => (0, k, String::new()),
             None => (1, (0, 0, 0, 0, 0), self.0.clone()),
         }
@@ -233,10 +246,9 @@ impl ToolchainId {
 
     /// Classify this pin against the lean-rs supported window.
     ///
-    /// Pure: reads only [`lean_toolchain::SUPPORTED_TOOLCHAINS`], no IO. The
-    /// single leading `v` is stripped before the query (`v4.31.0-rc1` ⇒
-    /// `4.31.0-rc1`, the bare form lean-rs tabulates). A pin that does not
-    /// parse as `X.Y.Z[-rcN]` (e.g. `nightly-2026-05-20`) is
+    /// Pure: reads only [`lean_toolchain::SUPPORTED_TOOLCHAINS`], no IO, and
+    /// queries it with [`Self::lean_version`]. A pin that does not parse as
+    /// `X.Y.Z[-rcN]` (e.g. `nightly-2026-05-20`) is
     /// [`WindowVerdict::Unknown`] — allowed, never a crash.
     ///
     /// Used by `install-worker` *before* it spends minutes building (the
@@ -244,11 +256,10 @@ impl ToolchainId {
     /// gate cannot answer), by `--list`, and internally by the gate.
     #[must_use]
     pub fn window_verdict(&self) -> WindowVerdict {
-        let bare = self.0.strip_prefix('v').unwrap_or(&self.0);
-        if lean_toolchain::supported_for(bare).is_some() {
+        if self.supported().is_some() {
             return WindowVerdict::Supported;
         }
-        match version_key(bare) {
+        match version_key(self.lean_version()) {
             Some(pin) => {
                 let (window, nearest) = out_of_window_bounds(pin);
                 WindowVerdict::OutOfWindow { window, nearest }
@@ -1089,6 +1100,19 @@ mod tests {
         let floor = entries.first().unwrap().versions.first().unwrap();
         let head = entries.last().unwrap().versions.first().unwrap();
         (floor, head)
+    }
+
+    #[test]
+    fn lean_version_drops_the_elan_prefix_and_one_leading_v() {
+        let (_, head) = window_bounds();
+        let id = ToolchainId::parse(&format!("leanprover/lean4:v{head}")).unwrap();
+        assert_eq!(id.lean_version(), head);
+        assert_eq!(id.supported(), lean_toolchain::supported_for(head));
+        assert!(id.supported().is_some());
+        assert_eq!(
+            ToolchainId::parse("nightly-2026-05-20").unwrap().lean_version(),
+            "nightly-2026-05-20"
+        );
     }
 
     #[test]
