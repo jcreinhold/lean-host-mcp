@@ -40,7 +40,6 @@ const PROOF_STATE_DIAGNOSTICS_ID: &str = "diagnostics";
 const PROOF_STATE_CONTEXT_ID: &str = "proof_state";
 
 const PROOF_AGENT_PER_FIELD_BYTES: u32 = 4 * 1024;
-const EXPERT_QUERY_PER_FIELD_BYTES: u32 = 8 * 1024;
 const DEFAULT_TOTAL_BYTES: u32 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1511,21 +1510,6 @@ fn proof_agent_budgets() -> LeanWorkerOutputBudgets {
     }
 }
 
-fn expert_query_budgets() -> LeanWorkerOutputBudgets {
-    LeanWorkerOutputBudgets {
-        per_field_bytes: EXPERT_QUERY_PER_FIELD_BYTES,
-        total_bytes: DEFAULT_TOTAL_BYTES,
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "prompt 38 establishes the shared budget helper for reference-query callers"
-)]
-fn reference_query_budgets() -> LeanWorkerOutputBudgets {
-    expert_query_budgets()
-}
-
 fn route_query_outcome(outcome: LeanWorkerModuleQueryOutcome, freshly_processed: bool) -> ModuleQueryRun {
     match outcome {
         LeanWorkerModuleQueryOutcome::Ok { result, .. } => ModuleQueryRun::Ready {
@@ -1892,8 +1876,8 @@ mod tests {
         BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, FindReferencesRequest, LeanWorkerProofPositionSelector,
         ProofBoundaryCandidate, ProofBoundarySelector, ProofPositionSelector, ProofStateProjection, ProofStateRequest,
         ProofStateResult, ReferenceScope, RenderedText, SourceSpan, cache_status_label, command_result,
-        expert_query_budgets, needs_build_context, project_proof_state_result, project_query_facts, project_references,
-        proof_agent_budgets, reference_query_budgets, route_batch_outcome, worker_proof_position,
+        needs_build_context, project_proof_state_result, project_query_facts, project_references, proof_agent_budgets,
+        route_batch_outcome, worker_proof_position,
     };
     use crate::broker::module_setup::NoAnswer;
     use crate::envelope::{Freshness, RuntimeFacts};
@@ -2336,13 +2320,6 @@ import Init -- comment
         let proof_agent = proof_agent_budgets();
         assert_eq!(proof_agent.per_field_bytes, 4 * 1024);
         assert_eq!(proof_agent.total_bytes, 64 * 1024);
-
-        let expert = expert_query_budgets();
-        assert_eq!(expert.per_field_bytes, 8 * 1024);
-        assert_eq!(expert.total_bytes, 64 * 1024);
-
-        let references = reference_query_budgets();
-        assert_eq!(references, expert);
     }
 
     #[test]

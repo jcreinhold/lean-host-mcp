@@ -268,7 +268,6 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
         let protocol = sidecar.as_ref().map_or("unknown", WorkerSidecar::protocol_status);
         rows.push(ListRow {
             id: id.to_owned(),
-            path: bin,
             support,
             header,
             smoke,
@@ -298,11 +297,6 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
 
 struct ListRow {
     id: String,
-    #[allow(
-        dead_code,
-        reason = "path is informational; not yet printed but useful for future flags"
-    )]
-    path: PathBuf,
     support: &'static str,
     header: &'static str,
     smoke: &'static str,
