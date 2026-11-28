@@ -122,7 +122,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "2",
         commented: false,
         overrides: "LEAN_HOST_MCP_MAX_LEAN_RUNS",
-        description: "Short lean and lake runs the server may run at once: file checks, lake setup-file and lake query runs, and semantic file runs. Each takes a permit before it starts and keeps it until its process group has exited; a run that finds no permit by its deadline does not start. Default 2.",
+        description: "Short lean and lake runs the server may run at once: file checks, lake setup-file, lake query and lake env runs, and semantic file runs. Each takes a permit before it starts and keeps it until its process group has exited; a run that finds no permit by its deadline does not start. Default 2.",
     },
     FieldDoc {
         key: "broker.idle_timeout_secs",
