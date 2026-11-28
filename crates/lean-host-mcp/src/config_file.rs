@@ -277,8 +277,9 @@ impl InstallFileConfig {
 }
 
 impl ConfigFile {
-    /// The config files of the Lake root `root`, read by [`load_table`]. `None`
-    /// reads nothing and gives the empty config.
+    /// The config files of the Lake root `root`, merged: the tracked file is
+    /// the base and the local file overlays it per key. `None` reads nothing
+    /// and gives the empty config.
     ///
     /// # Errors
     ///
