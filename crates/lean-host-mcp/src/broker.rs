@@ -1969,6 +1969,42 @@ mod tests {
         let _other = broker.opening_lock(Path::new("/other"));
         assert!(!broker.inner.lock().opening_locks.contains_key(&root));
     }
+
+    /// A call that waited to open a worker opens it with the roots Lake gave
+    /// while it waited. The test holds the project's opening lock, as a call
+    /// that opens a worker does, until the waiting call has Lake's answer.
+    /// Then the kept answer changes, as when the opener asked Lake after a
+    /// lakefile edit, and the lock comes free. The waiting call must open
+    /// with the newer roots, or the next call would retire its worker.
+    #[tokio::test]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and a matching installed worker"]
+    async fn a_call_that_waited_to_open_a_worker_opens_it_with_the_newest_roots() {
+        let root = worker_fixture();
+        let broker = ProjectBroker::new(cfg(Some(root.clone())));
+        let opener = broker.opening_lock(&root).lock_owned().await;
+        let waiting = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let root = root.clone();
+            async move { broker.acquire(root).await.map(|(project, _)| project) }
+        });
+        let answered = loop {
+            if let Some(roots) = broker.known_import_roots(&root) {
+                break roots;
+            }
+            assert!(!waiting.is_finished(), "the waiting call ended before Lake answered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // Lake may name a root before it builds the package that fills it.
+        let newer: Arc<[PathBuf]> = answered.iter().cloned().chain([root.join(".lake/unbuilt")]).collect();
+        broker.test_keep_import_roots(&root, Arc::clone(&newer));
+        drop(opener);
+        let opened = waiting.await.unwrap().unwrap();
+        assert_eq!(opened.import_roots(), &*newer);
+        let (next, _) = broker.acquire(root).await.unwrap();
+        assert!(Arc::ptr_eq(&next, &opened), "the next call retired the new worker");
+        drop((opened, next));
+        broker.shutdown_all();
+    }
     #[tokio::test]
     async fn cancelling_capacity_wait_keeps_the_retiring_workers_slot_reserved() {
         let mut config = cfg(None);

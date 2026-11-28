@@ -752,6 +752,13 @@ impl ProjectBroker {
     /// Lake configures the workspace from the lakefiles, the toolchain pin
     /// and the manifest, so the answer is kept until one of them changes. A
     /// dependency's own lakefile is not among them.
+    ///
+    /// Calls that find no kept answer each run `lake env`, so after a restart
+    /// or a lakefile change several may run at once, about 0.2 s each.
+    /// Sharing one run would hold a lock while that run waits for its read
+    /// turn. A request keeps its read turn for its later Lake runs, so a
+    /// request that holds one could wait on that lock while the holder waits
+    /// behind a queued build, which waits for that request.
     pub(crate) async fn import_roots(&self, root: &Path) -> Result<Arc<[PathBuf]>> {
         if let Some(roots) = self.known_import_roots(root) {
             return Ok(roots);
