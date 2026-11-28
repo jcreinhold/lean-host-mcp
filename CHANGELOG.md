@@ -127,6 +127,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `/- -/` comments may come before and between `module`, `prelude` and the `import` commands, and a doc comment or any
   other word ends the header. Before, it took every line that began with `import`, even one inside a comment or after
   the header, and missed an import that followed a block comment on its line.
+- The docs keep one copy of each fact. `docs/architecture.md` states the requirements, the owners and each invariant
+  with its test; `docs/operations.md` covers running, upgrading and recovering; `docs/tool-catalog.md` gives each tool's
+  contract; the build and test commands moved to `AGENTS.md`. Links to sections that are gone, such as
+  `operations.md#installing-the-server`, no longer resolve; the docs of each release tag keep them.
 
 ## [0.18.0] - 2026-11-27
 
@@ -134,7 +138,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Build against lean-rs 0.12.0 and lean-semantic-search 0.9.0, with worker protocol 14. Upgrade the server and its
   workers together; `install` replaces a worker that 0.17 built. See
-  [upgrading to 0.18](docs/operations.md#upgrading-to-018).
+  [upgrading to 0.18](https://github.com/jcreinhold/lean-host-mcp/blob/v0.18.0/docs/operations.md#upgrading-to-018).
 - One server owns a Lake checkout, and the SDK's cross-process artifact protocol is gone: shared reader locks, the
   project writer lock, writer demand, the native guardian, owner records and worker lifeline sockets. A build no longer
   runs in an SDK writer helper, and a check takes no kernel lock.
@@ -249,7 +253,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Breaking: build against lean-rs 0.11.1 and lean-semantic-search 0.8.0. The server, its writer and its workers must
   come from one SDK release. A worker built against lean-rs 0.10 still reports protocol 13; a plain `install` replaces
   it, since another release built it. A lock record or owner-directory entry that a 0.10 storage turn left now refuses
-  writer admission; [operations](docs/operations.md#upgrading-from-lean-rs-010) gives the steps to clear them.
+  writer admission;
+  [operations](https://github.com/jcreinhold/lean-host-mcp/blob/v0.17.0/docs/operations.md#upgrading-from-lean-rs-010)
+  gives the steps to clear them.
 - Breaking: the server binary serves the SDK's own writer, reader and guardian helpers (`lean_rs_writer::HelperCommand`)
   in place of the host's copy, so their subcommands, frames and messages are the SDK's. A helper started without
   `LEAN_RS_WORKER_OWNERS_DIRECTORY` refuses to run; the SDK sets it on every helper it starts. The capped build log
@@ -1076,7 +1082,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
   and `[server]` knobs that were previously env-var-only, plus the existing `primary_project`. When both files exist
   they merge per key (local wins); precedence is `CLI > env var > file > built-in default`, so existing
   `LEAN_HOST_MCP_*` setups are unaffected and an env var still overrides the file. Malformed files are logged and
-  ignored. See [docs/operations.md](docs/operations.md#configuration-file).
+  ignored. See
+  [docs/operations.md](https://github.com/jcreinhold/lean-host-mcp/blob/v0.1.0/docs/operations.md#configuration-file).
 - `lean-host-mcp config init` writes a documented starter config file — every option at its current default, each with a
   comment explaining it — to `./lean-host-mcp.toml` (or `~/.config/lean-host-mcp/config.toml` with `--home`, or a
   `--path`). The file, the per-knob reference table in the docs, and the built-in defaults are all generated from one
@@ -1085,7 +1092,7 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
   `worker_generation`, `rss_kib`, `limit_kib`, `restarts_total`) at a signal-appropriate level (`warn` for
   abnormal/crash, `info` for memory-pressure cycles, `debug` for hygiene), and every response's `runtime` carries
   lifetime `restarts_total` plus a per-cause `restarts_by_cause` breakdown so recycle *frequency* is visible. See
-  [docs/operations.md](docs/operations.md#observing-worker-recycles).
+  [docs/operations.md](https://github.com/jcreinhold/lean-host-mcp/blob/v0.1.0/docs/operations.md#observing-worker-recycles).
 - Structured `tracing` across the server's high-value paths (tool entry, project open/eviction, the idle reaper, the
   per-call job span, RSS headroom, toolchain resolution, and verdict-relabel decisions), all on stderr so the stdio
   transport's stdout stays clean. Default level is `info`; `RUST_LOG=lean_host_mcp=debug` surfaces per-call detail.

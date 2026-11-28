@@ -1,57 +1,96 @@
 # Operations
 
-Configure and troubleshoot the server here. Start with the [README](../README.md) for installation and client setup; use
-the [tool catalog](tool-catalog.md) for request and response contracts.
+How to run, upgrade and recover the server. The [README](../README.md) covers client setup, the
+[tool catalog](tool-catalog.md) gives each tool's contract, and the [architecture](architecture.md) says why the server
+works as it does.
 
-- [Configuration](#configuration-file) and [reference table](#configuration-reference)
-- [Artifact freshness](#rebuilt-artifacts) and [memory sizing](#memory-and-import-cycling)
-- [Builds](#builds) and [concurrency and admission](#concurrency-and-admission)
-- [Logging](#request-activity-in-the-terminal) and [worker recycles](#observing-worker-recycles)
-- [Process lifetime](#process-lifetime), [one server per store](#one-server-per-store) and
-  [runtime failures](#runtime-error-contract)
-- [Server installation](#installing-the-server), [worker installation](#installing-workers),
-  [upgrading to 0.18](#upgrading-to-018) and [test harnesses](#build-test-lint)
+## Run
 
-The server keeps its state in its [store](#one-server-per-store), not under `HOME`: `server.lock`, `children.lock` and
-`children/`, build logs in `logs/`, the inputs of running short runs in `runs/`, the named request table, the semantic
-runtime cache in `semantic-runtimes/`, and in `processes/` the PID records that `doctor processes` reads.
-`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` move the last two.
-`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` must be a canonical absolute path; the server creates the directory if it is missing.
-A server without `--lake-root` has no store and fails every project call; its PID records go under the per-user cache
-directory.
+### Install
 
-The server finds the Lean toolchain under `ELAN_HOME`, else under the elan home that install recorded as
-`[install] elan_home`, else under `$HOME/.elan`. It passes that home to Lake, Cargo and the processes it starts as
-`ELAN_HOME`.
+`lean-host-mcp install --lake-root PROJECT` makes one Lake project ready to serve. It reads the toolchain from
+`PROJECT/lean-toolchain` and writes only under `PROJECT/.local/lean-host-mcp/`, never a tracked file:
 
-## Configuration file
+| Path | Contents |
+| --- | --- |
+| `.gitignore` | `*`, so Git ignores the directory even when the project does not ignore `.local/` |
+| `bin/lean-host-mcp` | a copy of the running executable |
+| `workers/` | the worker for the project's toolchain, in a new generation |
+| `store/` | the server's private state, mode 0700, with the proof-search runtime in `semantic-runtimes/` |
+| `config.toml` | the local config file, with `[install]` set to the absolute `binary`, `workers_dir`, `store_dir` and `elan_home` |
 
-The server reads two TOML files at its `--lake-root`, and no others:
+- `--dir DIR` puts `bin/`, `workers/` and `store/` under `DIR`; the config file stays where the server reads it.
+- Without `--dir`, the worker and store directories follow the server's order: `LEAN_HOST_MCP_WORKERS_DIR` or
+  `LEAN_HOST_MCP_STORE_DIR`, then an `[install]` value already in the config files, then the default above.
+- A current worker stays, and `--force` replaces it. A worker that another release built is stale, so install replaces
+  it after an upgrade.
+- `--source-dir DIR` builds the worker from that checkout, as `install-worker` does.
+- Install takes the store as a server does, so it refuses while a server serves the project.
+- `[build] timeout_secs` limits the build of the proof-search runtime.
 
-- `lean-host-mcp.toml`, tracked with the project;
-- `.local/lean-host-mcp/config.toml`, which [`lean-host-mcp install`](#installing-the-server) writes. Its directory
-  holds a `.gitignore` that ignores everything in it.
+Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
+file that is not valid TOML before it builds anything. It records `elan_home` as `ELAN_HOME`, else `$HOME/.elan`, so a
+server started without `ELAN_HOME` finds the toolchain without reading `HOME`. Neither install nor the server writes
+under `HOME`.
 
-Keys in the local file win over the tracked file one key at a time, so each file need only set what it changes. The
-server does not look in its working directory, its parent directories or your home directory. Without `--lake-root` it
-reads no file. A missing file is ignored. A file that does not parse, or a value of the wrong type, stops the server at
-startup with an error that names the file or the key; `lean-host-mcp config check --lake-root PROJECT` reports the same
-errors without starting it. Tables the server does not know, such as an old `[launcher]`, are ignored.
+Any Lake project whose imports are built can be served; it needs no shims or extra targets. Install needs a Rust
+toolchain on `PATH` and the project's Lean toolchain installed through elan.
 
-Generate a commented tracked file with the current defaults:
+### Serve
 
 ```sh
-lean-host-mcp config init                       # ./lean-host-mcp.toml
-lean-host-mcp config init --lake-root PROJECT   # PROJECT/lean-host-mcp.toml
+PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT                       # stdio
+PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT --bind 127.0.0.1:8765  # Streamable HTTP at /mcp
 ```
 
-`--path FILE` selects another destination. Existing files require `--force` to overwrite.
+A server serves the one project that `--lake-root` or `LEAN_HOST_MCP_PROJECT` names and refuses a call that names
+another; without a root it fails every project call. It refuses to start with `LEAN_PATH` set, since each check takes
+its search path from Lake and workers refuse an inherited one. It finds the Lean toolchain under `ELAN_HOME`, else under
+the `[install] elan_home` that install recorded, else under `$HOME/.elan`, and passes that home on as `ELAN_HOME`.
 
-## Configuration reference
+A stdio server exits when the client closes its stdin, or when the process that launched it exits or changes, as the
+kernel reports its parent PID. An HTTP server binds only a loopback address, since it has no authentication or TLS, and
+exits on Ctrl-C or SIGTERM. Either way it closes its workers before it returns: queued calls fail with
+`runtime_unavailable` and reason `project_shutting_down`, and a running call may finish or run to its timeout. It leaves
+the rows of its named requests as they are, and the next server ends them
+([named requests](architecture.md#named-requests)).
 
-For each setting, precedence is **CLI flag > environment variable > local file > tracked file > built-in default**. An
-environment variable that is empty or holds only spaces counts as unset. Units are shown in the table; GiB figures in
-descriptions are explanatory, not literal setting values.
+### The store
+
+The store holds the server's state: `server.lock`, `children.lock` and `children/`, build logs in `logs/`, the inputs of
+running short runs in `runs/`, the request table `requests.sqlite3`, the proof-search runtime in `semantic-runtimes/`,
+and PID records in `processes/`. It is `LEAN_HOST_MCP_STORE_DIR`, else `[install] store_dir`, else
+`.local/lean-host-mcp/store` under the Lake root. The server creates it with mode 0700 once its config checks pass.
+`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, a canonical absolute path, moves `semantic-runtimes/`, and
+`LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` moves `processes/`. One server serves one store. The lock binds the store, not the
+checkout, so run one server per checkout and never point two servers with different stores at one Lake root.
+
+The request table uses SQLite's write-ahead log with `synchronous=FULL`, and `fullfsync` on macOS, so a row survives a
+crash of the server or the machine; the file has mode 0600. The server prunes the table at start and every hour: ended
+rows older than `requests.retention_hours`, then the oldest ended rows past `requests.max_rows`, then their logs, and at
+start every log that no row names. It never prunes a row that has not ended. A server without a store refuses request
+ids with `requests_unavailable`.
+
+### Configuration
+
+The server reads two TOML files at its Lake root and no others: the tracked `lean-host-mcp.toml`, and the local
+`.local/lean-host-mcp/config.toml` that install writes, in a directory Git ignores. The local file wins one key at a
+time, so each file sets only what it changes. A missing file adds nothing, and tables the server does not know, such as
+an old `[launcher]`, are ignored. A file that does not parse, or a value of the wrong type, stops the server at startup
+with an error that names the file or the key.
+
+```sh
+lean-host-mcp config init --lake-root PROJECT   # write PROJECT/lean-host-mcp.toml: every default, commented
+lean-host-mcp config check --lake-root PROJECT  # name each bad key and value; print [build] and each recipe
+```
+
+`config init` takes `--path FILE` for another file and needs `--force` to overwrite one. `config check` runs no Lake and
+writes nothing, so it is safe beside a running server.
+
+### Configuration reference
+
+Each setting takes the first value it finds: CLI flag, environment variable, local file, tracked file, built-in default.
+An environment variable that is empty or holds only spaces counts as unset.
 
 <!-- BEGIN GENERATED: do not edit by hand. Regenerate from `config_schema::render_reference_table`; the `operations_md_reference_table_is_in_sync` test fails when this block drifts. -->
 | Key | Type | Default | Override | Description |
@@ -91,106 +130,19 @@ descriptions are explanatory, not literal setting values.
 | `recipes.<name>.timeout_secs` | integer (s) | unset | none | Deadline for one build of this recipe, in place of build.timeout_secs. Unset uses build.timeout_secs. |
 <!-- END GENERATED -->
 
-`output.max_field_bytes` and `output.max_total_bytes` bound model-facing payloads before they leave the worker. Tight
-caps are useful for smoke tests and for very large proof states, but they can also make proof-step batches partial: once
-the total proof-action budget is exhausted the current candidate reports `budget_exceeded` and later candidates report
-`not_attempted`. Retry the promising snippet alone, or raise `LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES`, when the response
-summary shows nonzero `budget_exceeded`, `not_attempted`, or `output_truncated` counts.
+When `output.max_total_bytes` runs out in a batch of proof steps, the current candidate reports `budget_exceeded` and
+the later ones `not_attempted`. When a reply's summary counts any `budget_exceeded`, `not_attempted` or
+`output_truncated`, retry the best candidate alone or raise the cap.
 
-### Rebuilt artifacts
+### Builds
 
-A worker session's Lean environment is a snapshot taken at import, and a check reads `.olean` files while it runs, so no
-check may overlap a build of the same project. The server keeps them apart with one fair turn per Lake root:
-
-- A check takes a read turn before it starts a worker job or a short run, and keeps it until it ends. Read turns do not
-  exclude each other, so checks share the turn. A short run whose process group outlives its request keeps a share of
-  the turn until the group exits.
-- `lean_build` takes the write turn, so a build runs alone. It waits for the read turns and shares already held, and
-  holds back the checks that arrive after it, so a check sent during a build waits and then sees what the build wrote.
-  It stops the project's workers and waits until each has exited before Lake starts. The next check starts a fresh
-  worker, even after a build that changed nothing. Turns follow arrival order; a waiting request keeps its place until
-  its deadline.
-
-Each read turn carries the number of builds that have finished on the root. A worker that loaded its imports before a
-later build finished is recycled before reuse, and `artifacts_rebuilt` records that. Since a build stops the workers
-first, this is a backstop. A cached query result answers only while the worker that computed it lives.
-
-Build through `lean_build`. The turns order only the Lake and Lean runs this server starts: a `lake build` run outside
-the server can rewrite `.olean` files while a check reads them, and the server does not notice. That is outside the
-contract. Bundled shims and installed toolchain contents remain trusted fixed runtime inputs.
-
-File checks, `lake setup-file` and `lake query` runs, and semantic file runs are short runs: one `lean` or `lake`
-process in its own process group, with private inputs under the store's `runs/`. At most `broker.max_lean_runs` of them
-run at once (default 2). Each takes a permit before it starts and keeps it until its group has exited, even past its
-reply. A run that gets no permit by its request's deadline does not start, and its error says to raise
-`broker.max_lean_runs` or retry. Short runs take no worker slot.
-
-### Memory and import cycling
-
-Two quantities govern worker memory:
-
-- `runtime.worker_import_residue_budget_mib` bounds retained import bytes and triggers a clean recycle.
-- `runtime.lean_max_memory_kib` is a Lean heap backstop. Crossing it can abort the entire child: Lean's allocator throws
-  a C++ exception that cannot unwind through the Rust shim frame. It is not reliably a recoverable elaboration error.
-
-RSS is telemetry only. It includes clean, shared, memory-mapped `.olean` pages and does not measure unreclaimable
-imports; no server policy restarts, refuses, or recycles a worker on RSS or call count.
-
-An environment imported with `loadExts := true` retains its imported regions until the child exits. Only the first
-import in a process memory-maps compacted regions; later imports materialize their full closure as private copies,
-including overlapping modules. On measured Mathlib-scale per-file headers, the first import retained 10–18 MB and each
-later import 2.0–4.5 GB. Four imports cost 9.6 GiB on one workload and 16.0 GiB on another, so an import count does not
-predict the required memory. The parent sums the child's `non_memory_mapped_region_bytes` instead.
-
-The child keeps up to `runtime.worker_session_pool_capacity` imported sessions (default 8). Returning to a held profile
-restores it without importing. In the same measurements, holding another environment cost about 70 MiB against 2–4 GB
-for the import it saved. Session eviction and residue recycling are separate policies: dropping an environment does not
-reclaim its imported regions. A count backstop of 32 applies only when the child reports unusable zero-valued import
-statistics.
-
-The default residue budget starts at a quarter of system RAM divided by `broker.max_workers`, clamped to 9–12 GiB. It is
-then capped at one worker's share of RAM minus 4.5 GiB for an import in flight; this affordability cap can put it below
-9 GiB.
-
-The default heap ceiling is **budget + max(budget, 8 GiB)**. At budgets of at least 8 GiB this doubles the budget; at
-smaller budgets the fixed gap preserves room for Lean allocations outside the residue counter. The measured gap was
-4.4–6.3 GiB during an abort under the former fixed 8 GiB ceiling. That ceiling aborted a three-file sweep on file three
-before a 9 GiB residue budget could fire. Set the heap ceiling explicitly only with this ordering in mind; startup warns
-when a configured ceiling is at or below the residue budget.
-
-Size the worker count first. A conservative envelope per worker is `budget + 4.5 GiB + max(budget, 8 GiB)`, alongside
-the rest of the machine's workload. For example, one worker with an explicit 4 GiB residue budget has a derived 12 GiB
-heap ceiling; its conservative envelope is 16.5 GiB. An explicitly fixed budget does not shrink when the worker count
-changes. `LEAN_RS_NUM_THREADS` on the server also bounds inherited Lean task threads; the default uses every core, and
-concurrent elaboration tasks add working sets.
-
-For stable artifacts, the import policy behaves as follows:
-
-- Repeating one file reuses its session without adding residue.
-- Alternating among profiles still held in the session pool also adds no residue.
-- Sweeping new profiles eventually recycles the child. Frequency depends on each import's measured residue and the
-  budget, rather than the number of tool calls.
-
-`import_residue` records a reactive recycle on a request. Above 60% of the budget, a quiet tick can instead recycle and
-re-import the most recent profile; this is `import_residue_idle`. A higher idle-to-reactive ratio means more of the
-restart cost lands between calls. Reactive cycles dominate when work never pauses long enough; raising the budget may
-help if the machine has room. Both causes are planned, do not count toward the crash-loop limit, and do not taint a
-completed verdict.
-
-Earlier resident-memory measurements (+1 GiB per import and an 11.2 GiB `SIGKILL`) used a fixture whose import profiles
-shared about 99% of their closure. They should not replace the physical-footprint measurements above: under pressure,
-RSS can fall while unreclaimable import bytes keep growing.
-
-## Builds
-
-`lean_build` runs Lake in the Lake root and replies when Lake is done. A request names Lake `targets` (none: Lake's
-default targets) or a `recipe` from the tracked config, plus `args` where the recipe's `append` lets them in. For
-example:
+A `lean_build` request names Lake `targets`, none for Lake's default targets, or a `recipe` from the tracked config,
+with `args` where the recipe's `append` lets them in:
 
 ```toml
 [build]
 guard = ["@mathlib/+Mathlib:olean"] # must already be built; checked with lake build --no-build
-timeout_secs = 14400                # from the request: the wait for the turn and every step count
+timeout_secs = 3600                 # from the request: the wait for the turn and every step count
 log_limit_mib = 16
 
 [recipes.clean]
@@ -202,570 +154,198 @@ steps = [["build"], ["exe", "lean-fmt", "format", "--check", "--no-build"]]
 append = "each"                     # the request's args go at the end of both steps
 ```
 
-A build takes the project's write turn (see [rebuilt artifacts](#rebuilt-artifacts)), stops the project's workers and
-waits until each has exited, then runs the guard and each step as `lake <args>`, each in its own process group. The
-first failing step ends the build. All output goes to one log under the store's `logs/`, capped at
-`build.log_limit_mib`; the reply gives each step's command and exit code, the log's path and its tail. Cancellation or
-the deadline stops the running step's whole group. A step whose `lake` exits while other members of its group still run
-gets one second; then the server stops the group and the step ends the build with no exit code. The turn ends only after
-every group of the build has exited, so no check starts while one still runs.
+Each step runs as `lake <args>` in the Lake root; the [tool catalog](tool-catalog.md#lean_build) gives the order and the
+reply. A step whose `lake` exits while others in its process group still run gets one second; then the server stops the
+group, and the step ends the build with no exit code. Steps run with the server's environment, plus `LEAN_SYSROOT` set
+to the project's toolchain and `LAKE_ARTIFACT_CACHE=false`, so builds land in each package's `.lake/build`. Set a
+variable such as `LEAN_NUM_THREADS` where the server starts. A target or argument from a client may not be empty or
+start with `-`, so a client cannot pass Lake an option such as `-d`. Recipe words come from the tracked config, and Lake
+reports its own errors in them.
 
-Each step runs in the Lake root with the server's environment, except that the server sets `LEAN_SYSROOT` to the
-project's toolchain and sets `LAKE_ARTIFACT_CACHE=false` so that builds land in each package's `.lake/build`. Set a
-variable such as `LEAN_NUM_THREADS` where the server starts. The server refuses to start with `LEAN_PATH` set: each
-check takes its search path from the Lake manifest, and workers refuse an inherited one. The server checks only the
-words a client adds: a target or recipe argument may not be empty or start with `-`, so a client cannot pass Lake an
-option such as `-d`. Recipe words come from the tracked config, and Lake reports its own errors in them. Lake decides
-what to build and in which order.
+Build only through `lean_build`: a `lake build` run outside the server can rewrite `.olean` files while a check reads
+them, and the server does not notice.
 
-`lean-host-mcp config check --lake-root PROJECT` reads both config files, names every unknown key and bad value, and
-prints `[build]` and each recipe with their defaults. It runs no Lake and writes nothing, so it is safe beside a running
-server.
+### Sizing
 
-`lean_imports` lists, for each file, its whole transitive import closure as `lake setup-file --no-build` reports it
-(`importArts`), not only its direct imports: each module, its `.olean`, and, when Lake built it under the project's
-`.lake/build`, the source `lake query +MODULE:lean` names under the library's `srcDir`. It builds nothing: a missing or
-stale import fails the call with `setup_file_failed`, naming the file and quoting Lake, and an import that names no
-module Lake knows fails it with `unknown_import`. For each module it lists the source and the direct imports that
-`lake query +MODULE:lean +MODULE:header` reports, and a module Lake cannot answer for, such as `Init`, gets its own
-error.
+Size the worker count first. `broker.max_workers` caps the server's worker processes, counting those starting or still
+exiting. `broker.max_workers_per_project` caps those on the project; it defaults to 1, since each worker keeps its own
+imports and cache. `broker.max_lean_runs` caps short runs, and each file check among them loads its file's imports.
+Proof search runs one more `lean` process, the search driver, beside the worker. `LEAN_RS_NUM_THREADS` on the server
+bounds Lean's task threads; the default uses every core.
 
-The server asks Lake, never the module name, where a module's source lies: `lake query +MODULE:lean` for the files of
-project-scope references and for a declaration lookup or `module_all` check of a module, and `lake setup-file` for the
-module of a checked file and the goal module of a search. A file outside every library has no module, and an `.ilean`
-whose module Lake names no source for, as one a deleted file leaves, is left over from an earlier build.
+A worker's memory has two limits:
 
-## Concurrency and admission
+- `runtime.worker_import_residue_budget_mib` bounds the import bytes a child can never free, and recycles the child
+  cleanly once they pass it. The default starts at a quarter of RAM divided by `broker.max_workers`, clamped to 9–12
+  GiB, then capped at one worker's share of RAM minus 4.5 GiB, which can put it below 9 GiB.
+- `runtime.lean_max_memory_kib` is Lean's heap ceiling. Crossing it can abort the whole child, so it defaults to
+  `budget + max(budget, 8 GiB)`. Startup warns when a ceiling you set is at or below the budget.
 
-A server serves one Lake project, its `--lake-root`, and refuses calls on any other. Each worker owns a child process
-and a dedicated thread that runs one job at a time. `broker.max_workers_per_project`, default one, caps the workers that
-serve the project at once. `broker.max_workers` caps worker slots, counting workers that are starting or still exiting.
-With a larger per-project limit, the broker prefers an idle worker, starts another only when a slot is free, or queues
-on the least-loaded existing worker. Each worker keeps its own import and result caches.
-`runtime.project_mailbox_capacity` bounds the actor's mailbox. Further callers wait for mailbox admission in FIFO order
-rather than retrying `mailbox_full`. A cold start waits in FIFO order for a slot that an exiting worker still holds.
-Cancellation removes only its own waiter, and a slot stays reserved until its worker's exit is confirmed.
+Plan for `budget + 4.5 GiB + max(budget, 8 GiB)` per worker beside the machine's other work: one worker with a 4 GiB
+budget needs about 16.5 GiB. A budget you set does not shrink when the worker count changes. RSS is only reported: it
+counts shared `.olean` pages and can fall while the child's private memory grows.
 
-Worker-capacity admission, mailbox admission, and time waiting in the actor queue share one
-`runtime.request_timeout_millis` deadline. Expiry returns `project_admission_timeout`, `mailbox_admission_timeout`, or
-`queue_wait_timeout` without dispatching that queued operation. Once dispatch begins, the worker execution timeout
-applies separately. This is not a whole-tool deadline: a tool that submits several worker operations can take longer. A
-named check is the exception: its row fixes one deadline of the same length for the whole call, counted from the moment
-the server records it. Servers on other checkouts have their own limits; lower `broker.max_workers` when the machine
-cannot hold that many workers.
+With unchanged builds, repeating one file, or moving among the profiles the session pool holds
+(`runtime.worker_session_pool_capacity`), adds no residue. A sweep of new import profiles recycles the child at a rate
+set by the size of each import and the budget, not by the number of calls. `import_residue` counts the recycles a call
+waited for, and `import_residue_idle` counts those done between calls. When the first count leads, work never pauses
+long enough; raise the budget if the machine has room.
 
-Cheap metadata paths never open a worker at all: degraded `needs_build` responses, invalid-request responses, and
-project-scope `.ilean` reference reads answer from the Lake files directly. A repeat module query on an unmodified file
-is answered from the per-project result cache and likewise never enters the mailbox, so a warm call does not queue
-behind in-flight Lean work.
+### Logs
 
-Semantic proof ranking runs one more `lean` process beside the elaboration worker: lean-semantic-search's driver, as a
-short run that exits after the call. Include that peak in memory planning.
-
-### Request table
-
-A server started with `--lake-root` keeps one row per [named request](tool-catalog.md#named-requests) in
-`requests.sqlite3` in its store, and a build's log in the store's `logs/`. The table uses SQLite's write-ahead log with
-`synchronous=FULL` (and `fullfsync` on macOS), so a row the server has written survives a crash of the server or the
-machine. The file has mode 0600. A server without a store has no table and refuses request ids with
-`requests_unavailable`.
-
-The server prunes the table when it starts and every hour after. It deletes ended rows older than
-`requests.retention_hours`, then the oldest ended rows past `requests.max_rows`, and then their logs. It never prunes a
-row that has not ended. At start it also deletes every log that no row names.
-
-Before it listens, a starting server ends the rows an earlier server left. By then it has waited for every process the
-earlier server started (see [one server per store](#one-server-per-store)), so its `running` rows become `interrupted`
-at once. It then starts the `queued` rows in the order they came, or ends them as `timed_out` past their deadline and as
-`interrupted` when their project is gone. No row that said `running` runs again.
-
-## Request activity in the terminal
-
-Default INFO logging summarizes each actual semantic execution with a server-generated `request` number, tool, canonical
-kind and bounded project basename. The received line means preparation or queueing has begun, not that a worker has
-already started. The matching response line includes elapsed time (including queue wait), a fixed outcome label, an
-allowlisted `result_status` when present (such as `not_found` or `unsupported`), tool issue counts, and diagnostic or
-verification counts when available. `completed` means a response is ready, not that a theorem was proved; inspect
-`failed`, `diagnostic_errors`, and the actual client response for the verdict.
+The server logs to stderr, never to the stdio protocol stream. At the default level each call logs two lines with a
+request number, the tool, its kind and the project's base name:
 
 ```text
 INFO Lean request received (preparing or waiting for worker) request=42 tool="lean_verify" kind="verification" project=myproject
 INFO Lean response ready request=42 tool="lean_verify" kind="verification" project=myproject elapsed_ms=1532 outcome="completed" tool_errors=0 tool_warnings=0 verified=3 failed=1 needs_build=0
 ```
 
-Direct calls and named requests share this boundary. A retry with the same `request_id` or a `lean_get` does not log a
-second execution. Routine `lean_runtime` status and `lean_get` polling remain quiet. If a future disappears before it
-returns, a warning explicitly says worker completion is not confirmed; that log is not a receipt proving that an
-executing worker stopped.
+`completed` means a reply is ready, not that a proof checked: read `failed`, `diagnostic_errors` and the reply itself.
+The lines hold no source text, names, imports, diagnostics, request ids or full paths. A retry with the same
+`request_id`, a `lean_get` and a `lean_runtime` call log nothing. When a call ends before its reply, a warning says that
+the worker's end is not confirmed.
 
-These summaries do not print command/tactic text, theorem names, imports, diagnostics, response bodies, caller-supplied
-request IDs or full project paths. Project labels are bounded and terminal-safe; kind/outcome labels are allowlisted.
-Existing detailed debug/runtime logs are separate, and may contain paths or diagnostic details.
+Each worker recycle logs one line with `cause`, `reason`, `worker_generation`, `planned` and `restarts_total`: at `warn`
+for crashes and limits (`child_abort`, `child_exit`, `session_missing`, `worker_internal`, `timeout`, `cancelled`,
+`rss_hard_limit_exceeded`, and `restart limit exceeded; marking project unhealthy`), at `info` for `artifacts_rebuilt`,
+`import_residue` and `rss_post_job`, and at `debug` for `import_residue_idle`, `max_imports`, `max_requests`, `idle` and
+`explicit`.
 
-The default filter, also used for `RUST_LOG=info`, is `info,rmcp=warn`: routine SDK session creation, initialization and
-stream closure are hidden, but SDK WARN/ERROR remain visible. To investigate transport details explicitly, use
-`RUST_LOG=info,rmcp=debug`. Other explicit `RUST_LOG` directives retain their usual meaning. Logs go to stderr, never
-the stdio protocol stream.
+The default filter, `info,rmcp=warn`, hides routine MCP session lines and keeps the SDK's warnings. Use
+`RUST_LOG=info,rmcp=debug` for transport detail and `RUST_LOG=lean_host_mcp=debug` for the runtime; the estimate of the
+import budget appears only at debug. `telemetry.verbosity = "full"` adds runtime facts to each reply under
+`telemetry.runtime`: the worker generation, the queue wait, restarts by cause, `import_residue_bytes` against
+`import_residue_limit_bytes`, and a retried call's `previous_attempt_failure`.
 
-The import-budget sizing estimate appears only at DEBUG, once when the broker starts, not on worker restarts. Its 9216
-MiB comparison is a Mathlib-oriented sizing baseline for retaining two large imports, not a required minimum for every
-import or evidence of a failure. An explicitly configured smaller budget can be intentional; evaluate actual recycle
-frequency before changing it. Lowering the project count does not change an explicitly fixed budget. The heap-ceiling
-warning and real runtime error/recycle logs remain intact; no memory policy changes with logging.
+### Process records
 
-## Observing worker recycles
-
-Every recycle is logged to stderr and counted in worker runtime facts. Set `telemetry.verbosity = "full"` to include
-those facts in public responses under `telemetry.runtime`; they are omitted at the default quiet verbosity.
-
-Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `rss_kib`, `limit_kib`, `planned`,
-`restarts_total`. Level tracks the signal, not whether the cycle was planned:
-
-- `warn` — abnormal/crash causes: `rss_hard_limit_exceeded`, `child_abort`, `child_exit`, `session_missing`,
-  `worker_internal`, `timeout`, `cancelled` (and `restart limit exceeded; marking project unhealthy`).
-- `info` — `artifacts_rebuilt` (a build finished after the child loaded its imports, so it was recycled; a backstop, see
-  [rebuilt artifacts](#rebuilt-artifacts)), `import_residue` (the reactive half of the residue budget — the cycle a call
-  had to wait for, and the frequency an operator tunes against), memory-pressure cycles (`rss_post_job`), plus
-  `opened project` / `idle reaper evicted projects` lifecycle lines.
-- `debug` — pure hygiene (`import_residue_idle`, `max_imports`, `max_requests`, `idle`, `explicit`), detailed project
-  resolution, and the `job` span.
-
-The server no longer configures any resident-memory threshold, so in practice you see the abnormal causes above,
-`explicit`, `artifacts_rebuilt`, and the two residue causes (see
-[memory and import cycling](#memory-and-import-cycling)). `max_imports` should not appear at all — it is a backstop for
-a child that reports no import statistics. `rss_post_job` / `rss_hard_limit_exceeded` and `max_requests` stay in the
-vocabulary because the supervisor still reports them if a future policy asks for them; seeing one today means the worker
-was configured somewhere other than here.
-
-Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for internal runtime detail. Example at default level:
-
-```text
-INFO worker recycled (imports rebuilt on disk) cause=artifacts_rebuilt worker_generation=2 planned=true restarts_total=1
-```
-
-Full telemetry exposes the final-attempt cause in `call_restart`, the most recent in `last_restart`, and the lifetime
-frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause` (omitted when no recycle has happened).
-`import_residue_bytes` and `import_residue_limit_bytes` report the quantity the recycle policy actually reads, so how
-close a child is to its next cycle is observable rather than inferred. The two figures a cycle happened *on* are in the
-restart event's `reason` string.
-
-If a worker attempt fails and a fresh retry completes, the result remains usable. The response includes a warning about
-the first failure. Full telemetry records `previous_attempt_failure`, `retry_count`, and `final_attempt: "completed"`. A
-failed or uncertain retry still returns no usable result.
-
-## Process lifetime
-
-The idle reaper (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`) governs resident per-project controllers, not the parent server
-process. A stdio server exits when its transport closes: it serves until the client closes the server's stdin. It also
-watches the process that launched it and exits if that parent PID disappears or changes without a clean MCP shutdown. An
-HTTP server is separate: it exits on Ctrl-C, SIGTERM, or ordinary process shutdown. Both transport exit paths call
-`ProjectBroker::shutdown_all`, which closes resident projects before the process returns.
-
-Project shutdown is bounded by the worker layer. The host stops accepting new project work, queued messages receive
-`runtime_unavailable` with reason `project_shutting_down`, and the controller then lets `lean-rs-worker-parent` perform
-its structured child shutdown: terminate, bounded graceful wait, kill escalation if needed, and reap. An active request
-may finish normally or run until the configured request timeout before the worker layer reports a terminal runtime
-outcome. A server killed abruptly runs no Rust `Drop`. Its workers then exit with status 125 once the pipe to the server
-closes, while its short runs and build steps may run on; the next server on the store stops them before it serves (see
-[one server per store](#one-server-per-store)).
-
-On shutdown the server stops its named requests and leaves their rows as they are. At the next start a `running` row
-becomes `interrupted` and a `queued` row runs (see [request table](#request-table)). A killed server's build does not
-finish: the next server stops the build's step before it serves.
-
-Every running server writes a PID record in its store's `processes/` and removes it on normal shutdown. A server without
-`--lake-root` writes it under the per-user cache directory at `lean-host-mcp/processes/` instead, and
-`LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` overrides both. The record contains the exact server PID, executable path, working
-directory, transport, bind/path, startup parent PID, and process group. Inspect the records of a project's servers with
-the first command, and those of servers without a Lake root with the second:
+Each running server writes a PID record in the store's `processes/`, or, without `--lake-root`, in the per-user cache
+directory's `lean-host-mcp/processes/`, and removes it on a clean exit. `doctor processes` lists the records: the PID,
+whether it lives (`true`, `false` or `unknown`), whether the executable matches, the transport, bind and path, the
+working directory, the parent PIDs, the process group and the child PIDs. It reads only what servers wrote and never
+looks for processes by name.
 
 ```sh
-lean-host-mcp doctor processes --lake-root PROJECT
-lean-host-mcp doctor processes
+lean-host-mcp doctor processes --lake-root PROJECT      # this project's servers
+lean-host-mcp doctor processes                          # servers without a Lake root
+lean-host-mcp doctor processes --cleanup-stale-records  # drop records of servers that are gone
 ```
 
-The stdio parent watcher uses the kernel's parent PID rather than `ps`, and only confirmed parent death or reparenting
-ends the session. Observation failures never trigger shutdown.
+Cleanup removes a record only when the kernel confirms, twice, that its PID is gone; it kills nothing. For a live stdio
+server whose parent changed, the listing suggests `kill -TERM <pid>` for that exact PID.
 
-The output lists only host-written records: PID, liveness, executable-match status when the platform exposes it,
-transport, bind/path, working directory, startup/current parent PID, process group, stale-stdio-client status, and
-direct child PIDs. Liveness is `true`, `false` (kernel-confirmed absence), or `unknown`; `liveness_error` identifies
-permission denial or another observation failure. Missing process metadata and child lists remain unknown, not evidence
-of absence. It does not scan for process names. Only a confirmed live stdio server with a matching executable and a
-confirmed parent change receives an exact PID suggestion such as `kill -TERM <pid>` for the recorded server PID. Clean
-records left behind by abruptly killed servers with:
+## Upgrade
 
-```sh
-lean-host-mcp doctor processes --cleanup-stale-records
-```
+### Upgrading to 0.19
 
-Cleanup removes records only after kernel-confirmed PID absence is rechecked; unknown observations preserve records. It
-does not kill live processes and does not infer ownership from an executable name, command substring, or port number. Do
-not use broad process-name cleanup; identify the exact PID from the registry or from
-`ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
+A 0.19 server and its worker upgrade together, with lean-rs 0.13 and lean-semantic-search 0.10.
 
-### One server per store
+1. Stop the server and any build on the project. A 0.19 server, and `install`, refuse to start while a 0.18 server holds
+   the store.
+2. Run `lean-host-mcp install --lake-root PROJECT` with the new binary. It builds a worker in a new generation, since
+   another release built the old one, and builds the new proof-search runtime into the store. Use `install-worker` for a
+   worker installed on its own.
+3. Run `lean-host-mcp config check --lake-root PROJECT`. A config file that does not parse now stops the server at
+   startup, where 0.18 served with the defaults.
+4. Start the server again.
 
-A server started with `--lake-root` takes an exclusive `flock` on `server.lock` in its store and writes its pid and Lake
-root into that file. The kernel drops the lock when the process exits, however it exits. A second server on the same
-store exits at startup and names the first:
+Clients: `lean_compatibility` is gone, so call `lean_status` with `include: ["worker"]` and read
+`data.worker.compatibility`. A client that lists trust statuses should add `unknown_import`.
+
+### Installing workers
+
+`install` covers the usual case. `install-worker` builds workers alone: into `--workers-dir DIR`, or into the worker
+directory of `--lake-root PROJECT`, which is `LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir`, then
+`PROJECT/.local/lean-host-mcp/workers`. With neither flag it uses `LEAN_HOST_MCP_WORKERS_DIR` and fails when that is
+unset. With `--lake-root` it takes the project's store, except for `--list`, so it refuses while a server serves the
+project. With only `--workers-dir` it takes no store: stop every server that uses the directory first.
+
+A binary from `cargo install` builds the published `lean-host-mcp-worker` at its own version. A binary built in a
+checkout builds the worker from that checkout, and `--source-dir DIR` names another. Each worker's rpath points at its
+toolchain's `lib/lean`.
+
+Each worker lives in `DIR/<id>/generation-<name>/`, and `DIR/<id>/current-generation` names the one the server runs. A
+new generation writes and builds its shims with plain Lake, records their digests in `worker.json`, passes the smoke
+test, and only then becomes current; a failure leaves the old one current.
+
+- `--auto`, the default, builds a worker for each toolchain in elan's `toolchains/` whose worker is missing or stale,
+  and skips current ones and those outside the supported window. `--force` rebuilds current ones too.
+- `--toolchain <id>` builds one toolchain's worker.
+- `--list` prints each toolchain's current generation. Its `protocol` column reads `compatible` or `incompatible`, and
+  the other columns read `unknown` when the record does not load.
+- `--clean` removes every worker, or one with `--toolchain <id>`. It never touches source.
+- `--prune` removes only workers outside the supported window. `--list` and `--prune` skip a directory with no
+  `current-generation`.
+
+### Elan toolchains
+
+Keep a toolchain installed and unchanged while its workers run, and stop the servers that use it before you uninstall or
+replace it. The server checks the toolchain when it admits a call and takes no lock on it.
+
+## Recover
+
+### A refused start
+
+When another server holds the store, the new one exits with:
 
 ```text
 another lean-host-mcp (pid 4242, lake root /work/project) holds the store /work/project/.local/lean-host-mcp/store; stop it first
 ```
 
-The store is `LEAN_HOST_MCP_STORE_DIR`, else `[install] store_dir` from the config files, else
-`.local/lean-host-mcp/store` under the Lake root. The server creates it with mode 0700 after its config checks pass. A
-server without `--lake-root` has no store and takes no lock. The lock binds the store, not the checkout: run one server
-per checkout, and do not point two servers with different stores at one Lake root.
+Stop that server by its pid, or use it.
 
-The server then takes `children.lock` in the store and lets every process it starts inherit it, so the lock stays held
-until the last of them exits. Each build step and short run also gets a locked file in `children/` that its processes
-inherit. The file starts as `starting-…`, takes the number of the child's process group once the child runs, and the
-server deletes it once it has seen the group exit. The server never unlocks either lock. When it starts, it handles
-three cases:
+When processes of an earlier server still hold `children.lock` after the server's wait, it exits with:
 
-- `children.lock` is free: no process of an earlier server runs. The server deletes the files in `children/` and serves.
-- `children.lock` is held: an earlier server died and left processes. The server logs `processes an earlier server
-  started still run; stopping the recorded ones`, sends SIGTERM to each group whose file is locked, waits up to 5
-  seconds, and sends SIGKILL to each group still locked. It never signals a group whose file is free and never looks for
-  processes by name. It then waits up to 30 seconds for `children.lock`, logs `every process of the earlier server has
-  exited`, and serves.
-- `children.lock` is still held after that wait: the server exits with an error such as
-
-  ```text
-  processes an earlier server started still hold /work/project/.local/lean-host-mcp/store/children.lock after 35 s: process groups 51234 still run. Processes the server does not record, such as workers whose pipe to the dead server has not closed yet, may hold it too. `lsof /work/project/.local/lean-host-mcp/store/children.lock` lists every holder; stop them, then start the server again
-  ```
-
-`install` and `install-worker --lake-root` take the store the same way, so each one refuses while a server serves that
-store and waits for a dead server's processes as a server does.
-
-These rules hold, and each has a test:
-
-| Rule | Test |
-| --- | --- |
-| One server per checkout: a second server on the store exits and names the first. | `store.rs`: `second_lock_names_the_holder`, `a_refused_start_names_the_holder_and_leaves_children_alone`; `tests/http_transport.rs`: `second_server_on_one_store_names_the_first` |
-| Checks share the turn, and a build runs alone. | `project_lock/tests.rs`: `two_requests_hold_read_turns_at_once`, `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`, `a_read_share_keeps_a_build_waiting_after_its_request_ends`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build` |
-| The next server serves only after the last one's children exit. | `children.rs`: `a_held_child_file_gets_its_group_stopped_and_the_lock_frees`, `a_child_file_whose_lock_is_free_is_never_signalled`; `tests/requests.rs`: `the_next_server_serves_only_after_a_killed_servers_build_exits`, `a_killed_servers_workers_exit_and_the_next_build_runs`; `tests/project_workers.rs`: `after_a_kill_during_worker_start_the_next_server_has_every_slot` |
-| At most `broker.max_lean_runs` short runs run at once. | `broker/reader.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `two_file_checks_run_lean_at_once`, `with_one_lean_run_two_file_checks_take_turns` |
-
-The [architecture notes](architecture.md#one-server-per-checkout) explain how the locks work and what they miss.
-
-### A refused start
-
-When a server refuses to start because another holds the store, stop that server by the pid the error names, or use the
-server that already runs.
-
-When it refuses because processes of an earlier server still hold `children.lock`:
-
-1. List every holder:
-
-   ```sh
-   lsof STORE/children.lock
-   ```
-
-2. Check each pid with `ps -o pid,pgid,command -p PID`. Expect `lake`, `lean` or `lean-host-mcp-worker` processes that
-   the dead server started.
-3. Stop each one by its exact pid, or its process group when the error names it: `kill -TERM -- -PGID`, then
-   `kill -KILL -- -PGID` if it does not exit. Do not stop processes by name.
-4. Start the server again. It deletes what the dead server left in `children/`.
-
-## Runtime-error contract
-
-Recoverable runtime and controller failures return a semantic response with `data: null` and an issue in `errors`. The
-issue has `code: "runtime_unavailable"`, a reason, a `retryable` flag, and structured `details`. Follow that flag and
-any recovery command; not every runtime refusal is retryable. See the [response schema](tool-catalog.md#response-shape)
-for the full shape.
-
-| Failure | Where it appears |
-| --- | --- |
-| Lean parse/elaboration diagnostics, kernel rejection, meta timeout | `data`; a failed proof is a completed tool call. |
-| Admission timeout, worker death, or session loss | `errors` with `code: "runtime_unavailable"`; retryability depends on the outcome. |
-| Heap-ceiling overrun | May abort the child and enter worker-death recovery; do not assume a Lean diagnostic. |
-| I/O/config errors, internal-invariant violations, unusable Lake project | MCP error. |
-
-Warnings also appear in `errors`, with `severity: "warning"` and an optional `next_action`. A completed fresh retry can
-return usable data alongside a warning about its earlier failed attempt.
-
-### Internal runtime facts
-
-The operation layer still computes freshness/import and runtime facts before semantic response adaptation. Runtime facts
-include worker generation, whether a call observed or performed a restart, retry count, controller queue wait, RSS when
-available, import profile, profile-switch count, and restart history. These remain telemetry and are omitted at the
-default quiet verbosity. Proof-relevant artifact facts are public under `trust.artifacts` and survive the quiet
-telemetry gate: source snapshots (`source` / `file` / `edit_fresh`), build artifacts (`olean` or `ilean` with
-`build_fresh`, `stale_build`, or `missing_build`), and worker/toolchain availability facts. Each source fact includes
-`content_sha256`, the digest of the exact bytes elaborated for that call.
-
-## Capability shims and module queries
-
-`lean_context(kind = "proof_position")` returns compact diagnostics, goals, and locals, with opt-in expected type and
-proof boundaries. It depends on the optional bounded `lean_rs_host_process_module_query_batch` shim; a worker lacking
-that capability answers `{ "status": "unsupported" }`. No public tool requests or caches whole-file info trees. With
-full telemetry, `query_facts` reports worker cache status, output bytes, and phase timings. Repeated calls reach the
-worker snapshot cache, so warm behavior is observable.
-
-Files whose headers import modules absent from the open environment are still processed; missing imports produce a
-semantic warning issue. Files using Lean 4's module-system header syntax — `module`, `public import`, `import all`, and
-`meta import` — are supported. A header that doesn't parse short-circuits to `header_parse_failed`.
-
-Unlike an external LSP process, the host can still start when unrelated project modules are broken. Calls whose imports
-avoid the broken module continue to work; a broken target file reports structured Lean diagnostics instead of a
-bootstrap failure.
-
-## Installing the server
-
-`lean-host-mcp install --lake-root PROJECT` makes one Lake project ready to serve. It reads the toolchain from
-`PROJECT/lean-toolchain` and writes only under `PROJECT/.local/lean-host-mcp/`, never a tracked file:
-
-| Path | Contents |
-| --- | --- |
-| `.gitignore` | `*`, so Git ignores the directory even when the project does not ignore `.local/` |
-| `bin/lean-host-mcp` | a copy of the running executable |
-| `workers/` | the worker for the project's toolchain, built as `install-worker` builds it |
-| `store/` | the server's private state, mode 0700, with the semantic search runtime that install builds in `semantic-runtimes/` |
-| `config.toml` | the local config file, with `[install]` set to the absolute `binary`, `workers_dir`, `store_dir` and `elan_home` |
-
-Serve with the installed copy:
-
-```sh
-PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
+```text
+processes an earlier server started still hold /work/project/.local/lean-host-mcp/store/children.lock after 35 s: process groups 51234 still run. Processes the server does not record, such as workers whose pipe to the dead server has not closed yet, may hold it too. `lsof /work/project/.local/lean-host-mcp/store/children.lock` lists every holder; stop them, then start the server again
 ```
 
-- `--dir DIR` puts `bin/`, `workers/` and `store/` under `DIR`. The config file stays at
-  `PROJECT/.local/lean-host-mcp/config.toml`, where the server reads it.
-- Without `--dir`, the worker and store directories follow the server's order: `LEAN_HOST_MCP_WORKERS_DIR` or
-  `LEAN_HOST_MCP_STORE_DIR`, then an `[install]` value already in the config files, then the default above.
-- A current worker stays; `--force` replaces it. A worker that another `lean-host-mcp` release built is stale, so
-  install replaces it after an upgrade.
-- `--source-dir DIR` passes to the worker build, as for `install-worker`.
-- Install takes the store as a server does (see [one server per store](#one-server-per-store)), so it refuses while a
-  server serves the project. Stop the server, install, then start it again.
-- Install builds the semantic search runtime for the project's toolchain into the store's `semantic-runtimes/`. A server
-  only opens it; a semantic call that finds it unbuilt fails and says to rerun `lean-host-mcp install --lake-root`.
-  `[build] timeout_secs` limits the build's wait for the cache's lock, and then its Lake run, and the same for a
-  server's open.
+1. List every holder with `lsof STORE/children.lock`.
+2. Check each with `ps -o pid,pgid,command -p PID`. Expect `lake`, `lean` or `lean-host-mcp-worker` processes that the
+   dead server started.
+3. Stop each by its exact pid, or its process group when the error names it: `kill -TERM -- -PGID`, then
+   `kill -KILL -- -PGID` if it does not exit. Never stop processes by name.
+4. Start the server again. It deletes what the dead server left in `children/`.
 
-Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
-file that is not valid TOML before it builds anything. It records `elan_home` as `ELAN_HOME`, else `$HOME/.elan`, so a
-server started without `ELAN_HOME` finds the toolchain without reading `HOME`. Install, then serve, write nothing under
-`HOME`; `install_and_serve_keep_no_state_in_an_empty_home` in `tests/http_transport.rs` checks this.
+### A refused worker
 
-## Installing workers
-
-The target Lake project's requested imports must have built `.olean` files. Any ordinary Lake project can be served; it
-need not copy the [test fixture](../fixtures/lean/README.md), declare host shims, or build its own shared facet for the
-server. The worker uses the shims bundled with `lean-rs-host`.
-
-`install-worker` compiles a worker for each Lean toolchain. Its `build.rs` embeds an absolute rpath to that toolchain's
-`lib/lean`. It installs into `--workers-dir DIR`, or into the worker directory of `--lake-root PROJECT`:
-`LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir`, then `PROJECT/.local/lean-host-mcp/workers`. The server finds
-workers through the same function. With neither flag, `install-worker` uses `LEAN_HOST_MCP_WORKERS_DIR` and fails when
-it is unset. With `--lake-root`, `install-worker` takes the project's store as a server does, except for `--list`, so it
-refuses while a server serves the project; then no worker it replaces, prunes or cleans can still run. With only
-`--workers-dir` it takes no store: stop every server that uses that directory first. Source selection is automatic:
-
-- **Registry** (the default for a `cargo install lean-host-mcp` binary): fetch and build the published
-  `lean-host-mcp-worker` crate at the server's own version (`cargo install lean-host-mcp-worker --version =<ver>`).
-- **Local workspace** (automatic when running from a checkout): build the worker from the workspace source
-  (`cargo build -p lean-host-mcp-worker`), reusing cargo's incremental cache.
-
-The detection is "was this binary built from a checkout that still has the worker crate beside it?" — no flag needed.
-`--source-dir <path>` overrides it to build from an explicit checkout (useful if the original checkout moved after the
-binary was built). Either way the worker needs a Rust toolchain on `PATH` and the matching Lean toolchain installed via
-elan; the freshly built worker is smoke-tested before it is recorded as usable.
-
-### Keeping workers compatible with the host
-
-Each worker lives in a generation, `DIR/<id>/generation-<name>/`, and `DIR/<id>/current-generation` names the one the
-server runs. The generation's `worker.json` records the worker wire-protocol version and, apart from it, the
-`lean-host-mcp` version that built the worker. The server runs no other layout, so an install made by an older
-lean-host-mcp must be redone. A worker in the toolchain's directory itself or at the top of the worker directory counts
-as missing, and a record that lacks a field this release requires counts as unusable.
-
-- `install-worker --auto` (the default) scans `toolchains/` in the elan home and (re)builds any worker that is **missing
-  or stale** — a record that does not load, `lean.h` header drift, protocol mismatch, or a build by another
-  `lean-host-mcp` release — and skips ones that are current. The worker and host crates release together, and a release
-  can keep the protocol version. The server still serves a worker whose protocol matches. Out-of-window toolchains are
-  skipped (a worker for them could never load). `--force` rebuilds current workers too (e.g. to re-run the smoke test or
-  replace a corrupted binary).
-- `install-worker --toolchain <id>` builds a fresh generation in its final directory. The new worker writes the shim
-  sources compiled into it to the generation's `shims/` directory and builds them there with plain Lake; the installer
-  records their digests in `worker.json`. After the builtin `Nat.add_zero` inspection and successful shutdown it
-  atomically updates `current-generation`. A failed build or smoke test fails the install and leaves the selected
-  generation in place. Existing workers retain their original paths. The installed shims and their compiled Lean imports
-  run without the source checkout or Cargo source cache. To use a different worker root, reinstall there. The SDK
-  manifest records absolute paths for its generation.
-- `install-worker --list` prints the selected generation of each toolchain; the `protocol` column reads `compatible` or
-  `incompatible`, and the status columns read `unknown` when the record does not load.
-- `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one, with any files an
-  older release left in its directory. Workers are rebuildable artifacts, so this only deletes from the install root and
-  never touches source. Use it for disk hygiene or to force a clean rebuild after a `lean-rs` ABI change.
-- `install-worker --prune` removes only *unservable* workers: those outside the supported window. Other stale workers
-  are kept, since another release may still serve them; rebuild those with `--auto`. `--list` and `--prune` skip a
-  directory with no `current-generation`.
-
-At runtime, package-version skew is silent when the protocol matches. A recorded protocol mismatch is a non-retryable
-`runtime_unavailable` response whose recovery command is `SERVER install --lake-root PROJECT`, where `SERVER` is the
-running executable. A missing worker, a record that does not load, header drift, a generation with no passing smoke test
-and a generation that differs from its record are also hard refusals. Each is one line that names the worker directory
-and ends with the same command:
+A missing, stale or incompatible worker refuses before it starts, with one line that names the worker directory and ends
+with the command that fixes it:
 
 ```text
 no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/workers (an install by an older lean-host-mcp must be redone); run: /work/project/.local/lean-host-mcp/bin/lean-host-mcp install --lake-root /work/project
 ```
 
-### Upgrading to 0.18
+Stop the server, run that command, and start the server again. A protocol mismatch is a `runtime_unavailable` reply that
+is not retryable and carries the same command. A proof search that finds its runtime unbuilt says to run `install`
+again.
 
-A 0.18 server, its workers and its SDK (lean-rs 0.12) upgrade together. A 0.18 server reads none of the locks, records
-and sockets that 0.17 kept. To upgrade:
+### A check that needs a build
 
-1. Stop every server and build that uses the project. A 0.18 server refuses to start while a 0.17 server holds the
-   store.
-2. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT`. It replaces the worker, since another
-   release built it, and builds the semantic search runtime into the store. Use `install-worker` for a worker installed
-   on its own.
-3. Remove `LEAN_HOST_MCP_SOCKET_DIR`, `LEAN_RS_WORKER_OWNERS_DIRECTORY` and the `LEAN_RS_WRITER_*` variables from the
-   server's environment and client configs. Nothing reads them now.
-4. Delete what 0.17 left, which blocks nothing: `owners/` in the store, or the directory that
-   `LEAN_RS_WORKER_OWNERS_DIRECTORY` named; the socket directory (`LEAN_HOST_MCP_SOCKET_DIR`, else
-   `$XDG_RUNTIME_DIR/lean-host-mcp`, else `$HOME/.lean-host-mcp-ipc`); the writer lock file `.lean-rs-writer-*.lock`
-   beside the project in its parent directory; and an old `bin/lean-rs-writer` in the install directory.
+Run the `lean_build` call that a `needs_build` row names, then retry; an `unknown_import` row means fix the import
+([response shape](tool-catalog.md#response-shape)). A failure at stage `lake_option_discovery` means Lake could not
+answer for the project's configuration, and no proof check ran. Right after a lakefile edit, a check can fail with
+Lake's "could not acquire an exclusive configuration lock". Retry it.
 
-## Build, test, lint
+### A lost reply
 
-```sh
-cargo build --locked -p lean-host-mcp                          # parent only
-cargo build --locked -p lean-host-mcp-worker                   # worker only (links libleanshared)
-cargo clippy --locked --workspace --all-targets -- -D warnings # safe; clippy doesn't link
-cargo test --locked -p lean-host-mcp --lib                     # parent unit tests
-cargo test --locked -p lean-host-mcp-worker --all-targets       # worker tests
-scripts/test-installed-stdio.sh --all-targets                  # includes installed-worker EOF and exit
-scripts/test-installed-module-setup.sh                         # packaged pair and semantic search
-scripts/check-parent-link.sh                                  # build and inspect the release parent
-cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation \
-    --no-run                                                   # ignored suites; run each test alone, below
-CARGO_NET_OFFLINE=true \
-    cargo test --locked -p lean-host-mcp --test http_transport install_and_serve_keep_no_state_in_an_empty_home \
-    -- --ignored                                               # install and serve with an empty HOME
-```
+Send the call again with the same `request_id`, or call `lean_get` with it. The server runs each id once and keeps its
+result; the [tool catalog](tool-catalog.md#named-requests) gives the states.
 
-Run the ignored tests that start workers one at a time, each with a new store. They start Lean processes, and the timing
-tests in `tests/requests.rs` assume no other load.
+### Runtime errors
 
-On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs, and the installed worker refuses any
-`DYLD_*` variable, so opt-in tests that check files or start a worker fail under `cargo test`. Build them with
-`cargo test --no-run`, then run each printed binary under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
-`LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and `TMPDIR` under the
-target directory. A test that ranks proofs needs the semantic runtime built in that cache first, as
-`examples/prepare_semantic_smoke.rs` builds it. For one printed binary `BINARY`:
+A runtime or controller failure a client can act on returns `data: null` and an issue in `errors` with
+`code: "runtime_unavailable"`, a reason, a `retryable` flag and `details`. Follow the flag and any recovery command.
 
-```sh
-for name in $(BINARY --list --ignored | sed -n 's/: test$//p'); do
-    env -u DYLD_FALLBACK_LIBRARY_PATH LEAN_HOST_MCP_TEST_FIXTURE="$PWD/fixtures/lean" \
-        LEAN_HOST_MCP_STORE_DIR="$(mktemp -d "$PWD/target/store.XXXXXX")" \
-        BINARY --ignored --exact "$name"
-done
-```
+| Failure | Where it appears |
+| --- | --- |
+| Lean parse or elaboration errors, kernel rejection, meta timeout | `data`; a failed proof is a completed call |
+| Admission timeout, worker death, session loss | `errors` with `code: "runtime_unavailable"`; retryable or not by outcome |
+| Heap-ceiling overrun | Can abort the child and enter worker-death recovery, with no Lean diagnostic |
+| I/O and config errors, broken invariants, an unusable Lake project | MCP error |
 
-The empty-HOME test clears its children's environment, so it runs under `cargo test`.
-
-Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
-and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
-`cargo package --workspace --locked` to verify the archives and installs from the unpacked sources in the target
-directory's `package/` subdirectory.
-
-The installed smoke scripts require Python 3.11 or later and a native build. They resolve the pin in
-`fixtures/lean/lean-toolchain` through Elan and use Cargo's configured target directory for artifacts. Keep the matching
-toolchain in the elan home's `toolchains/` for worker installation and discovery. `LEAN_SYSROOT` can select a matching
-prefix for the build. Run `actionlint` and `shellcheck scripts/*.sh` to lint the workflow and shell files.
-
-Dispatch the Release workflow from `main` to rehearse verification and packaging. A push of a matching `v<version>` tag
-triggers publication after the changelog and packages pass verification. To recover after partial publication, rerun the
-original tagged workflow. It skips crate versions already present on crates.io and continues to GitHub Release creation.
-
-## Smoke and performance baseline
-
-The ignored `smoke_perf` integration test is the black-box baseline harness for proof-agent work. It starts the compiled
-stdio MCP server, calls `tools/list`, runs representative tool calls, and emits JSONL rows with wall time, serialized
-response bytes, 32 KiB / 64 KiB budget flags, status, warning count, observable project-session changes, and process RSS
-when the platform exposes it. For `lean_context(kind = "proof_position")`, rows also include the worker module-cache
-status, worker-reported output bytes, phase timings, and optional worker cache size facts. The budget constants are
-test-only guardrails: ordinary model-facing responses should aim for 16–32 KiB, with 64 KiB as the default hard ceiling.
-Production truncation is still tool-specific policy.
-
-Every scenario starts workers, so set `LEAN_HOST_MCP_WORKERS_DIR` to an installed worker. The worker that Cargo builds
-refuses to serve without the files `install-worker` puts beside it. Run each test alone and outside `cargo test`, as
-[Build, test, lint](#build-test-lint) explains:
-
-```sh
-cargo test -p lean-host-mcp --test smoke_perf --no-run   # prints the test binary, BINARY
-env -u DYLD_FALLBACK_LIBRARY_PATH LEAN_HOST_MCP_WORKERS_DIR=/path/to/installed/workers \
-  BINARY --ignored --exact black_box_mcp_smoke_perf_baseline --nocapture
-
-LEAN_HOST_MCP_SMOKE_PROJECT=/path/to/your/lake/project \
-  LEAN_HOST_MCP_SMOKE_FILE=Relative/Module/File.lean \
-  LEAN_HOST_MCP_SMOKE_DECLARATION=Your.Namespace.declaration \
-  env -u DYLD_FALLBACK_LIBRARY_PATH LEAN_HOST_MCP_WORKERS_DIR=/path/to/installed/workers \
-  BINARY --ignored --exact black_box_mcp_smoke_perf_baseline --nocapture
-```
-
-Keep the JSONL output with performance changes so comparisons use the same workload, byte accounting, and cold/warm
-worker behavior.
-
-### Memory stability
-
-`scripts/memory_stability.py` answers the orthogonal question: does a long-lived server grow with *call count*? It
-replays a workload JSON `--repeats` times against one server and reports `peak_import_residue_mib`,
-`final_import_residue_mib`, `final_worker_generation`, and `call_restart_count` per run. Residue is monotone within a
-generation, so `peak == final` with the generation unmoved is the flat-growth result.
-
-```sh
-uv run scripts/memory_stability.py \
-  --project-root /path/to/lake/project \
-  --workload scripts/memory_stability.kanproofs.json \
-  --server-bin target/release/lean-host-mcp \
-  --workers-dir /path/to/installed/workers \
-  --repeats 15
-```
-
-Measured on a Mathlib-scale project (four tools against one file, 15 repeats — 60 calls): **60/60 `ok`, generation 1
-throughout, 0 restarts, residue 1786 MiB peak and final against a 9216 MiB budget, RSS 5.46 GB.** This baseline
-exercises a repeated import profile; it does not predict the residue growth of a changed-file sweep. The latter is
-bounded by the residue budget and covered by `crates/lean-host-mcp/tests/kanproofs_eval.rs`.
-
-A server serves the one project that `--lake-root` or `LEAN_HOST_MCP_PROJECT` names. An explicit `project=` must resolve
-to that canonical directory before the broker reads the project or opens a worker; without a root every call fails.
-Worker-side source and capability checks still apply.
-
-To verify a file in an already-built project, start the stdio server with
-`lean-host-mcp --lake-root /absolute/path/to/project`. Call `lean_verify` with a project-relative file and a
-declaration, for example:
-
-```json
-{"targets":[{"kind":"explicit","file":"Demo.lean","declarations":["Demo.exampleTheorem"]}]}
-```
-
-Under the request's read turn, the server runs the selected toolchain's `lake --no-build --no-cache setup-file <file>`
-as a short run and checks the current source using that file's options, imports, plugins and dynamic libraries. Lake
-builds nothing here, so keep the project built: when an import is missing or stale, Lake exits 3 and the reply is
-`needs_build`, with a `stale_build` row naming each module Lake lists and the `lean_build` call that builds it. When
-Lake exits 1 because an import names no module, the reply is `needs_build` with an `unknown_import` row for that import
-instead, which says to fix it. This route requires the setup-aware verification shim. File-backed `lean_lookup` with
-`kind="proof_search"` uses the same setup for goal elaboration.
-
-Every other source check also runs `lake --no-build --no-cache setup-file` first, with an empty header, to get the
-file's options without touching its imports. A file in a library gets that library's server options (`leanOptions` and
-`moreServerOptions`); a file outside every library, and a call with no file, get the root package's. `-D` arguments in
-`moreLeanArgs` and `weakLeanArgs` reach `lake build` only. When the library's own plugins or extra targets need a build,
-the reply is `needs_build`; any other failure there means no proof check ran.
-
-Lake writes its own config cache under `.lake/config/` when the lakefile changed, under Lake's own lock, so any check
-right after a lakefile edit can write there. When two checks start that write at the same moment, Lake fails one with
-"could not acquire an exclusive configuration lock"; retry it.
-
-**Elan maintenance.** Keep the selected canonical Elan toolchain installed and unchanged while its workers run. Stop the
-servers that use it before uninstalling or replacing that toolchain. The host checks release identity at admission; it
-takes no Elan maintenance lock. `install-worker --lake-root` with `--clean` or `--prune` takes the project's store, so
-it refuses while a server serves the project; with only `--workers-dir`, stop every server that uses the directory
-first.
+An admission timeout, `project_admission_timeout`, `mailbox_admission_timeout` or `queue_wait_timeout`, means the call
+never ran: retry it, or raise `runtime.request_timeout_millis` or `broker.max_lean_runs` when calls often wait. A fresh
+retry that completes returns usable data with a warning about the failed first attempt; a failed or uncertain retry
+returns none.
