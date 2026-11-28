@@ -29,6 +29,18 @@ jobs:
       - name: cargo deny check
         run: cargo deny --locked check
 
+  lake-native:
+    name: Lake-native check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install ripgrep
+        run: command -v rg >/dev/null || { sudo apt-get update && sudo apt-get install -y ripgrep; }
+      - name: shipped code reads no Lake file
+        run: scripts/check-lake-native.sh
+
   check:
     name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

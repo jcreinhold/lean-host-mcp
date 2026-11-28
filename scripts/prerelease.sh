@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/prerelease.sh — run the local pre-release checks.
 #
-# Runs the Rust checks, parent link check, and cargo-deny from CI.
+# Runs the Rust checks, parent link check, Lake-native check and cargo-deny
+# from CI.
 # Adds local taplo/prettier formatting, mdwright linting and cargo-shear.
 # See AGENTS.md "Build and validation" for the per-member build invariant.
 #
@@ -9,8 +10,8 @@
 #
 # All gates are attempted even if an earlier one fails; the run ends with
 # a pass/fail/skip summary and a non-zero exit if anything failed. Optional
-# tools (taplo, mdwright, prettier via npx, cargo-deny, cargo-shear) are skipped
-# when absent — so the script runs on any dev box.
+# tools (rg, taplo, mdwright, prettier via npx, cargo-deny, cargo-shear) are
+# skipped when absent — so the script runs on any dev box.
 #
 # Usage:
 #   scripts/prerelease.sh            # run local checks
@@ -143,6 +144,12 @@ run_gate "cargo test --locked -p lean-host-mcp --all-targets (installed stdio wo
 	scripts/test-installed-stdio.sh --all-targets
 
 run_gate "Parent release link check" scripts/check-parent-link.sh
+
+if command -v rg >/dev/null 2>&1; then
+	run_gate "Lake-native check" scripts/check-lake-native.sh
+else
+	skip_gate "Lake-native check (rg not installed)"
+fi
 
 # -- Local formatting and Markdown lint checks (beyond CI) ------------------
 
