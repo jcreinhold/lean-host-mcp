@@ -226,7 +226,7 @@ impl ProjectBroker {
         body: Vec<u8>,
     ) -> Result<Vec<u8>> {
         let PreparedReader { sysroot, shims, .. } = reader;
-        crate::lake_options::reader_output(
+        super::reader::reader_output(
             "Lean file driver",
             root,
             crate::cancellation::CallCancellation::current()
@@ -339,7 +339,7 @@ impl ProjectBroker {
             .lean_options(setup.options.clone());
         let PreparedReader { sysroot, .. } = reader;
         let (cwd, path, snapshot) = (root.clone(), PathBuf::from(file), source.as_bytes().to_vec());
-        let output = crate::lake_options::reader_run(
+        let output = super::reader::reader_run(
             "Lean file diagnostics",
             &root,
             crate::cancellation::CallCancellation::current()
@@ -409,7 +409,7 @@ struct LeanPosition {
 /// position. When the byte budget cannot hold every row, errors come first,
 /// then warnings, then the rest, and the list is marked truncated.
 fn lean_messages(
-    output: &crate::lake_options::ReaderOutput,
+    output: &super::reader::ReaderOutput,
     file: &str,
     budgets: &lean_rs_worker_parent::LeanWorkerOutputBudgets,
 ) -> Result<crate::projections::ElabFailure> {
@@ -510,8 +510,8 @@ mod tests {
     const ERROR: &str = r#"{"fileName":"/p/A.lean","pos":{"line":3,"column":2},"endPos":{"line":3,"column":7},"keepFullRange":false,"severity":"error","isSilent":false,"caption":"","data":"unknown identifier 'x'","kind":"lean.unknownIdentifier"}"#;
     const INFO: &str = r#"{"fileName":"/p/A.lean","pos":{"line":1,"column":0},"endPos":null,"keepFullRange":false,"severity":"information","isSilent":false,"caption":"note","data":"hi","kind":"[anonymous]"}"#;
 
-    fn output(exit_code: i32, lines: &[&str]) -> crate::lake_options::ReaderOutput {
-        crate::lake_options::ReaderOutput {
+    fn output(exit_code: i32, lines: &[&str]) -> crate::broker::reader::ReaderOutput {
+        crate::broker::reader::ReaderOutput {
             exit_code,
             stdout: lines.join("\n").into_bytes(),
             stderr: "trace".to_owned(),

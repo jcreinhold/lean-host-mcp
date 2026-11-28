@@ -65,7 +65,7 @@ descriptions are explanatory, not literal setting values.
 | `runtime.worker_session_pool_capacity` | integer | `8` | `LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY` | How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8. |
 | `broker.max_workers` | integer | `4` | `LEAN_HOST_MCP_MAX_WORKERS` | Worker processes the server may run at once, counting workers that are starting or still exiting. An exiting worker keeps its slot until its exit is confirmed, so a value above max_workers_per_project lets a new worker start while an old one exits. Default 4. |
 | `broker.max_workers_per_project` | integer | `1` | `LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT` | Workers that may serve the project at once. An extra worker opens only when a slot is free; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks: each worker keeps its own imports and cache. Default 1. |
-| `broker.max_lean_runs` | integer | `2` | `LEAN_HOST_MCP_MAX_LEAN_RUNS` | Short lean and lake runs the server may run at once: file checks, setup-file runs, options probes and semantic file runs. Each takes a permit before it starts and keeps it until its process group has exited; a run that finds no permit by its deadline does not start. Default 2. |
+| `broker.max_lean_runs` | integer | `2` | `LEAN_HOST_MCP_MAX_LEAN_RUNS` | Short lean and lake runs the server may run at once: file checks, lake setup-file and lake query runs, and semantic file runs. Each takes a permit before it starts and keeps it until its process group has exited; a run that finds no permit by its deadline does not start. Default 2. |
 | `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Stop a worker after this many idle seconds. 0 turns idle retirement off. Default 10 minutes. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
 | `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
@@ -119,11 +119,11 @@ Build through `lean_build`. The turns order only the Lake and Lean runs this ser
 the server can rewrite `.olean` files while a check reads them, and the server does not notice. That is outside the
 contract. Bundled shims and installed toolchain contents remain trusted fixed runtime inputs.
 
-File checks, `lake setup-file` runs, options probes and semantic file runs are short runs: one `lean` or `lake` process
-in its own process group, with private inputs under the store's `runs/`. At most `broker.max_lean_runs` of them run at
-once (default 2). Each takes a permit before it starts and keeps it until its group has exited, even past its reply. A
-run that gets no permit by its request's deadline does not start, and its error says to raise `broker.max_lean_runs` or
-retry. Short runs take no worker slot.
+File checks, `lake setup-file` and `lake query` runs, and semantic file runs are short runs: one `lean` or `lake`
+process in its own process group, with private inputs under the store's `runs/`. At most `broker.max_lean_runs` of them
+run at once (default 2). Each takes a permit before it starts and keeps it until its group has exited, even past its
+reply. A run that gets no permit by its request's deadline does not start, and its error says to raise
+`broker.max_lean_runs` or retry. Short runs take no worker slot.
 
 ### Memory and import cycling
 
@@ -441,7 +441,7 @@ These rules hold, and each has a test:
 | One server per checkout: a second server on the store exits and names the first. | `store.rs`: `second_lock_names_the_holder`, `a_refused_start_names_the_holder_and_leaves_children_alone`; `tests/http_transport.rs`: `second_server_on_one_store_names_the_first` |
 | Checks share the turn, and a build runs alone. | `project_lock/tests.rs`: `two_requests_hold_read_turns_at_once`, `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`, `a_read_share_keeps_a_build_waiting_after_its_request_ends`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build` |
 | The next server serves only after the last one's children exit. | `children.rs`: `a_held_child_file_gets_its_group_stopped_and_the_lock_frees`, `a_child_file_whose_lock_is_free_is_never_signalled`; `tests/requests.rs`: `the_next_server_serves_only_after_a_killed_servers_build_exits`, `a_killed_servers_workers_exit_and_the_next_build_runs`; `tests/project_workers.rs`: `after_a_kill_during_worker_start_the_next_server_has_every_slot` |
-| At most `broker.max_lean_runs` short runs run at once. | `lake_options.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `two_file_checks_run_lean_at_once`, `with_one_lean_run_two_file_checks_take_turns` |
+| At most `broker.max_lean_runs` short runs run at once. | `broker/reader.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `two_file_checks_run_lean_at_once`, `with_one_lean_run_two_file_checks_take_turns` |
 
 The [architecture notes](architecture.md#one-server-per-checkout) explain how the locks work and what they miss.
 
@@ -746,7 +746,13 @@ Lake exits 1 because an import names no module, the reply is `needs_build` with 
 instead, which says to fix it. This route requires the setup-aware verification shim. File-backed `lean_lookup` with
 `kind="proof_search"` uses the same setup for goal elaboration.
 
-Lake writes its own config cache under `.lake/config/` when the lakefile changed, under Lake's own lock, so a file check
+Every other source check also runs `lake --no-build --no-cache setup-file` first, with an empty header, to get the
+file's options without touching its imports. A file in a library gets that library's server options (`leanOptions` and
+`moreServerOptions`); a file outside every library, and a call with no file, get the root package's. `-D` arguments in
+`moreLeanArgs` and `weakLeanArgs` reach `lake build` only. When the library's own plugins or extra targets need a build,
+the reply is `needs_build`; any other failure there means no proof check ran.
+
+Lake writes its own config cache under `.lake/config/` when the lakefile changed, under Lake's own lock, so any check
 right after a lakefile edit can write there. When two checks start that write at the same moment, Lake fails one with
 "could not acquire an exclusive configuration lock"; retry it.
 

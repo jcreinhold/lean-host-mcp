@@ -2,7 +2,10 @@
 //! frame, including import visibility, plugin entry points and compiler
 //! options.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
+use crate::cancellation::CallCancellation;
+use crate::envelope::TargetCheckNotStarted;
 use crate::error::{invalid, invalid_data};
+use lean_toolchain::LeanOptionValue;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -15,6 +18,12 @@ use std::{
 const SETUP_FILE: &str = "Lake setup-file";
 const MODULE_SOURCES: &str = "Lake module sources";
 const MODULE_LOOKUP: &str = "Lake module lookup";
+const OPTION_DISCOVERY: &str = "Lake option discovery";
+
+/// The header `lake setup-file` reads in place of the file's own when it
+/// looks up options. It imports nothing, so Lake builds and checks no import,
+/// and a stale import cannot fail the lookup.
+const NO_IMPORTS: &str = r#"{"imports":[],"isModule":false}"#;
 
 /// Lake's exit code when `--no-build` meets a target it would have to rebuild
 /// (`noBuildCode`, `Lake/Build/Run.lean`).
@@ -39,7 +48,7 @@ fn failed_jobs(stderr: &str) -> impl Iterator<Item = &str> {
 
 /// The setup Lake printed, or [`ServerError::OutOfDate`] naming the targets
 /// Lake would have to rebuild first.
-fn setup_output(output: crate::lake_options::ReaderOutput) -> Result<Vec<u8>> {
+fn setup_output(output: super::reader::ReaderOutput) -> Result<Vec<u8>> {
     if output.exit_code != NO_BUILD_EXIT {
         return Ok(output.stdout);
     }
@@ -86,6 +95,27 @@ fn names_no_module(module: &str, stderr: &str) -> bool {
             }))
 }
 
+/// The error for an option lookup for `file_label` that failed with `error`.
+/// Lake may have run the project's configuration, but no check of the file
+/// started: the error says so, and the request records it.
+fn options_failed(file_label: &str, error: ServerError) -> ServerError {
+    let target_check = TargetCheckNotStarted {
+        file_label: file_label.to_owned(),
+        stage: "lake_option_discovery".to_owned(),
+        disposition: "not_started".to_owned(),
+    };
+    CallCancellation::current().target_check_not_started(target_check.clone());
+    let message = if let ServerError::BadProject(message) = error {
+        message
+    } else {
+        error.to_string()
+    };
+    ServerError::PreparationFailed {
+        message: format!("{message}; no proof check ran"),
+        target_check,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ModuleSetup {
@@ -99,7 +129,7 @@ struct ModuleSetup {
     import_arts: BTreeMap<String, Vec<Vec<PathBuf>>>,
     plugins: Vec<Plugin>,
     dynlibs: Vec<PathBuf>,
-    options: BTreeMap<String, lean_toolchain::LeanOptionValue>,
+    options: BTreeMap<String, LeanOptionValue>,
 }
 
 #[derive(Deserialize)]
@@ -131,7 +161,7 @@ impl Identity {
 /// file it names, taken when Lake answered.
 pub(crate) struct StagedSetup {
     pub(crate) bytes: Vec<u8>,
-    pub(crate) options: BTreeMap<String, lean_toolchain::LeanOptionValue>,
+    pub(crate) options: BTreeMap<String, LeanOptionValue>,
     sysroot: PathBuf,
     /// The project's package roots ([`crate::lake_meta::manifest_package_roots`]).
     packages: Vec<PathBuf>,
@@ -319,6 +349,47 @@ impl ProjectBroker {
         Ok((setup.name, imports))
     }
 
+    /// The options Lake gives the Lean server for the file `label` names, as
+    /// `lake setup-file` reports them under this request's read turn: the
+    /// server options of the library that holds the file, or the root
+    /// package's for a file outside every library. A label in angle brackets,
+    /// such as `<elaborate>`, names no file and gets the root package's.
+    ///
+    /// Lake reads [`NO_IMPORTS`] in place of the file's header, so it builds
+    /// and checks no import. It returns [`ServerError::OutOfDate`] only when
+    /// the library's own needs, such as a plugin, must be built first. Any
+    /// other failure says that the check of `label` never started.
+    pub(super) async fn module_options(&self, root: &Path, label: &str) -> Result<BTreeMap<String, LeanOptionValue>> {
+        self.ensure_read(root).await?;
+        // Lake resolves a relative path against its working directory, the
+        // root. A label in angle brackets names no file there, so Lake takes
+        // it for a file outside every library.
+        let file = if label.starts_with('<') {
+            OsString::from(label)
+        } else {
+            root.join(label).into_os_string()
+        };
+        let args = vec!["setup-file".into(), file, NO_IMPORTS.into()];
+        let lookup: Result<ModuleSetup> = async {
+            let (_, output) = self
+                .lake_reader(root, OPTION_DISCOVERY, args, &[0, NO_BUILD_EXIT])
+                .await?;
+            Ok(parse_setup(&setup_output(output)?)?)
+        }
+        .await;
+        match lookup {
+            Ok(setup) => {
+                tracing::debug!(
+                    root = %root.display(), module = %setup.name, lean_options = ?setup.options,
+                    "Lake's server options; the host heartbeat limit overrides maxHeartbeats"
+                );
+                Ok(setup.options)
+            }
+            Err(error @ ServerError::OutOfDate { .. }) => Err(error),
+            Err(error) => Err(options_failed(label, error)),
+        }
+    }
+
     /// The source file Lake reads for each of `modules`, in order, as
     /// `lake query +MODULE:lean` reports it under this request's read turn:
     /// the module's path under its library's `srcDir`. Lake builds nothing.
@@ -396,7 +467,7 @@ impl ProjectBroker {
     /// The error for a `lake setup-file` that failed:
     /// [`ServerError::UnknownImports`] when the modules it names include one
     /// Lake finds no module for, else what Lake printed.
-    async fn setup_failure(&self, root: &Path, output: crate::lake_options::ReaderOutput) -> ServerError {
+    async fn setup_failure(&self, root: &Path, output: super::reader::ReaderOutput) -> ServerError {
         match self.unknown_modules(root, &failed_modules(&output.stderr)).await {
             Ok(modules) if !modules.is_empty() => ServerError::UnknownImports {
                 modules,
@@ -440,7 +511,7 @@ impl ProjectBroker {
         label: &'static str,
         args: Vec<OsString>,
         accepted: &'static [i32],
-    ) -> Result<(PathBuf, crate::lake_options::ReaderOutput)> {
+    ) -> Result<(PathBuf, super::reader::ReaderOutput)> {
         let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(invalid)?;
         if id.window_verdict() != crate::toolchain::WindowVerdict::Supported {
             return Err(ServerError::BadProject(format!(
@@ -451,7 +522,7 @@ impl ProjectBroker {
         let activity = self.preparation_activity();
         let lake = sysroot.join("bin/lake");
         let cwd = root.to_owned();
-        let output = crate::lake_options::reader_run(
+        let output = super::reader::reader_run(
             label,
             root,
             crate::cancellation::CallCancellation::current()
@@ -523,7 +594,7 @@ mod tests {
                       error: target is out-of-date and needs to be rebuilt\n\
                       Some required targets logged failures:\n\
                       - A\n";
-        let output = |exit_code| crate::lake_options::ReaderOutput {
+        let output = |exit_code| crate::broker::reader::ReaderOutput {
             exit_code,
             stdout: b"{}".to_vec(),
             stderr: stderr.to_owned(),
@@ -565,6 +636,111 @@ mod tests {
             "Chain.B",
             "error: /p/Chain/B.lean:1:0: unexpected token; expected command\n"
         ));
+    }
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn a_failed_option_lookup_says_the_check_never_started() -> TestResult {
+        let request = tokio_util::sync::CancellationToken::new();
+        let (error, evidence) = crate::cancellation::with_cancellation_evidence(&request, async {
+            options_failed(
+                "Demo.lean",
+                ServerError::BadProject("Lake option discovery: the program exited with code 1: why".to_owned()),
+            )
+        })
+        .await;
+        let target = evidence.target_check.ok_or("no target check was recorded")?;
+        assert_eq!(
+            (
+                target.file_label.as_str(),
+                target.stage.as_str(),
+                target.disposition.as_str()
+            ),
+            ("Demo.lean", "lake_option_discovery", "not_started")
+        );
+        let error = rmcp::ErrorData::from(error);
+        assert_eq!(
+            error.message,
+            "lake project not usable: Lake option discovery: the program exited with code 1: why; no proof check ran"
+        );
+        let stage = error.data.as_ref().and_then(|data| data.pointer("/target_check/stage"));
+        assert_eq!(stage, Some(&serde_json::json!("lake_option_discovery")));
+        Ok(())
+    }
+
+    /// A Lake project in a new directory, with the fixture's toolchain, whose
+    /// package and libraries set options in each way Lake knows. `Strict`
+    /// imports `Loose`, which nothing has built.
+    fn options_project() -> TestResult<(tempfile::TempDir, PathBuf)> {
+        let fixture = std::env::var_os("LEAN_HOST_MCP_TEST_FIXTURE").ok_or("set LEAN_HOST_MCP_TEST_FIXTURE")?;
+        let pin = fs::read_to_string(Path::new(&fixture).join("lean-toolchain"))?;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let files = [
+            ("lean-toolchain", pin.as_str()),
+            (
+                "lake-manifest.json",
+                r#"{"version":"1.1.0","packagesDir":".lake/packages","packages":[]}"#,
+            ),
+            (
+                "lakefile.lean",
+                "import Lake\nopen Lake DSL\n\npackage options_test where\n  \
+                 leanOptions := #[⟨`pp.unicode.fun, true⟩]\n  \
+                 moreServerOptions := #[⟨`linter.unusedVariables, false⟩]\n  \
+                 moreLeanArgs := #[\"-DmaxRecDepth=321\"]\n\n\
+                 lean_lib Strict where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n  \
+                 moreServerOptions := #[⟨`maxSynthPendingDepth, .ofNat 3⟩]\n\n\
+                 lean_lib Loose where\n  srcDir := \"src\"\n",
+            ),
+            ("Strict.lean", "import Loose\n"),
+            ("src/Loose.lean", "def loose : Nat := 1\n"),
+            ("Outside.lean", "def outside : Nat := 1\n"),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, text)?;
+        }
+        Ok((dir, root))
+    }
+
+    /// The server takes each file's options from Lake: a library file gets
+    /// its library's server options, which add `moreServerOptions` and leave
+    /// out `-D` arguments; a file outside every library, and a label that
+    /// names no file, get the root package's. A stale import does not fail
+    /// the lookup, and Lake builds nothing.
+    #[tokio::test]
+    #[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE"]
+    async fn options_are_the_server_options_lake_gives_each_file() -> TestResult {
+        let (_dir, root) = options_project()?;
+        let broker = ProjectBroker::new(super::super::BrokerConfig {
+            lake_root: Some(root.clone()),
+            ..super::super::BrokerConfig::unserved()
+        });
+        let package = BTreeMap::from([
+            ("linter.unusedVariables".to_owned(), LeanOptionValue::Bool(false)),
+            ("pp.unicode.fun".to_owned(), LeanOptionValue::Bool(true)),
+        ]);
+        let mut strict = package.clone();
+        strict.insert("autoImplicit".to_owned(), LeanOptionValue::Bool(false));
+        strict.insert("maxSynthPendingDepth".to_owned(), LeanOptionValue::Nat(3));
+        // The first lookup also elaborates the configuration; the second
+        // reads Lake's saved copy.
+        let started = std::time::Instant::now();
+        assert_eq!(broker.module_options(&root, "Strict.lean").await?, strict);
+        let first = started.elapsed();
+        let started = std::time::Instant::now();
+        assert_eq!(broker.module_options(&root, "Strict.lean").await?, strict);
+        eprintln!("Lake's options took {first:?}, then {:?}", started.elapsed());
+        let src = root.join("src/Loose.lean");
+        for label in [src.to_str().ok_or("path is not UTF-8")?, "Outside.lean", "<elaborate>"] {
+            assert_eq!(broker.module_options(&root, label).await?, package, "{label}");
+        }
+        assert!(!root.join(".lake/build").exists(), "Lake built something");
+        Ok(())
     }
 
     #[test]

@@ -28,7 +28,8 @@ crates/lean-host-mcp/src/
   broker.rs              ProjectBroker: the served root, worker slots, short-run permits, idle retirement, the reaper
   broker/control.rs      worker activity snapshots for lean_runtime, and the activity count
   broker/host_artifacts.rs the installed shims a worker reads before it opens
-  broker/module_setup.rs lake setup-file and lake query as short runs; the import closure and module sources
+  broker/module_setup.rs lake setup-file and lake query as short runs; a file's options, the import closure and module sources
+  broker/reader.rs       reader runs: the permit, read share and exit codes of each short run a check starts
   broker/semantic_file.rs file-backed semantic proof search through a short run
   broker/verify_file.rs  file checks through one-shot Lean programs
   project.rs             LeanProject actor: one serialized controller and worker
@@ -45,7 +46,7 @@ crates/lean-host-mcp/src/
   tools/                 semantic.rs facade; declaration/proof_search/proof_action/position internals; build.rs
   projections.rs         stable MCP projections from lean-rs worker types
   lake_meta.rs           minimal Lake-project metadata
-  lake_options.rs, lake/ Lake compile options and setup through Lake's own API, without building imports
+  lake/                  the Lean drivers that file checks and semantic file runs load
   toolchain.rs           the project's lean-toolchain pin, its elan toolchain and its worker
   cache.rs               bounded module-query cache, valid while the worker that computed an entry lives
   envelope.rs            internal operation envelope adapted to { data, errors, trust } at the public boundary
@@ -289,9 +290,9 @@ it and answers only while that generation lives: a build stops every worker befo
 what a live generation read. A probe made while another generation lives, or none, drops the entry. Execution taint
 prevents insertion, and unknown query variants bypass caching.
 
-A valid hit bypasses the actor mailbox, but source option discovery still runs. Name-only inspection/search, proof
-attempts, and verification are not cached: their meaning depends on an imported environment and execution policy that
-cannot be identified by source content alone. The worker separately owns bounded module snapshot reuse.
+A valid hit bypasses the actor mailbox, but the option lookup still runs. Name-only inspection/search, proof attempts,
+and verification are not cached: their meaning depends on an imported environment and execution policy that cannot be
+identified by source content alone. The worker separately owns bounded module snapshot reuse.
 
 ## Reference indices
 
@@ -385,38 +386,46 @@ narrowing/fallback behavior, exact array arities, and stale-source reporting.
 
 ## Lake compilation options
 
-Source checks resolve the target file's options through the pinned Lake API before checking or looking up a cached
-result. The helper evaluates configuration afresh without resolving or materializing dependencies or entering Lake's
-build graph. Root and direct dependency files use their own package and library settings, including saved root `-K`
-options and current `require ... with` options. Source checks for transitive dependencies fail explicitly rather than
-guess their configuration; lookups of already-built declarations are unaffected.
+Before a source check runs or reads a cached result, the server asks Lake for the target file's options with
+`lake --no-build --no-cache setup-file FILE '{"imports":[],"isModule":false}'`. Lake reads the second argument as the
+file's header in place of the one in the file (`setupServerModule` in `Lake/Build/Module.lean`). That header imports
+nothing, so Lake checks and builds no import, and a stale or missing import cannot fail the lookup. Lake answers as it
+answers an editor:
 
-The helper is a short run (`lean_run.rs`), like a file check: one program in its own process group, with capped output.
-Both root and dependency configuration caches live in the run's private directory under the store's `runs/`; framework
-loading creates no project `.lake` directory and changes no shared cache or trace. Real package paths, cwd and `__dir__`
-remain intact. The run holds the request's read turn, so no build the server runs changes the files it reads. These are
-cooperating read-only programs; arbitrary user configuration IO is not sandboxed. Private inputs stay until the run's
-group has exited. Files outside a configured library and file-less trials use Lake's root-package defaults.
+- A file in a library, a dependency's library included, gets that library's server options (`LeanLib.serverOptions` in
+  `Lake/Config/LeanLib.lean`): the build type's options, the package's `leanOptions` and `moreServerOptions`, then the
+  library's `leanOptions` and `moreServerOptions`.
+- A file outside every library, and a label such as `<elaborate>` that names no file, get the root package's
+  `leanOptions` and `moreServerOptions` (`Workspace.serverOptions`).
+- `-D` arguments in `moreLeanArgs` and `weakLeanArgs` are not server options. `lake build` passes them to Lean; checks
+  do not get them.
 
-Every short run takes a permit from the broker's `broker.max_lean_runs` semaphore before it starts and keeps it until
-its group has exited, even past its reply. A run that finds no permit by its deadline does not start. Short runs also
-join the broker's activity count, but take no worker slot, so option discovery does not evict a warm worker or request
-exclusive project access.
+Lake keeps its configuration cache under `.lake/config/` and elaborates the lakefile again only when the lakefile's
+text, the toolchain, the platform or a `-K` option changes. A change to some other file or variable the configuration
+reads does not refresh it.
 
-The worker receives typed options, including `weak.*` options. It resolves their types after imports load.
-`-Dname=value` compiler arguments use Lean's parser; other extra compiler arguments return an explicit unsupported
-error. Source, query and compilation options all contribute to the result-cache key. `freshness.elaboration_options`
-records the project options and the actual host heartbeat limit, which overrides the project's `maxHeartbeats`.
+Lake still fetches what the library itself needs: its `extraDep` target, dynlibs and plugins. When one of them needs a
+build, Lake exits 3 under `--no-build`, and the check replies `needs_build` with Lake's targets. Any other failure stops
+the check before it starts: the error's `target_check.stage` is `lake_option_discovery`, and the message says no proof
+check ran. The server never retries with default options.
 
-A helper starts once per source request, including cache hits. Evaluated configuration is not cached: it may read files
-or environment variables beyond the lakefile. Discovery has one 30-second admission/execution budget; cancellation
-requests owned group cleanup. Configuration errors return no proof verdict and never retry with defaults.
+The lookup is a short run (`broker/reader.rs`), like a file check: one program in its own process group, with capped
+output and Lake's cache directory pointed at the run's private directory under the store's `runs/`. Every short run
+takes a permit from the broker's `broker.max_lean_runs` semaphore before it starts, and keeps it and a share of the
+request's read turn until its group has exited, even past its reply. A run that finds no permit by its deadline does not
+start. Short runs join the broker's activity count but take no worker slot, so a lookup does not evict a warm worker.
+The lookup counts against the request's deadline; on the test fixture it takes about 0.4 s.
+
+The worker receives typed options, including `weak.*` options. It resolves their types after imports load. Source, query
+and compilation options all contribute to the result-cache key, so a lookup runs before every source check, cache hits
+included. `freshness.elaboration_options` records the project options and the actual host heartbeat limit, which
+overrides the project's `maxHeartbeats`.
 
 ## Queue and execution deadlines
 
 `runtime.request_timeout_millis` supplies a deadline from broker project acquisition through opening, mailbox admission,
-and waiting behind earlier requests. The same absolute deadline follows the job into the actor. Source-option resolution
-before project acquisition has its own budget. Worker operation timeouts remain separate; they do not bound the whole
+and waiting behind earlier requests. The same absolute deadline follows the job into the actor. The option lookup before
+project acquisition counts against it too. Worker operation timeouts remain separate; they do not bound the whole
 request across preparation, multiple operations, and retries.
 
 An expired queued request returns `queue_wait_timeout` and cannot run later. The actor and caller share one atomic
@@ -464,11 +473,11 @@ Lean writes each `.olean` to a temporary file and renames it into place (`src/li
 never sees a torn file and a file a worker has mapped never changes under it. The turns prevent the one hazard left: a
 check that loads some modules from before a build and some from after.
 
-After a lakefile edit, `lake setup-file` rewrites Lake's configuration cache, and checks hold read turns at once, so two
-can start that rewrite together. Lake locks the cache itself (`importConfigFile` in `Lake/Load/Lean/Elab.lean`): readers
-share the trace lock and a rewrite holds it alone, so the cache stays whole. Of two processes that start a rewrite at
-the same moment, Lake fails one with "could not acquire an exclusive configuration lock"; that check reports Lake's
-error, and a retry reads the new cache.
+After a lakefile edit, the next `lake setup-file` rewrites Lake's configuration cache. Every source check runs one,
+worker checks included, and checks hold read turns at once, so two can start that rewrite together. Lake locks the cache
+itself (`importConfigFile` in `Lake/Load/Lean/Elab.lean`): readers share the trace lock and a rewrite holds it alone, so
+the cache stays whole. Of two processes that start a rewrite at the same moment, Lake fails one with "could not acquire
+an exclusive configuration lock"; that check reports Lake's error, and a retry reads the new cache.
 
 The turns order only the Lake and Lean runs this server starts. A `lake build` run outside the server can rewrite
 `.olean` files while a check reads them, and neither the turns nor the finished-build count see it. That is outside the
@@ -488,7 +497,7 @@ that checks the code. "None yet" marks a gap.
 | A worker serves trials, proof positions, lookups and checks of modules with no source file from the project's own build, path dependencies included. | `tests/project_workers.rs`: `a_trial_imports_a_dependency_module_and_prints_its_axioms`, `a_proof_position_and_a_lookup_answer_from_the_project_build`, `a_module_without_a_source_file_is_checked_in_a_worker` |
 | A worker admits an import only through its launch roots, in order, then the shim roots, while no root holds `Init`. | `tests/project_workers.rs`: `an_import_through_other_roots_is_refused`, `an_import_root_that_holds_init_is_refused` |
 | Workers stay within `max_workers` and `max_workers_per_project` while checks, trials and builds share a project. | `tests/many_clients.rs`: `many_clients_share_one_project` |
-| At most `broker.max_lean_runs` short runs at once; a run that gets no permit by its deadline never starts. | `lake_options.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `with_one_lean_run_two_file_checks_take_turns`, and `two_file_checks_run_lean_at_once` for the default of two |
+| At most `broker.max_lean_runs` short runs at once; a run that gets no permit by its deadline never starts. | `broker/reader.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `with_one_lean_run_two_file_checks_take_turns`, and `two_file_checks_run_lean_at_once` for the default of two |
 | A short run stops its whole group on cancel, at its time limit, past its output cap, or when its leader leaves members running, and its reply never waits on a process outside the group. | `lean_run.rs`: `a_cancelled_run_writes_no_inputs_and_never_starts`, `a_run_past_its_limit_stops_the_group`, `output_past_the_cap_stops_the_group`, `a_leftover_member_holding_stdout_open_is_stopped_without_waiting_for_eof` |
 | No build starts between a check's `setup-file` and its use of the imports. | `project_lock/tests.rs`: `a_nested_read_reuses_the_turn_while_a_writer_waits` |
 | The next server serves only after the last one's children exit: it stops each recorded group whose file lock is held, then waits for `children.lock`. | `children.rs`: `a_held_child_file_gets_its_group_stopped_and_the_lock_frees`, `a_free_children_lock_clears_stale_files_and_passes_to_children`; `tests/requests.rs`: `the_next_server_serves_only_after_a_killed_servers_build_exits`, `a_killed_servers_workers_exit_and_the_next_build_runs` |

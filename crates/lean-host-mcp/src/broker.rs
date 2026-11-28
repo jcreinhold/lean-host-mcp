@@ -34,7 +34,7 @@
 //! [`ProjectBroker::runtime_status`] observes the pool.
 //!
 //! **Short runs.** A `lean` or `lake` process the server starts for a check
-//! (a file check, a setup-file run, an options probe or a semantic file run)
+//! (a file check, a `lake setup-file` or `lake query` run, or a semantic file run)
 //! first takes one of [`BrokerConfig::max_lean_runs`] permits. Requirement: at
 //! most that many short runs execute at once, whatever the number of clients.
 
@@ -67,6 +67,7 @@ use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
 mod control;
 mod host_artifacts;
 pub(crate) mod module_setup;
+mod reader;
 pub(crate) mod semantic_file;
 pub(crate) mod verify_file;
 pub(crate) use control::MaintenanceAccess;
@@ -819,17 +820,11 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<LeanWorkerElabOptions> {
         self.ensure_read(&meta.canonical_root).await?;
-        let activity = self.preparation_activity();
-        // Resolve availability before evaluating arbitrary project configuration.
-        // This is metadata-only and preserves ordinary missing-worker precedence.
+        // Find the worker before Lake runs the project's configuration. This
+        // reads metadata only, so a missing worker still comes first.
         let _worker = crate::project::resolve_worker(meta)?;
-        crate::lake_options::resolve(
-            &meta.canonical_root,
-            options,
-            self.lean_runs(),
-            Some(Box::new(activity)),
-        )
-        .await
+        let lean_options = self.module_options(&meta.canonical_root, &options.file_label).await?;
+        Ok(options.lean_options(lean_options))
     }
 
     async fn project_for(&self, hint: ProjectHint) -> Result<(Arc<LeanProject>, Instant)> {

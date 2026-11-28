@@ -21,7 +21,6 @@ mod error;
 mod host_preparation;
 mod ilean;
 mod lake_meta;
-mod lake_options;
 mod lean_run;
 mod project;
 mod project_lock;

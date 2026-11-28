@@ -55,6 +55,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `lean-host-mcp` now depends on `lean-host-mcp-worker`, at the same version and with default features off, for the
   deployment record in `worker.json`. The server and the worker read that record through one type, and the server no
   longer keeps its own copy. The library links no Lean; the worker binary still needs the `native-worker` feature.
+- A check gets its file's options from Lake, as an editor does: the server runs
+  `lake --no-build --no-cache setup-file FILE '{"imports":[],"isModule":false}'`, whose empty header keeps Lake from
+  checking or building any import. The server's own reader of the Lake configuration, `ModuleOptions.lean`, is gone. A
+  file in a library gets that library's server options, which now include `moreServerOptions` and leave out the `-D`
+  arguments in `moreLeanArgs` and `weakLeanArgs`. A file outside every library, and a call with no file, get the root
+  package's. A file in a dependency gets its own library's options; before, a check of a file in a transitive dependency
+  failed. Lake's configuration cache now applies, so Lake reads the lakefile again only when its text, the toolchain,
+  the platform or a `-K` option changes, and two checks right after a lakefile edit can meet Lake's "could not acquire
+  an exclusive configuration lock" error, as file checks already could. When the library's plugins or extra targets need
+  a build, the reply is `needs_build`. Any other failure still reports stage `lake_option_discovery` and runs no proof
+  check. The lookup counts against the request's deadline, not a separate 30-second budget, and takes about 0.4 s on the
+  test fixture, where the old reader took about 0.9 s.
 
 ## [0.18.0] - 2026-11-27
 

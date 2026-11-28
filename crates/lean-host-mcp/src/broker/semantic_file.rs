@@ -50,7 +50,7 @@ impl ProjectBroker {
             .map_err(invalid)??;
         let bootstrap = select_semantic_runtime(runtime.package_root(), runtime.module_dir())?;
         let body = request.reader_input(&roots)?;
-        let bytes = crate::lake_options::reader_output(
+        let bytes = super::reader::reader_output(
             "Lean semantic feature reader",
             &root,
             cancellation.remaining_or(Duration::from_millis(self.request_timeout_millis())),
