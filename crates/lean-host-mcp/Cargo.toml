@@ -3,6 +3,8 @@ authors.workspace = true
 categories = ["development-tools"]
 description = "MCP server hosting Lean 4 via a supervised lean-rs-worker child"
 edition.workspace = true
+# The integration suites use lean-host-mcp-test-support, which is not published, and fixtures outside this crate.
+exclude = ["tests/"]
 keywords = ["lean", "lean4", "mcp", "theorem-proving"]
 license.workspace = true
 name = "lean-host-mcp"
