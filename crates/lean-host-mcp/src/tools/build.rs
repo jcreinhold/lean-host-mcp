@@ -102,6 +102,31 @@ pub struct ImportsRequest {
     pub modules: Vec<String>,
 }
 
+impl ImportsRequest {
+    /// Refuse a request the tool never answers: one that names no file and no
+    /// module, more than [`MAX_IMPORT_FILES`] files or [`MAX_IMPORT_MODULES`]
+    /// modules, or a module name Lake would read as target syntax. A direct
+    /// call and a named request both check here.
+    ///
+    /// # Errors
+    /// Names the fault.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if self.files.is_empty() && self.modules.is_empty() {
+            return Err("name at least one of `files` and `modules`".to_owned());
+        }
+        if self.files.len() > MAX_IMPORT_FILES {
+            return Err(format!("`files` takes at most {MAX_IMPORT_FILES} files"));
+        }
+        if self.modules.len() > MAX_IMPORT_MODULES {
+            return Err(format!("`modules` takes at most {MAX_IMPORT_MODULES} modules"));
+        }
+        if let Some(name) = self.modules.iter().find(|name| !is_module_name(name)) {
+            return Err(format!("`{name}` is not a module name"));
+        }
+        Ok(())
+    }
+}
+
 /// `lean_imports` reply.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ImportsReply {
@@ -257,19 +282,9 @@ fn is_module_name(name: &str) -> bool {
 /// Lake names no source, or when Lake answers for no module, and
 /// [`ImportsError::Call`] for a bad request or when the call gets no turn.
 pub async fn lean_imports(ctx: &ToolContext, request: ImportsRequest) -> Result<ImportsReply, ImportsError> {
-    let invalid = |message: String| ImportsError::Call(McpError::invalid_params(message, None));
-    if request.files.is_empty() && request.modules.is_empty() {
-        return Err(invalid("name at least one of `files` and `modules`".to_owned()));
-    }
-    if request.files.len() > MAX_IMPORT_FILES {
-        return Err(invalid(format!("`files` takes at most {MAX_IMPORT_FILES} files")));
-    }
-    if request.modules.len() > MAX_IMPORT_MODULES {
-        return Err(invalid(format!("`modules` takes at most {MAX_IMPORT_MODULES} modules")));
-    }
-    if let Some(name) = request.modules.iter().find(|name| !is_module_name(name)) {
-        return Err(invalid(format!("`{name}` is not a module name")));
-    }
+    request
+        .check()
+        .map_err(|message| ImportsError::Call(McpError::invalid_params(message, None)))?;
     let root = ctx
         .broker
         .resolve(&ProjectHint::from_request(request.project))

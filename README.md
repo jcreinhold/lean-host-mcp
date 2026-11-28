@@ -58,7 +58,7 @@ it starts. The [tool catalog](docs/tool-catalog.md) gives every tool and reply.
 
 | Component | Version |
 | --- | --- |
-| `lean-host-mcp` and `lean-host-mcp-worker` | 0.19.0 |
+| `lean-host-mcp` and `lean-host-mcp-worker` | 0.19.1 |
 | `lean-rs` and `lean-toolchain` | 0.13.0 |
 | `lean-semantic-search` | 0.10.0 |
 | Worker protocol | 15 |

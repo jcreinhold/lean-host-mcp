@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-11-28
+
+### Fixed
+
+- `lean_imports` over MCP, as a direct or a named call, refused a call that named only `modules`: its argument check
+  still asked for 1 to 16 files. The call now applies the tool's own rules: at least one file or module, at most 16
+  files and 128 modules, and module names only.
+
 ## [0.19.0] - 2026-11-28
 
 ### Breaking
@@ -1196,7 +1204,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.22...v0.17.0

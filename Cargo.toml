@@ -8,7 +8,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jcreinhold/lean-host-mcp"
 rust-version = "1.94"
-version = "0.19.0"
+version = "0.19.1"
 
 # Single version knob for the semver-fragile, version-coupled crate families.
 # The lean-rs stack is 0.x (adjacent minor lines are incompatible) and the
@@ -19,7 +19,7 @@ version = "0.19.0"
 [workspace.dependencies]
 # The worker's deployment record, which the server reads too. Without default
 # features it links no Lean; keep its version equal to the workspace's.
-lean-host-mcp-worker = { default-features = false, path = "crates/lean-host-mcp-worker", version = "=0.19.0" }
+lean-host-mcp-worker = { default-features = false, path = "crates/lean-host-mcp-worker", version = "=0.19.1" }
 lean-rs = "=0.13.0"
 lean-rs-host = "=0.13.0"
 lean-rs-worker-child = "=0.13.0"

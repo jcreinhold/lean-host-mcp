@@ -565,12 +565,8 @@ impl ToolCall {
     /// Refuse arguments that decode but that the tool never accepts.
     fn check(&self) -> Result<(), String> {
         match self {
-            Self::Imports(request)
-                if request.files.is_empty() || request.files.len() > tools::build::MAX_IMPORT_FILES =>
-            {
-                Err(format!("`files` needs 1 to {} files", tools::build::MAX_IMPORT_FILES))
-            }
-            Self::Semantic(_) | Self::Build(_) | Self::Imports(_) => Ok(()),
+            Self::Imports(request) => request.check(),
+            Self::Semantic(_) | Self::Build(_) => Ok(()),
         }
     }
 
@@ -739,6 +735,43 @@ mod tests {
     use super::*;
     use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
     use crate::error::{ServerError, WorkerUnavailable};
+
+    /// `lean_imports` takes files, modules or both, and refuses a call that
+    /// names neither. A direct call and a named request both check their
+    /// arguments here, so a call that names only modules must pass.
+    #[test]
+    fn imports_calls_name_files_or_modules() {
+        let refusal = |arguments: Value| {
+            let Value::Object(map) = arguments else {
+                return Some("the arguments are not an object".to_owned());
+            };
+            match ToolCall::parse("lean_imports", &map) {
+                Ok(_) => None,
+                Err(ToolCallError::InvalidArguments(message) | ToolCallError::UnknownTool(message)) => Some(message),
+            }
+        };
+        assert_eq!(refusal(serde_json::json!({"modules": ["Chain.B"]})), None);
+        assert_eq!(refusal(serde_json::json!({"files": ["Chain/B.lean"]})), None);
+        assert_eq!(
+            refusal(serde_json::json!({"files": ["Chain/B.lean"], "modules": ["Dep"]})),
+            None
+        );
+        assert_eq!(
+            refusal(serde_json::json!({})).as_deref(),
+            Some("name at least one of `files` and `modules`")
+        );
+        let files: Vec<String> = (0..=tools::build::MAX_IMPORT_FILES)
+            .map(|i| format!("F{i}.lean"))
+            .collect();
+        assert_eq!(
+            refusal(serde_json::json!({ "files": files })).as_deref(),
+            Some("`files` takes at most 16 files")
+        );
+        assert_eq!(
+            refusal(serde_json::json!({"modules": ["Chain:B"]})).as_deref(),
+            Some("`Chain:B` is not a module name")
+        );
+    }
 
     #[test]
     fn worker_unavailable_is_a_structured_tool_response() {
