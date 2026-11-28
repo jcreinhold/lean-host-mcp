@@ -341,10 +341,6 @@ pub struct SelectorMessage {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "public proof-state response keeps a flat JSON shape; boxing fields would only hide the same payload"
-)]
 pub enum ProofStateResult {
     Context {
         diagnostics: DiagnosticsBlock,
