@@ -120,7 +120,7 @@ async fn trial(ctx: &ToolContext, imports: &[&str]) -> TestResult<SemanticRespon
         .into_iter()
         .collect(),
     };
-    Ok(Box::pin(as_call(lean_trial(ctx, request))).await?)
+    Ok(as_call(lean_trial(ctx, request)).await?)
 }
 
 /// The module and next action of each trust row of `response` with `status`.
@@ -527,7 +527,7 @@ async fn a_file_check_of_an_import_that_names_no_module_says_to_fix_it() -> Test
     };
     for response in [
         diagnostics(&ctx, "Typo.lean").await?,
-        Box::pin(as_call(lean_verify(&ctx, verify))).await?,
+        as_call(lean_verify(&ctx, verify)).await?,
     ] {
         assert_eq!(
             rows(&response, TrustStatus::UnknownImport),

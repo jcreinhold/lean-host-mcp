@@ -199,7 +199,9 @@ pub struct ToolContext {
 /// it takes on a project end when it returns. For callers that run tool
 /// functions in process, such as tests.
 pub async fn as_call<T>(operation: impl Future<Output = T>) -> T {
-    crate::cancellation::with_cancellation(&tokio_util::sync::CancellationToken::new(), operation).await
+    // The server boxes each call inside its scope too. Unboxed, each layer of
+    // the scope keeps room for the whole future.
+    crate::cancellation::with_cancellation(&tokio_util::sync::CancellationToken::new(), Box::pin(operation)).await
 }
 
 /// Imports passed to worker sessions: `Init` is the internal base

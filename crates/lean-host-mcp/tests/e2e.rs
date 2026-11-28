@@ -19,14 +19,9 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Four tests below share one mutable file: the fixture's `Handles.olean`,
-// whose mtime the rebuild tests bump under an outside writer's turn to stand
-// in for `lake build`, while the residue-budget tests assert across
-// multi-second sleeps that the worker serving that same import never
-// recycles. A writer turn retires every idle worker on the fixture, so under
-// the default parallel test runner one test's bump would land inside
-// another's stability window; the named serial key confines the exclusion to
-// exactly these four, leaving the rest of the suite parallel.
+// The two residue-budget tests below each watch, across multi-second sleeps,
+// when the worker that serves `LeanRsFixture.Handles` cycles. The named serial
+// key runs them one at a time and leaves the rest of the suite parallel.
 use serial_test::serial;
 
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
@@ -41,7 +36,7 @@ use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest,
 use lean_host_mcp::tools::semantic::{
     SemanticResponse, SemanticToolRequest, lean_context, lean_lookup, lean_status, lean_trial, lean_verify,
 };
-use lean_host_mcp::tools::{OutputBudgetOverrides, TelemetryVerbosity, ToolConfig, ToolContext};
+use lean_host_mcp::tools::{OutputBudgetOverrides, TelemetryVerbosity, ToolConfig, ToolContext, as_call};
 use lean_host_mcp::{
     BrokerConfig, CoordinateSpace, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker,
     ProjectHint, ProjectRuntimeConfig, ProofAttemptResult, Severity,
@@ -190,7 +185,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
 
     // proof_state at the default shows the pristine entry goal: nothing has run,
     // so before == after, and it is the declaration's opening goal.
-    let proof = proof_state(
+    let proof = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -200,7 +195,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
             include_expected_type: false,
             project: None,
         },
-    )
+    ))
     .await
     .expect("proof_state");
     let ProofStateResult::Context {
@@ -222,7 +217,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
 
     // try_proof_step at the default splices before the first tactic, so the
     // from-scratch block elaborates against the pristine goal and closes it.
-    let closed = try_proof_step(
+    let closed = as_call(try_proof_step(
         &ctx,
         TryProofStepRequest {
             file: proof_actions_file(),
@@ -233,7 +228,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
             snippets: Vec::new(),
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("default try_proof_step");
     let ProofAttemptResult::Ok { result, .. } = closed.result.expect("default attempt result") else {
@@ -247,7 +242,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
 
     // The same block at the post-first-tactic position (`index: 0`) re-introduces
     // binders already in scope and fails — and the response carries the cue.
-    let trapped = try_proof_step(
+    let trapped = as_call(try_proof_step(
         &ctx,
         TryProofStepRequest {
             file: proof_actions_file(),
@@ -258,7 +253,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
             snippets: Vec::new(),
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("index:0 try_proof_step");
     let cue_warnings = trapped.warnings.clone();
@@ -287,7 +282,7 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
     let ctx = open_ctx(&root);
     let declaration = "LeanRsFixture.ProofActions.stepTheorem".to_owned();
 
-    let unresolved = proof_state(
+    let unresolved = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -300,7 +295,7 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
             include_expected_type: false,
             project: None,
         },
-    )
+    ))
     .await
     .expect("unresolved after_text proof_state");
     let ProofStateResult::Context {
@@ -339,7 +334,7 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
             ProofBoundarySelector::Index { index } => Some(ProofPositionSelector::Index { index }),
         })
         .expect("fixture should expose at least one index candidate");
-    let retry = proof_state(
+    let retry = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -349,7 +344,7 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
             include_expected_type: false,
             project: None,
         },
-    )
+    ))
     .await
     .expect("retry proof_state with candidate selector");
     let ProofStateResult::Context {
@@ -390,7 +385,7 @@ async fn verify_resolves_every_declaration_scan_form_by_name() {
         "LeanRsFixture.ScanForms.Default",
         "LeanRsFixture.ScanForms.namedDefault",
     ] {
-        let verified = verify_declaration(
+        let verified = as_call(verify_declaration(
             &ctx,
             VerifyDeclarationRequest {
                 file: file.clone(),
@@ -400,7 +395,7 @@ async fn verify_resolves_every_declaration_scan_form_by_name() {
                 report_axioms: false,
                 retry_tainted_non_positive: false,
             },
-        )
+        ))
         .await
         .unwrap_or_else(|err| panic!("verify {name} should complete: {err}"));
         let result = verified.result.expect("verification result");
@@ -418,7 +413,7 @@ async fn verify_resolves_every_declaration_scan_form_by_name() {
 
     // The anonymous instance resolves under its generated name: discover it
     // through the declaration inventory, then verify that name.
-    let inventory = lean_lookup(
+    let inventory = as_call(lean_lookup(
         &ctx,
         semantic_request(
             "declarations",
@@ -427,7 +422,7 @@ async fn verify_resolves_every_declaration_scan_form_by_name() {
                 "limit": 20
             }),
         ),
-    )
+    ))
     .await
     .expect("scan-forms declaration inventory");
     let inventory_data = semantic_data(inventory);
@@ -439,7 +434,7 @@ async fn verify_resolves_every_declaration_scan_form_by_name() {
         .find(|name| name.contains("instDefaultPoint"))
         .unwrap_or_else(|| panic!("anonymous instance should be catalogued under its generated name: {inventory_data}"))
         .to_owned();
-    let verified = verify_declaration(
+    let verified = as_call(verify_declaration(
         &ctx,
         VerifyDeclarationRequest {
             file,
@@ -449,7 +444,7 @@ async fn verify_resolves_every_declaration_scan_form_by_name() {
             report_axioms: false,
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("verify anonymous instance");
     let result = verified.result.expect("verification result");
@@ -478,7 +473,7 @@ async fn context_trim_defaults_omit_boundaries_expected_type_and_echo_fields() {
     // on the wire) and a goal with an expected type, yet the response must
     // carry none of the opt-in or echo keys — the projection never
     // materializes them, proving the skipped code path, not just empty JSON.
-    let lean = proof_state(
+    let lean = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -488,7 +483,7 @@ async fn context_trim_defaults_omit_boundaries_expected_type_and_echo_fields() {
             include_expected_type: false,
             project: None,
         },
-    )
+    ))
     .await
     .expect("default proof_state");
     let lean_json = serde_json::to_value(lean.result.as_ref().expect("default proof result")).unwrap();
@@ -512,7 +507,7 @@ async fn context_trim_defaults_omit_boundaries_expected_type_and_echo_fields() {
 
     // Opt-in request: same declaration, both flags set — boundaries and the
     // expected type return exactly as before the trim.
-    let full = proof_state(
+    let full = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -522,7 +517,7 @@ async fn context_trim_defaults_omit_boundaries_expected_type_and_echo_fields() {
             include_expected_type: true,
             project: None,
         },
-    )
+    ))
     .await
     .expect("opt-in proof_state");
     let full_json = serde_json::to_value(full.result.as_ref().expect("opt-in proof result")).unwrap();
@@ -560,7 +555,7 @@ async fn try_proof_step_batch_returns_all_ordered_rows_under_worker_limit() {
     let ctx = open_ctx(&root);
     let snippets = (0..10).map(|_| "trivial".to_owned()).collect::<Vec<_>>();
 
-    let response = try_proof_step(
+    let response = as_call(try_proof_step(
         &ctx,
         TryProofStepRequest {
             file: proof_actions_file(),
@@ -571,7 +566,7 @@ async fn try_proof_step_batch_returns_all_ordered_rows_under_worker_limit() {
             snippets,
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("batch proof_step");
     let ProofAttemptResult::Ok { result, .. } = response.result.expect("batch proof-step result") else {
@@ -634,7 +629,7 @@ async fn trial_loop_runs_with_zero_per_step_context_calls() {
     let declaration = "LeanRsFixture.ProofActions.stepTheorem".to_owned();
 
     // The intended loop: ONE navigation call per declaration...
-    let navigate = proof_state(
+    let navigate = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -644,7 +639,7 @@ async fn trial_loop_runs_with_zero_per_step_context_calls() {
             include_expected_type: false,
             project: None,
         },
-    )
+    ))
     .await
     .expect("navigation proof_state");
     let navigate_json = serde_json::to_value(navigate.result.as_ref().expect("navigation result")).unwrap();
@@ -657,7 +652,7 @@ async fn trial_loop_runs_with_zero_per_step_context_calls() {
         ProofPositionSelector::Default,
         ProofPositionSelector::Index { index: 0 },
     ] {
-        let response = try_proof_step(
+        let response = as_call(try_proof_step(
             &ctx,
             TryProofStepRequest {
                 file: proof_actions_file(),
@@ -668,7 +663,7 @@ async fn trial_loop_runs_with_zero_per_step_context_calls() {
                 snippets: vec!["trivial".to_owned(), "skip".to_owned()],
                 retry_tainted_non_positive: false,
             },
-        )
+        ))
         .await
         .expect("trial batch");
         let ProofAttemptResult::Ok { result, .. } = response.result.expect("trial batch result") else {
@@ -709,7 +704,7 @@ async fn try_proof_step_partial_budget_surfaces_batch_summary() {
         .map(|idx| format!("exact definitely_missing_identifier_with_a_long_name_to_fill_budget_{idx}"))
         .collect::<Vec<_>>();
 
-    let response = try_proof_step(
+    let response = as_call(try_proof_step(
         &ctx,
         TryProofStepRequest {
             file: proof_actions_file(),
@@ -720,7 +715,7 @@ async fn try_proof_step_partial_budget_surfaces_batch_summary() {
             snippets,
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("partial proof_step");
     let warnings = response.warnings.clone();
@@ -747,7 +742,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     };
     let ctx = open_ctx(&root);
 
-    let inspected = inspect_declaration(
+    let inspected = as_call(inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
             name: "LeanRsFixture.ProofActions.closedTheorem".to_owned(),
@@ -757,7 +752,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             fields: InspectDeclarationFields::default(),
             raw_statement: false,
         },
-    )
+    ))
     .await
     .expect("inspect declaration");
     assert!(matches!(
@@ -765,7 +760,7 @@ async fn inspect_proof_state_try_verify_and_references() {
         DeclarationInspectionResult::Found { .. }
     ));
 
-    let proof = proof_state(
+    let proof = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -775,7 +770,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             include_expected_type: false,
             project: None,
         },
-    )
+    ))
     .await
     .expect("proof_state");
     let ProofStateResult::Context {
@@ -795,7 +790,7 @@ async fn inspect_proof_state_try_verify_and_references() {
         "miss"
     );
 
-    let warm = proof_state(
+    let warm = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -805,7 +800,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             include_expected_type: false,
             project: None,
         },
-    )
+    ))
     .await
     .expect("warm proof_state");
     let ProofStateResult::Context { query_facts, .. } = warm.result.expect("warm proof result") else {
@@ -817,7 +812,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     );
 
     let before = fs::read(root.join(proof_actions_file())).expect("fixture source before");
-    let bad = try_proof_step(
+    let bad = as_call(try_proof_step(
         &ctx,
         TryProofStepRequest {
             file: proof_actions_file(),
@@ -828,7 +823,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             snippets: Vec::new(),
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("bad proof attempt");
     let ProofAttemptResult::Ok { result, .. } = bad.result.expect("proof attempt result") else {
@@ -862,7 +857,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     let after = fs::read(root.join(proof_actions_file())).expect("fixture source after");
     assert_eq!(before, after, "try_proof_step must not mutate source files");
 
-    let verified = verify_declaration(
+    let verified = as_call(verify_declaration(
         &ctx,
         VerifyDeclarationRequest {
             file: proof_actions_file(),
@@ -872,7 +867,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             report_axioms: true,
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("verify closed theorem");
     assert!(matches!(
@@ -885,7 +880,7 @@ async fn inspect_proof_state_try_verify_and_references() {
 
     let tmp = tempfile::tempdir().expect("temp fixture copy");
     let sorry_ctx = open_ctx(&fixture_with_sorry_theorem(&root, tmp.path()));
-    let sorry = verify_declaration(
+    let sorry = as_call(verify_declaration(
         &sorry_ctx,
         VerifyDeclarationRequest {
             file: proof_actions_file(),
@@ -895,7 +890,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             report_axioms: true,
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .expect("verify sorry theorem");
     assert!(matches!(
@@ -907,7 +902,7 @@ async fn inspect_proof_state_try_verify_and_references() {
         } if verification_status == "has_sorry" && facts.contains_sorry
     ));
 
-    let refs = find_references(
+    let refs = as_call(find_references(
         &ctx,
         FindReferencesRequest {
             name: "LeanRsFixture.ProofActions.closedTheorem".to_owned(),
@@ -917,7 +912,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             limit: Some(10),
             project: None,
         },
-    )
+    ))
     .await
     .expect("find references");
     let FindReferencesResult::Ok { references, .. } = refs.result.expect("references result") else {
@@ -938,7 +933,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
     let ctx = open_ctx(&root);
 
     let inspected = semantic_data(
-        lean_lookup(
+        as_call(lean_lookup(
             &ctx,
             semantic_request(
                 "declaration",
@@ -947,7 +942,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
                     "file": "LeanRsFixture/ProofActions.lean"
                 }),
             ),
-        )
+        ))
         .await
         .expect("lean_lookup declaration"),
     );
@@ -957,7 +952,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
     );
 
     let proof = semantic_data(
-        lean_context(
+        as_call(lean_context(
             &ctx,
             semantic_request(
                 "proof_position",
@@ -966,7 +961,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
                     "declaration": "LeanRsFixture.ProofActions.stepTheorem"
                 }),
             ),
-        )
+        ))
         .await
         .expect("lean_context proof_position"),
     );
@@ -976,7 +971,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
     );
 
     let search = semantic_data(
-        lean_lookup(
+        as_call(lean_lookup(
             &ctx,
             semantic_request(
                 "proof_search",
@@ -986,7 +981,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
                     "limit": 5
                 }),
             ),
-        )
+        ))
         .await
         .expect("lean_lookup proof_search"),
     );
@@ -1000,7 +995,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
 
     let before = fs::read(root.join(proof_actions_file())).expect("fixture source before");
     let attempt = semantic_data(
-        lean_trial(
+        as_call(lean_trial(
             &ctx,
             semantic_request(
                 "proof_step",
@@ -1010,7 +1005,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
                     "snippet": "trivial"
                 }),
             ),
-        )
+        ))
         .await
         .expect("lean_trial proof_step"),
     );
@@ -1022,7 +1017,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
     assert_eq!(before, after, "lean_trial must not mutate source files");
 
     let verified = semantic_data(
-        lean_verify(
+        as_call(lean_verify(
             &ctx,
             semantic_request_without_kind(serde_json::json!({
                 "targets": [{
@@ -1032,7 +1027,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
                 }],
                 "report_axioms": true
             })),
-        )
+        ))
         .await
         .expect("lean_verify targets"),
     );
@@ -1043,7 +1038,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
         Some("verified")
     );
 
-    let refs_response = lean_lookup(
+    let refs_response = as_call(lean_lookup(
         &ctx,
         semantic_request(
             "references",
@@ -1054,7 +1049,7 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
                 "limit": 10
             }),
         ),
-    )
+    ))
     .await
     .expect("lean_lookup references");
     assert_ne!(
@@ -1085,7 +1080,7 @@ async fn lean_verify_batches_explicit_file_and_module_targets() {
     let ctx = open_ctx(&fixture_with_sorry_theorem(&root, tmp.path()));
 
     let explicit = semantic_data(
-        lean_verify(
+        as_call(lean_verify(
             &ctx,
             semantic_request_without_kind(serde_json::json!({
                 "targets": [{
@@ -1099,7 +1094,7 @@ async fn lean_verify_batches_explicit_file_and_module_targets() {
                 }],
                 "allow_sorry": false
             })),
-        )
+        ))
         .await
         .expect("lean_verify explicit batch"),
     );
@@ -1115,13 +1110,13 @@ async fn lean_verify_batches_explicit_file_and_module_targets() {
     assert_eq!(statuses, ["verified", "has_sorry", "not_found"]);
 
     let file_all = semantic_data(
-        lean_verify(
+        as_call(lean_verify(
             &ctx,
             semantic_request_without_kind(serde_json::json!({
                 "targets": [{ "kind": "file_all", "file": "LeanRsFixture/ProofActions.lean" }],
                 "allow_sorry": true
             })),
-        )
+        ))
         .await
         .expect("lean_verify file_all"),
     );
@@ -1134,13 +1129,13 @@ async fn lean_verify_batches_explicit_file_and_module_targets() {
     );
     assert_eq!(file_all.pointer("/summary/needs_build"), Some(&serde_json::json!(0)));
 
-    let module_all = lean_verify(
+    let module_all = as_call(lean_verify(
         &ctx,
         semantic_request_without_kind(serde_json::json!({
             "targets": [{ "kind": "module_all", "module": "LeanRsFixture.ProofActions" }],
             "allow_sorry": true
         })),
-    )
+    ))
     .await
     .expect("lean_verify module_all");
     assert!(
@@ -1166,7 +1161,7 @@ async fn lean_verify_normalizes_paths_dedupes_trust_and_compacts_rows() {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
-    let response = lean_verify(
+    let response = as_call(lean_verify(
         &ctx,
         semantic_request_without_kind(serde_json::json!({
             "targets": [
@@ -1176,7 +1171,7 @@ async fn lean_verify_normalizes_paths_dedupes_trust_and_compacts_rows() {
             ],
             "allow_sorry": true
         })),
-    )
+    ))
     .await
     .expect("lean_verify mixed targets");
 
@@ -1210,14 +1205,14 @@ async fn lean_verify_normalizes_paths_dedupes_trust_and_compacts_rows() {
     }
 
     let full = semantic_data(
-        lean_verify(
+        as_call(lean_verify(
             &ctx,
             semantic_request_without_kind(serde_json::json!({
                 "targets": [{ "kind": "explicit", "file": "LeanRsFixture/ProofActions.lean", "declarations": ["LeanRsFixture.ProofActions.closedTheorem"] }],
                 "allow_sorry": true,
                 "detail": "full"
             })),
-        )
+        ))
         .await
         .expect("lean_verify full detail"),
     );
@@ -1236,7 +1231,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
     let ctx = open_ctx(&root);
 
     let command = semantic_data(
-        lean_trial(
+        as_call(lean_trial(
             &ctx,
             semantic_request(
                 "command",
@@ -1245,7 +1240,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
                     "commands": "#check Nat.add\n#print axioms Nat.add_assoc"
                 }),
             ),
-        )
+        ))
         .await
         .expect("lean_trial command explicit imports"),
     );
@@ -1264,7 +1259,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
     );
 
     let file_command = semantic_data(
-        lean_trial(
+        as_call(lean_trial(
             &ctx,
             semantic_request(
                 "command",
@@ -1273,7 +1268,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
                     "commands": "#check LeanRsFixture.ProofActions.closedTheorem"
                 }),
             ),
-        )
+        ))
         .await
         .expect("lean_trial command file imports"),
     );
@@ -1286,7 +1281,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
     );
 
     let invalid = semantic_data(
-        lean_trial(
+        as_call(lean_trial(
             &ctx,
             semantic_request(
                 "command",
@@ -1295,7 +1290,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
                     "commands": "#check definitelyMissingCommandMessage"
                 }),
             ),
-        )
+        ))
         .await
         .expect("lean_trial invalid command"),
     );
@@ -1315,7 +1310,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
         fs::read_to_string(&proof_actions).expect("read proof actions") + "\n#check definitelyMissingFileDiagnostic\n";
     fs::write(&proof_actions, edited).expect("write diagnostics edit");
     let ctx = open_ctx(&work);
-    let diagnostics = lean_status(
+    let diagnostics = as_call(lean_status(
         &ctx,
         semantic_request(
             "file_diagnostics",
@@ -1323,7 +1318,7 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
                 "file": "LeanRsFixture/ProofActions.lean"
             }),
         ),
-    )
+    ))
     .await
     .expect("lean_status file diagnostics");
     assert!(
@@ -1360,13 +1355,13 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
     )
     .expect("write whole-file fixture");
     let whole = semantic_data(
-        lean_status(
+        as_call(lean_status(
             &ctx,
             semantic_request(
                 "file_diagnostics",
                 serde_json::json!({ "file": "LeanRsFixture/WholeFile.lean" }),
             ),
-        )
+        ))
         .await
         .expect("lean_status whole-file diagnostics"),
     );
@@ -1415,7 +1410,7 @@ async fn worker_file_checks_see_the_header_and_drop_silent_messages() {
     let ctx = open_ctx(&work);
 
     let verify = semantic_data(
-        lean_verify(
+        as_call(lean_verify(
             &ctx,
             semantic_request_without_kind(serde_json::json!({
                 "targets": [{
@@ -1426,7 +1421,7 @@ async fn worker_file_checks_see_the_header_and_drop_silent_messages() {
                 "allow_sorry": false,
                 "detail": "full"
             })),
-        )
+        ))
         .await
         .expect("lean_verify whole file"),
     );
@@ -1442,7 +1437,7 @@ async fn worker_file_checks_see_the_header_and_drop_silent_messages() {
     );
 
     let outline = semantic_data(
-        lean_lookup(
+        as_call(lean_lookup(
             &ctx,
             semantic_request(
                 "declarations",
@@ -1451,7 +1446,7 @@ async fn worker_file_checks_see_the_header_and_drop_silent_messages() {
                     "limit": 20
                 }),
             ),
-        )
+        ))
         .await
         .expect("whole-file outline"),
     );
@@ -1480,7 +1475,7 @@ async fn find_references_project_scope_reads_index_with_cross_module_hits() {
     // worker — so a name defined in one module and used in another comes back
     // whole, with no per-file elaboration.
     let started = std::time::Instant::now();
-    let refs = find_references(
+    let refs = as_call(find_references(
         &ctx,
         FindReferencesRequest {
             name: "LeanRsFixture.ProofSearchFacts.MiniRat".to_owned(),
@@ -1490,7 +1485,7 @@ async fn find_references_project_scope_reads_index_with_cross_module_hits() {
             limit: Some(1000),
             project: None,
         },
-    )
+    ))
     .await
     .expect("find references (project)");
     let elapsed = started.elapsed();
@@ -1575,7 +1570,7 @@ async fn find_references_project_scope_unbuilt_degrades_to_needs_build() {
     }
 
     let ctx = open_ctx(tmp.path());
-    let refs = find_references(
+    let refs = as_call(find_references(
         &ctx,
         FindReferencesRequest {
             name: "LeanRsFixture.ProofSearchFacts.MiniRat".to_owned(),
@@ -1585,7 +1580,7 @@ async fn find_references_project_scope_unbuilt_degrades_to_needs_build() {
             limit: Some(1000),
             project: None,
         },
-    )
+    ))
     .await
     .expect("find references (unbuilt)");
 
@@ -1611,7 +1606,7 @@ async fn lean_lookup_declarations_file_and_module_are_source_fresh() {
     };
     let ctx = open_ctx(&root);
 
-    let file = lean_lookup(
+    let file = as_call(lean_lookup(
         &ctx,
         semantic_request(
             "declarations",
@@ -1620,7 +1615,7 @@ async fn lean_lookup_declarations_file_and_module_are_source_fresh() {
                 "limit": 20
             }),
         ),
-    )
+    ))
     .await
     .expect("file declaration inventory");
     assert!(
@@ -1648,7 +1643,7 @@ async fn lean_lookup_declarations_file_and_module_are_source_fresh() {
         "file declaration inventory should include theorem, got {file_names:?}"
     );
 
-    let module = lean_lookup(
+    let module = as_call(lean_lookup(
         &ctx,
         semantic_request(
             "declarations",
@@ -1657,7 +1652,7 @@ async fn lean_lookup_declarations_file_and_module_are_source_fresh() {
                 "limit": 20
             }),
         ),
-    )
+    ))
     .await
     .expect("module declaration inventory");
     assert!(
@@ -1697,7 +1692,7 @@ async fn search_for_proof_prefers_relevant_fixture_lemmas() {
     );
     let ctx = open_ctx(&root);
 
-    let response = search_for_proof(
+    let response = as_call(search_for_proof(
         &ctx,
         SearchForProofRequest {
             file: Some(proof_agent_file()),
@@ -1710,7 +1705,7 @@ async fn search_for_proof_prefers_relevant_fixture_lemmas() {
             limit: Some(10),
             project: None,
         },
-    )
+    ))
     .await
     .expect("search_for_proof");
     let telemetry = response.telemetry.as_ref().expect("full telemetry");
@@ -1786,7 +1781,7 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
     };
     let ctx = open_ctx(&root);
 
-    let proof = proof_state(
+    let proof = as_call(proof_state(
         &ctx,
         ProofStateRequest {
             file: proof_actions_file(),
@@ -1796,8 +1791,8 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
             include_expected_type: false,
             project: None,
         },
-    );
-    let inspect = inspect_declaration(
+    ));
+    let inspect = as_call(inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
             name: "Nat.add_zero".to_owned(),
@@ -1807,8 +1802,8 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
             fields: InspectDeclarationFields::default(),
             raw_statement: false,
         },
-    );
-    let verify = verify_declaration(
+    ));
+    let verify = as_call(verify_declaration(
         &ctx,
         VerifyDeclarationRequest {
             file: proof_actions_file(),
@@ -1818,7 +1813,7 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
             report_axioms: false,
             retry_tainted_non_positive: false,
         },
-    );
+    ));
 
     let (proof, inspect, verify) = tokio::join!(proof, inspect, verify);
     let proof = proof.expect("proof_state should complete");
@@ -1861,14 +1856,18 @@ async fn an_idle_project_over_its_soft_budget_cycles_between_calls() {
         fields: InspectDeclarationFields::default(),
     };
 
-    let first = inspect_declaration(&ctx, request()).await.expect("first inspect");
+    let first = as_call(inspect_declaration(&ctx, request()))
+        .await
+        .expect("first inspect");
     assert!(matches!(first.status, lean_host_mcp::ResponseStatus::Ok));
 
     // Longer than the actor's quiescence grace, so the receive times out and the
     // idle path runs. Nothing is in flight, so this is wall time, not a race.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    let second = inspect_declaration(&ctx, request()).await.expect("second inspect");
+    let second = as_call(inspect_declaration(&ctx, request()))
+        .await
+        .expect("second inspect");
     let runtime = second.runtime().expect("full verbosity keeps runtime facts");
     assert!(
         runtime.restarts_by_cause.contains_key("import_residue_idle"),
@@ -1905,14 +1904,18 @@ async fn a_project_under_its_soft_budget_never_cycles_for_residue() {
         fields: InspectDeclarationFields::default(),
     };
 
-    let first = inspect_declaration(&ctx, request()).await.expect("first inspect");
+    let first = as_call(inspect_declaration(&ctx, request()))
+        .await
+        .expect("first inspect");
     let first_generation = first
         .runtime()
         .expect("full verbosity keeps runtime facts")
         .worker_generation;
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    let second = inspect_declaration(&ctx, request()).await.expect("second inspect");
+    let second = as_call(inspect_declaration(&ctx, request()))
+        .await
+        .expect("second inspect");
     let runtime = second.runtime().expect("full verbosity keeps runtime facts");
     assert_eq!(
         runtime.worker_generation, first_generation,
@@ -1927,12 +1930,7 @@ async fn a_project_under_its_soft_budget_never_cycles_for_residue() {
     }
 }
 
-/// A rebuild must reach a profile even when another import profile ran in
-/// between.
-///
-/// The child pools sessions, so the profile served two calls ago is still alive
-/// and would be restored without re-importing — from `.olean` files that have
-/// since changed. A writer turn retires the whole worker, pool and all.
+/// One batched declaration search answers each request in the order sent.
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn batched_declaration_searches_answer_in_request_order() {
@@ -1971,9 +1969,13 @@ async fn batched_declaration_searches_answer_in_request_order() {
         "LeanRsFixture.Strings".to_owned(),
         "LeanRsFixture.Handles".to_owned(),
     ];
-    let call = ctx
-        .broker
-        .search_declarations(ProjectHint::from_request(None), imports.clone(), imports, requests)
+    // `search_for_proof` makes this broker call inside a tool call, so take
+    // the turn as one does.
+    let call =
+        as_call(
+            ctx.broker
+                .search_declarations(ProjectHint::from_request(None), imports.clone(), imports, requests),
+        )
         .await
         .expect("batched declaration search should complete");
 
@@ -2024,7 +2026,7 @@ async fn lake_options_reach_diagnostics_verification_and_cache() {
         project: None,
     };
     for _ in 0..2 {
-        let result = file_diagnostics(&ctx, request.clone()).await.unwrap();
+        let result = as_call(file_diagnostics(&ctx, request.clone())).await.unwrap();
         let diagnostics = result.result.unwrap().diagnostics;
         assert!(
             !diagnostics
@@ -2035,7 +2037,7 @@ async fn lake_options_reach_diagnostics_verification_and_cache() {
         );
     }
     fs::write(root.join("lakefile.lean"), config.replace("true", "false")).unwrap();
-    let result = file_diagnostics(&ctx, request).await.unwrap();
+    let result = as_call(file_diagnostics(&ctx, request)).await.unwrap();
     let json = serde_json::to_value(&result).unwrap();
     assert_eq!(
         json.pointer("/freshness/elaboration_options/project_options/autoImplicit"),
@@ -2049,7 +2051,7 @@ async fn lake_options_reach_diagnostics_verification_and_cache() {
             .any(|d| matches!(d.severity, Severity::Error)),
         "{diagnostics:?}"
     );
-    let verified = verify_declaration(
+    let verified = as_call(verify_declaration(
         &ctx,
         VerifyDeclarationRequest {
             file: "Demo.lean".into(),
@@ -2059,7 +2061,7 @@ async fn lake_options_reach_diagnostics_verification_and_cache() {
             report_axioms: true,
             retry_tainted_non_positive: false,
         },
-    )
+    ))
     .await
     .unwrap()
     .result

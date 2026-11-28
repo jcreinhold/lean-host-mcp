@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use lean_host_mcp::tools::position::ProofPositionSelector;
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
-use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
+use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext, as_call};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectRuntimeConfig};
 use serde::Serialize;
 
@@ -94,7 +94,7 @@ async fn kanproofs_semantic_search_field_eval() {
 
     for query in queries {
         let started = Instant::now();
-        let response = search_for_proof(
+        let response = as_call(search_for_proof(
             &ctx,
             SearchForProofRequest {
                 file: Some(PathBuf::from(query.file)),
@@ -107,7 +107,7 @@ async fn kanproofs_semantic_search_field_eval() {
                 limit: Some(8),
                 project: None,
             },
-        )
+        ))
         .await
         .expect("search_for_proof");
         let elapsed_ms = started.elapsed().as_millis();
@@ -164,7 +164,7 @@ async fn kanproofs_unbuilt_import_degrades_to_build_warning() {
     };
     let ctx = open_ctx(&root);
     let started = Instant::now();
-    let response = search_for_proof(
+    let response = as_call(search_for_proof(
         &ctx,
         SearchForProofRequest {
             file: None,
@@ -177,7 +177,7 @@ async fn kanproofs_unbuilt_import_degrades_to_build_warning() {
             limit: Some(5),
             project: None,
         },
-    )
+    ))
     .await
     .expect("search_for_proof");
     let elapsed_ms = started.elapsed().as_millis();
@@ -259,7 +259,7 @@ async fn a_changed_file_sweep_recycles_only_on_its_residue_budget() {
     let mut residues = Vec::new();
     for file in files {
         let started = Instant::now();
-        let response = declaration_inventory(
+        let response = as_call(declaration_inventory(
             &ctx,
             DeclarationInventoryRequest {
                 target: DeclarationInventoryTarget::File {
@@ -268,7 +268,7 @@ async fn a_changed_file_sweep_recycles_only_on_its_residue_budget() {
                 project: None,
                 limit: None,
             },
-        )
+        ))
         .await
         .expect("declaration_inventory");
         let result = response
@@ -367,7 +367,7 @@ async fn the_residue_recycle_reaches_the_child_before_the_heap_ceiling_aborts_it
 
     let mut causes = std::collections::BTreeMap::new();
     for file in files {
-        let response = declaration_inventory(
+        let response = as_call(declaration_inventory(
             &ctx,
             DeclarationInventoryRequest {
                 target: DeclarationInventoryTarget::File {
@@ -376,7 +376,7 @@ async fn the_residue_recycle_reaches_the_child_before_the_heap_ceiling_aborts_it
                 project: None,
                 limit: None,
             },
-        )
+        ))
         .await
         .expect("declaration_inventory");
         let result = response
