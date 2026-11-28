@@ -169,10 +169,6 @@ pub struct CliFileVerification {
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RuntimeFacts {
-    /// Actual loaded compatibility for this call, preserved in semantic trust
-    /// even when operational telemetry is quiet.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
     #[serde(skip)]
     #[schemars(skip)]
     pub cli_file_verification: Option<Box<CliFileVerification>>,
@@ -470,7 +466,6 @@ mod tests {
     #[test]
     fn runtime_facts_separate_call_restart_from_lifecycle_history() {
         let facts = RuntimeFacts {
-            native_compatibility: None,
             cli_file_verification: None,
             worker_generation: 4,
             worker_restarted: false,

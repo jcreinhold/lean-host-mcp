@@ -676,9 +676,7 @@ impl RequestRunner {
         let left = until(row.deadline_at);
         match call {
             ToolCall::Build(request) => self.execute_build(&row, request, &token, left).await,
-            call @ (ToolCall::Semantic(_) | ToolCall::Imports(_) | ToolCall::Compatibility(_)) => {
-                self.execute_check(&row, call, &token, left).await
-            }
+            call @ (ToolCall::Semantic(_) | ToolCall::Imports(_)) => self.execute_check(&row, call, &token, left).await,
         }
     }
 

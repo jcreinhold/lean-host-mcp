@@ -34,6 +34,7 @@ use crate::cancellation::{CallCancellation, CallOperation};
 use crate::envelope::{FinalAttemptStatus, Freshness, RuntimeFacts, RuntimeRestartEvent, WorkerStopReceipt};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
 use crate::lake_meta::LakeProjectMeta;
+use crate::runtime_compatibility::LoadedReceipt;
 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
 use crate::worker_retirement::WorkerSlot;
 
@@ -224,10 +225,6 @@ struct JobMeta {
 }
 
 enum ProjectMessage {
-    NativeCompatibility {
-        meta: JobMeta,
-        reply: oneshot::Sender<Result<ProjectCall<()>>>,
-    },
     ModuleQuery {
         meta: JobMeta,
         source: String,
@@ -278,8 +275,7 @@ enum ProjectMessage {
 impl ProjectMessage {
     fn meta(&self) -> &JobMeta {
         match self {
-            Self::NativeCompatibility { meta, .. }
-            | Self::ModuleQuery { meta, .. }
+            Self::ModuleQuery { meta, .. }
             | Self::ModuleQueryBatch { meta, .. }
             | Self::DeclarationInspection { meta, .. }
             | Self::DeclarationSearch { meta, .. }
@@ -295,9 +291,6 @@ impl ProjectMessage {
 
     fn reject(self, state: &ProjectActorState, reason: &'static str) {
         match self {
-            Self::NativeCompatibility { meta, reply } => {
-                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
-            }
             Self::ModuleQuery { meta, reply, .. } => {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
@@ -334,12 +327,14 @@ struct RuntimeSnapshot {
     restarts_by_cause: BTreeMap<String, u64>,
     import_residue_bytes: Option<u64>,
     import_residue_limit_bytes: Option<u64>,
+    /// The receipt of the last completed call, kept only while its worker
+    /// generation is the published one.
+    compatibility: Option<LoadedReceipt>,
 }
 
 impl RuntimeSnapshot {
     fn facts(&self) -> RuntimeFacts {
         RuntimeFacts {
-            native_compatibility: None,
             cli_file_verification: None,
             worker_generation: self.worker_generation,
             worker_restarted: false,
@@ -436,6 +431,7 @@ impl LeanProject {
             restarts_by_cause: BTreeMap::new(),
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
+            compatibility: None,
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let pool_active_jobs = maintenance.activity_counter();
@@ -688,18 +684,6 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
-    pub(crate) async fn native_compatibility(&self, admission_deadline: Instant) -> Result<ProjectCall<()>> {
-        let (reply, rx) = oneshot::channel();
-        self.enqueue(
-            ProjectMessage::NativeCompatibility {
-                meta: self.job_meta(Vec::new(), RetryPolicy::Never, admission_deadline),
-                reply,
-            },
-            rx,
-        )
-        .await
-    }
-
     fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy, admission_deadline: Instant) -> JobMeta {
         let created_at = Instant::now();
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
@@ -859,6 +843,13 @@ impl LeanProject {
     #[must_use]
     pub(crate) fn runtime_facts(&self) -> RuntimeFacts {
         self.runtime.lock().facts()
+    }
+
+    /// The receipt of this worker's last completed call on its current
+    /// generation. It starts and asks nothing.
+    #[must_use]
+    pub(crate) fn compatibility(&self) -> Option<LoadedReceipt> {
+        self.runtime.lock().compatibility.clone()
     }
 
     pub(crate) fn shutdown(&self) {
@@ -1175,13 +1166,6 @@ impl ProjectActorState {
         // A call was served, so the next quiet period earns a fresh idle cycle.
         self.cycled_while_idle = false;
         match message {
-            ProjectMessage::NativeCompatibility { meta, reply } => {
-                let result = self.run_job(meta, |handle, imports, cancellation| {
-                    let _session = handle.open_session_with_imports(imports, Some(cancellation), None)?;
-                    Ok(())
-                });
-                let _ = reply.send(result);
-            }
             ProjectMessage::ModuleQuery {
                 meta,
                 source,
@@ -1619,32 +1603,12 @@ impl ProjectActorState {
         );
         runtime.final_attempt = final_attempt;
         runtime.previous_attempt_failure = previous_attempt_failure;
-        if matches!(&exit, JobExit::Done(_)) {
-            let actual = self.handle.host_runtime_metadata().ok_or_else(|| {
-                ServerError::BadProject("actual host runtime metadata missing after completed native call".into())
-            })?;
-            let proposed =
-                crate::runtime_compatibility::contract_from_loaded(actual).map_err(ServerError::BadProject)?;
-            let (instance, contract) = self
-                .config
-                .maintenance
-                .bind_native_contract(&self.config.toolchain_label, &proposed)
-                .map_err(ServerError::BadProject)?;
-            runtime.native_compatibility = Some(
-                crate::runtime_compatibility::evidence(
-                    contract,
-                    instance,
-                    &self.config.lake_root.to_string_lossy(),
-                    &self.config.toolchain_label,
-                    &self.config.session_id,
-                    self.observed_generation(),
-                    &self.handle.runtime_metadata(),
-                    actual,
-                )
-                .map_err(ServerError::BadProject)?,
-            );
-        }
-        self.publish_runtime(&runtime);
+        let receipt = if matches!(&exit, JobExit::Done(_)) {
+            Some(self.loaded_receipt()?)
+        } else {
+            None
+        };
+        self.publish_runtime(&runtime, receipt);
         match exit {
             JobExit::Done(value) => {
                 tracing::debug!(
@@ -1910,28 +1874,30 @@ impl ProjectActorState {
             None,
         );
         self.record_restart(event.clone());
-        self.publish_runtime(&RuntimeFacts {
-            native_compatibility: None,
-            cli_file_verification: None,
-            worker_generation: event.worker_generation,
-            worker_restarted: true,
-            retry_count: 0,
-            final_attempt: FinalAttemptStatus::Unknown,
-            previous_attempt_failure: None,
-            queue_wait_millis: 0,
-            call_elapsed_millis: 0,
-            call_cpu_millis: None,
-            call_restart: None,
-            last_restart: Some(event),
-            rss_kib: self.last_rss_kib,
-            worker_lanes: 1,
-            import_profile: None,
-            profile_switch_count: self.profile_switch_count,
-            restarts_total: self.restart_stats.total,
-            restarts_by_cause: self.restart_stats.by_cause.clone(),
-            import_residue_bytes: Some(self.handle.lifecycle_snapshot().import_residue_bytes),
-            import_residue_limit_bytes: Some(self.config.import_residue_budget_bytes),
-        });
+        self.publish_runtime(
+            &RuntimeFacts {
+                cli_file_verification: None,
+                worker_generation: event.worker_generation,
+                worker_restarted: true,
+                retry_count: 0,
+                final_attempt: FinalAttemptStatus::Unknown,
+                previous_attempt_failure: None,
+                queue_wait_millis: 0,
+                call_elapsed_millis: 0,
+                call_cpu_millis: None,
+                call_restart: None,
+                last_restart: Some(event),
+                rss_kib: self.last_rss_kib,
+                worker_lanes: 1,
+                import_profile: None,
+                profile_switch_count: self.profile_switch_count,
+                restarts_total: self.restart_stats.total,
+                restarts_by_cause: self.restart_stats.by_cause.clone(),
+                import_residue_bytes: Some(self.handle.lifecycle_snapshot().import_residue_bytes),
+                import_residue_limit_bytes: Some(self.config.import_residue_budget_bytes),
+            },
+            None,
+        );
 
         // The cycle relocated the respawn; this relocates the import, which at
         // Mathlib scale is the expensive half by an order of magnitude.
@@ -2107,28 +2073,30 @@ impl ProjectActorState {
                 None,
             );
             self.record_restart(event.clone());
-            self.publish_runtime(&RuntimeFacts {
-                native_compatibility: None,
-                cli_file_verification: None,
-                worker_generation: self.observed_generation(),
-                worker_restarted: false,
-                retry_count: 0,
-                final_attempt: FinalAttemptStatus::Interrupted,
-                previous_attempt_failure: None,
-                queue_wait_millis: 0,
-                call_elapsed_millis: 0,
-                call_cpu_millis: None,
-                call_restart: None,
-                last_restart: Some(event),
-                rss_kib: self.last_rss_kib,
-                worker_lanes: 1,
-                import_profile: self.current_import_profile().map(str::to_owned),
-                profile_switch_count: self.profile_switch_count,
-                restarts_total: self.restart_stats.total,
-                restarts_by_cause: self.restart_stats.by_cause.clone(),
-                import_residue_bytes: Some(self.handle.lifecycle_snapshot().import_residue_bytes),
-                import_residue_limit_bytes: self.config.import_residue_budget_bytes.into(),
-            });
+            self.publish_runtime(
+                &RuntimeFacts {
+                    cli_file_verification: None,
+                    worker_generation: self.observed_generation(),
+                    worker_restarted: false,
+                    retry_count: 0,
+                    final_attempt: FinalAttemptStatus::Interrupted,
+                    previous_attempt_failure: None,
+                    queue_wait_millis: 0,
+                    call_elapsed_millis: 0,
+                    call_cpu_millis: None,
+                    call_restart: None,
+                    last_restart: Some(event),
+                    rss_kib: self.last_rss_kib,
+                    worker_lanes: 1,
+                    import_profile: self.current_import_profile().map(str::to_owned),
+                    profile_switch_count: self.profile_switch_count,
+                    restarts_total: self.restart_stats.total,
+                    restarts_by_cause: self.restart_stats.by_cause.clone(),
+                    import_residue_bytes: Some(self.handle.lifecycle_snapshot().import_residue_bytes),
+                    import_residue_limit_bytes: self.config.import_residue_budget_bytes.into(),
+                },
+                None,
+            );
             return Err(RestartLimitExceeded {
                 message,
                 cause,
@@ -2158,7 +2126,6 @@ impl ProjectActorState {
         let generation = self.observed_generation();
         let snapshot = self.handle.lifecycle_snapshot();
         RuntimeFacts {
-            native_compatibility: None,
             cli_file_verification: None,
             worker_generation: generation,
             worker_restarted: call_restart.is_some() || generation > generation_before,
@@ -2181,8 +2148,43 @@ impl ProjectActorState {
         }
     }
 
-    fn publish_runtime(&self, runtime: &RuntimeFacts) {
-        *self.runtime.lock() = RuntimeSnapshot {
+    /// Check the host facts the worker reported for a completed call against
+    /// the compiled contract, and bind them to this actor and generation.
+    fn loaded_receipt(&self) -> Result<LoadedReceipt> {
+        let actual = self.handle.host_runtime_metadata().ok_or_else(|| {
+            ServerError::BadProject("actual host runtime metadata missing after completed native call".into())
+        })?;
+        let proposed = crate::runtime_compatibility::contract_from_loaded(actual).map_err(ServerError::BadProject)?;
+        let (instance, contract) = self
+            .config
+            .maintenance
+            .bind_native_contract(&self.config.toolchain_label, &proposed)
+            .map_err(ServerError::BadProject)?;
+        crate::runtime_compatibility::receipt(
+            &contract,
+            &instance,
+            &self.config.lake_root.to_string_lossy(),
+            &self.config.toolchain_label,
+            &self.config.session_id,
+            self.observed_generation(),
+            &self.handle.runtime_metadata(),
+            actual,
+        )
+        .map_err(ServerError::BadProject)
+    }
+
+    /// Publish the facts of a call or restart. A receipt describes one worker
+    /// generation, so without a new one the snapshot keeps the old receipt
+    /// only while its generation is still the published one.
+    fn publish_runtime(&self, runtime: &RuntimeFacts, receipt: Option<LoadedReceipt>) {
+        let mut snapshot = self.runtime.lock();
+        let compatibility = receipt.or_else(|| {
+            snapshot
+                .compatibility
+                .take()
+                .filter(|kept| kept.worker_generation == runtime.worker_generation)
+        });
+        *snapshot = RuntimeSnapshot {
             worker_generation: runtime.worker_generation,
             last_restart: runtime.last_restart.clone().or_else(|| runtime.call_restart.clone()),
             rss_kib: runtime.rss_kib,
@@ -2192,6 +2194,7 @@ impl ProjectActorState {
             restarts_by_cause: runtime.restarts_by_cause.clone(),
             import_residue_bytes: runtime.import_residue_bytes,
             import_residue_limit_bytes: runtime.import_residue_limit_bytes,
+            compatibility,
         };
     }
 

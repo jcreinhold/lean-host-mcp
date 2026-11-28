@@ -14,6 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A config file that does not parse, or a value of the wrong type, stops the server at startup with an error that names
   the file or the key. Before, the server logged it and served with the defaults. `ConfigFile::load`, `store::store_dir`
   and `toolchain::workers_dir` return that error.
+- Remove the `lean_compatibility` tool, and `trust.native_compatibility` from check replies. `lean_status` with
+  `include: ["worker"]` now reports the record at `data.worker.compatibility`: the compiled contract and the receipt
+  each resident worker kept from its last completed call on its current generation. The field is absent when no resident
+  worker has one, and `lean_status` still opens no worker. The status and compatibility types no longer derive
+  `JsonSchema`, and a receipt's `loaded` facts use lean-rs's `LeanWorkerHostRuntimeMetadata`.
 
 ### Changed
 

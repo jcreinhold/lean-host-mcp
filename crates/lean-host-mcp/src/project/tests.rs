@@ -80,6 +80,7 @@ fn queued_test_project(limit: Duration) -> (LeanProject, mpsc::Receiver<ProjectM
             restarts_by_cause: BTreeMap::new(),
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
+            compatibility: None,
         })),
         module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
         actor_scope: std::sync::Weak::new(),

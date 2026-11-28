@@ -1,5 +1,5 @@
-//! Worker-pool observation for `lean_runtime`, and the activity count it
-//! reads.
+//! Worker-pool observation for `lean_runtime` and `lean_status`, and the
+//! activity count it reads.
 //!
 //! The registry lock is the admission boundary: a caller holds a project Arc
 //! before using a resident worker, or an opening-lock Arc before starting one.
@@ -197,6 +197,38 @@ impl ProjectBroker {
     #[must_use]
     pub fn instance_id(&self) -> String {
         self.inner.lock().control.instance_id.clone()
+    }
+
+    /// The compatibility record of `root`'s resident workers: the compiled
+    /// contract and each worker's receipt for its last completed call on its
+    /// current generation. `None` when no resident worker has one. It starts
+    /// and asks nothing.
+    ///
+    /// # Errors
+    /// Returns an error when the compiled host contract is unavailable.
+    pub(crate) fn worker_compatibility(
+        &self,
+        root: &Path,
+    ) -> Result<Option<crate::runtime_compatibility::CompatibilityEvidence>, String> {
+        let inner = self.inner.lock();
+        let mut receipts: Vec<_> = inner
+            .registry
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .filter_map(|(key, project)| project.compatibility().map(|receipt| (key.lane, receipt)))
+            .collect();
+        let instance_id = inner.control.instance_id.clone();
+        drop(inner);
+        if receipts.is_empty() {
+            return Ok(None);
+        }
+        receipts.sort_by_key(|(lane, _)| *lane);
+        crate::runtime_compatibility::CompatibilityEvidence::new(
+            instance_id,
+            crate::runtime_compatibility::ExpectedContract::compiled()?,
+            receipts.into_iter().map(|(_, receipt)| receipt).collect(),
+        )
+        .map(Some)
     }
 
     /// Observe this server's build, settings and workers. It starts nothing

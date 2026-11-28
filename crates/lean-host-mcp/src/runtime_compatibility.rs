@@ -2,22 +2,22 @@
 //!
 //! `ExpectedContract` is safe on a cold status path: it says what the broker
 //! requires, not what any child has loaded. `LoadedReceipt` can only be made
-//! after a child host session reports its manifest-checked bindings. Package
-//! versions are recorded rather than pinned.
+//! after a child host session reports its manifest-checked bindings. Each
+//! worker keeps the receipt of its last completed call, and `lean_status`
+//! reports them. Package versions are recorded rather than pinned.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use lean_rs_worker_parent::{
     LeanWorkerHostRuntimeExpectation, LeanWorkerHostRuntimeMetadata, LeanWorkerRuntimeMetadata,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub(crate) const SCHEMA: &str = "lean-host-native-compatibility-v1";
 
-/// Successful `lean_compatibility` evidence, including an actual loaded worker.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
+/// The compiled contract and the receipts of this broker's resident workers
+/// for one project, as `lean_status` reports them.
+#[derive(Clone, Debug, Serialize)]
 pub struct CompatibilityEvidence {
     pub server_instance_id: String,
     pub contract_sha256: String,
@@ -53,7 +53,7 @@ impl CompatibilityEvidence {
 }
 
 /// Requirements owned by the broker's semantic API and host dependency.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ExpectedContract {
     pub schema: String,
     pub native_api: String,
@@ -120,22 +120,10 @@ impl ExpectedContract {
     }
 }
 
-/// Actual facts emitted by the worker child after checked host-session opening.
-/// No constructor fills these from status, configured paths, or worker.json.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LoadedHostRuntime {
-    /// Compile identity of the running child, not a runtime C-ABI version query.
-    pub compiled_lean_version: String,
-    pub compiled_header_sha256: String,
-    /// Read through the actually loaded optional Lean runtime-version shim.
-    pub runtime_lean_version: Option<String>,
-    /// Each entry exists only after that typed binding was successfully resolved
-    /// against the loaded capability's captured manifest and loaded symbol.
-    pub checked_host_bindings: BTreeMap<String, String>,
-}
-
-/// The server's actor/generation binding for actual child-supplied facts.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+/// The server's actor/generation binding for the facts the worker child
+/// reported after it opened a checked host session. No constructor fills
+/// `loaded` from status, configured paths, or worker.json.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LoadedReceipt {
     pub schema: String,
     pub contract_sha256: String,
@@ -146,7 +134,7 @@ pub struct LoadedReceipt {
     pub worker_generation: u64,
     pub worker_version: String,
     pub protocol_version: u16,
-    pub loaded: LoadedHostRuntime,
+    pub loaded: LeanWorkerHostRuntimeMetadata,
 }
 
 #[derive(Clone, Copy)]
@@ -174,7 +162,7 @@ pub(crate) fn validate_loaded(
     binding: WorkerBinding<'_>,
     worker_version: &str,
     protocol_version: u16,
-    loaded: Option<&LoadedHostRuntime>,
+    loaded: Option<&LeanWorkerHostRuntimeMetadata>,
 ) -> Result<LoadedReceipt, String> {
     let loaded = loaded.ok_or("worker did not report loaded host bindings")?;
     if protocol_version != expected_protocol {
@@ -218,6 +206,78 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+/// Requirements for the supported pinned Lean runtime, without probing a process.
+///
+/// # Errors
+/// Returns an error for toolchains outside the supported stable/RC table.
+pub(crate) fn session_expectation(
+    toolchain: &str,
+    contract: Option<&ExpectedContract>,
+) -> Result<LeanWorkerHostRuntimeExpectation, String> {
+    let label = toolchain.strip_prefix("leanprover/lean4:").unwrap_or(toolchain);
+    let version = label.strip_prefix('v').unwrap_or(label);
+    let entry = lean_toolchain::SUPPORTED_TOOLCHAINS
+        .iter()
+        .find(|entry| entry.versions.contains(&version))
+        .ok_or_else(|| format!("native compatibility requires a supported pinned Lean toolchain: {toolchain}"))?;
+    let compiled = ExpectedContract::compiled()?;
+    if contract.is_some_and(|contract| contract != &compiled) {
+        return Err("negotiated host contract differs from compiled requirements".into());
+    }
+    Ok(LeanWorkerHostRuntimeExpectation {
+        compiled_header_sha256: Some(entry.header_digest.to_owned()),
+        runtime_lean_version: Some(version.to_owned()),
+        checked_host_bindings: compiled.required_host_bindings,
+    })
+}
+
+/// Native check operations, not every optional service the loaded shim offers.
+pub(crate) fn contract_from_loaded(actual: &LeanWorkerHostRuntimeMetadata) -> Result<ExpectedContract, String> {
+    let expected = ExpectedContract::compiled()?;
+    for (operation, abi) in &expected.required_host_bindings {
+        if actual.checked_host_bindings.get(operation) != Some(abi) {
+            return Err(format!(
+                "loaded host differs from compiled native operation: {operation}"
+            ));
+        }
+    }
+    Ok(expected)
+}
+
+/// Bind actual child facts to the actor/generation that returned this call.
+///
+/// # Errors
+/// Refuses facts that do not meet the toolchain's expectation or `contract`.
+pub(crate) fn receipt(
+    contract: &ExpectedContract,
+    server_instance_id: &str,
+    project_root: &str,
+    toolchain: &str,
+    session_id: &str,
+    generation: u64,
+    runtime: &LeanWorkerRuntimeMetadata,
+    actual: &LeanWorkerHostRuntimeMetadata,
+) -> Result<LoadedReceipt, String> {
+    let expectation = session_expectation(toolchain, Some(contract))?;
+    expectation.validate(actual)?;
+    validate_loaded(
+        contract,
+        lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
+        WorkerBinding {
+            server_instance_id,
+            project_root,
+            lean_toolchain: toolchain,
+            expected_header_sha256: expectation.compiled_header_sha256.as_deref().unwrap_or(""),
+            expected_runtime_lean_version: expectation.runtime_lean_version.as_deref().unwrap_or(""),
+            worker_session_id: session_id,
+            worker_generation: generation,
+        },
+        &runtime.worker_version,
+        runtime.protocol_version,
+        Some(actual),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,8 +286,8 @@ mod tests {
         ExpectedContract::new(BTreeMap::from([("verify_declaration_batch".into(), "a".repeat(64))]))
     }
 
-    fn loaded() -> Result<LoadedHostRuntime, String> {
-        Ok(LoadedHostRuntime {
+    fn loaded() -> Result<LeanWorkerHostRuntimeMetadata, String> {
+        Ok(LeanWorkerHostRuntimeMetadata {
             compiled_lean_version: "4.35.0".into(),
             compiled_header_sha256: "b".repeat(64),
             runtime_lean_version: Some("4.35.0".into()),
@@ -235,7 +295,7 @@ mod tests {
         })
     }
 
-    fn receipt(actual: Option<&LoadedHostRuntime>, generation: u64) -> Result<LoadedReceipt, String> {
+    fn receipt(actual: Option<&LeanWorkerHostRuntimeMetadata>, generation: u64) -> Result<LoadedReceipt, String> {
         validate_loaded(
             &contract()?,
             12,
@@ -324,178 +384,13 @@ mod tests {
         assert!(CompatibilityEvidence::new("broker-original".into(), contract()?, vec![]).is_err());
         Ok(())
     }
-}
-
-/// Explicit project for the compatibility handshake; it never selects a target proof.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CompatibilityRequest {
-    pub project: String,
-    /// Explicit versioned discovery never falls back to a loaded handshake.
-    #[serde(default)]
-    pub mode: CompatibilityMode,
-}
-
-/// Pure discovery is opt-in so old deny-unknown-field requests refuse it safely.
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CompatibilityMode {
-    /// Existing manual API: open and verify an actual native worker.
-    #[default]
-    Loaded,
-    /// Describe compiled requirements without admitting native work.
-    PureV1,
-}
-
-/// Compiled requirements and filesystem identity, with no loaded-runtime claim.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct PureCompatibilityDescription {
-    pub mode: &'static str,
-    pub server_instance_id: String,
-    pub project_root: PathBuf,
-    pub lean_toolchain: String,
-    pub worker_protocol_version: u16,
-    pub contract_sha256: String,
-    pub expected: ExpectedContract,
-}
-
-/// Worker-free response; intentionally has no `loaded` evidence field.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct PureCompatibilityResponse {
-    pub status: &'static str,
-    pub native_compatibility: PureCompatibilityDescription,
-}
-
-impl PureCompatibilityResponse {
-    /// Describe only static requirements and the broker's resolved project identity.
-    ///
-    /// # Errors
-    /// Returns unsupported toolchain or SDK contract errors.
-    pub fn describe(server_instance_id: String, project_root: PathBuf, lean_toolchain: String) -> Result<Self, String> {
-        let expected = ExpectedContract::compiled()?;
-        session_expectation(&lean_toolchain, Some(&expected))?;
-        let contract_sha256 = expected.digest().map_err(|error| error.to_string())?;
-        Ok(Self {
-            status: "ok",
-            native_compatibility: PureCompatibilityDescription {
-                mode: "pure_v1",
-                server_instance_id,
-                project_root,
-                lean_toolchain,
-                worker_protocol_version: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
-                contract_sha256,
-                expected,
-            },
-        })
-    }
-}
-
-/// One handshake response, separate from advisory runtime status.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct CompatibilityResponse {
-    pub status: String,
-    pub native_compatibility: CompatibilityEvidence,
-}
-
-/// Requirements for the supported pinned Lean runtime, without probing a process.
-///
-/// # Errors
-/// Returns an error for toolchains outside the supported stable/RC table.
-pub(crate) fn session_expectation(
-    toolchain: &str,
-    contract: Option<&ExpectedContract>,
-) -> Result<LeanWorkerHostRuntimeExpectation, String> {
-    let label = toolchain.strip_prefix("leanprover/lean4:").unwrap_or(toolchain);
-    let version = label.strip_prefix('v').unwrap_or(label);
-    let entry = lean_toolchain::SUPPORTED_TOOLCHAINS
-        .iter()
-        .find(|entry| entry.versions.contains(&version))
-        .ok_or_else(|| format!("native compatibility requires a supported pinned Lean toolchain: {toolchain}"))?;
-    let compiled = ExpectedContract::compiled()?;
-    if contract.is_some_and(|contract| contract != &compiled) {
-        return Err("negotiated host contract differs from compiled requirements".into());
-    }
-    Ok(LeanWorkerHostRuntimeExpectation {
-        compiled_header_sha256: Some(entry.header_digest.to_owned()),
-        runtime_lean_version: Some(version.to_owned()),
-        checked_host_bindings: compiled.required_host_bindings,
-    })
-}
-
-/// Native check operations, not every optional service the loaded shim offers.
-pub(crate) fn contract_from_loaded(actual: &LeanWorkerHostRuntimeMetadata) -> Result<ExpectedContract, String> {
-    let expected = ExpectedContract::compiled()?;
-    for (operation, abi) in &expected.required_host_bindings {
-        if actual.checked_host_bindings.get(operation) != Some(abi) {
-            return Err(format!(
-                "loaded host differs from compiled native operation: {operation}"
-            ));
-        }
-    }
-    Ok(expected)
-}
-
-/// Bind actual child facts to the actor/generation that returned this call.
-pub(crate) fn evidence(
-    contract: ExpectedContract,
-    server_instance_id: String,
-    project_root: &str,
-    toolchain: &str,
-    session_id: &str,
-    generation: u64,
-    runtime: &LeanWorkerRuntimeMetadata,
-    actual: &LeanWorkerHostRuntimeMetadata,
-) -> Result<CompatibilityEvidence, String> {
-    let expectation = session_expectation(toolchain, Some(&contract))?;
-    expectation.validate(actual)?;
-    let loaded = LoadedHostRuntime {
-        compiled_lean_version: actual.compiled_lean_version.clone(),
-        compiled_header_sha256: actual.compiled_header_sha256.clone(),
-        runtime_lean_version: actual.runtime_lean_version.clone(),
-        checked_host_bindings: actual.checked_host_bindings.clone(),
-    };
-    let receipt = validate_loaded(
-        &contract,
-        lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
-        WorkerBinding {
-            server_instance_id: &server_instance_id,
-            project_root,
-            lean_toolchain: toolchain,
-            expected_header_sha256: expectation.compiled_header_sha256.as_deref().unwrap_or(""),
-            expected_runtime_lean_version: expectation.runtime_lean_version.as_deref().unwrap_or(""),
-            worker_session_id: session_id,
-            worker_generation: generation,
-        },
-        &runtime.worker_version,
-        runtime.protocol_version,
-        Some(&loaded),
-    )?;
-    CompatibilityEvidence::new(server_instance_id, contract, vec![receipt])
-}
-
-#[cfg(test)]
-mod pure_tests {
-    use super::*;
 
     #[test]
-    fn pure_mode_is_explicit_and_rejected_by_old_request_before_dispatch() -> Result<(), Box<dyn std::error::Error>> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct OldRequest {
-            project: String,
-        }
-        let input = serde_json::json!({"project":"/proofs","mode":"pure_v1"});
-        let request: CompatibilityRequest = serde_json::from_value(input.clone())?;
-        assert!(matches!(request.mode, CompatibilityMode::PureV1));
-        assert!(serde_json::from_value::<OldRequest>(input).is_err());
-        let old: OldRequest = serde_json::from_value(serde_json::json!({"project":"/proofs"}))?;
-        assert_eq!(old.project, "/proofs");
-        let default: CompatibilityRequest = serde_json::from_value(serde_json::json!({"project":"/proofs"}))?;
-        assert!(matches!(default.mode, CompatibilityMode::Loaded));
-        assert!(
-            serde_json::from_value::<CompatibilityRequest>(serde_json::json!({"project":"/proofs","mode":"future"}))
-                .is_err()
-        );
+    fn evidence_refuses_a_receipt_from_another_broker() -> Result<(), String> {
+        let other = receipt(Some(&loaded()?), 1)?;
+        assert!(CompatibilityEvidence::new("broker-other".into(), contract()?, vec![other.clone()]).is_err());
+        let evidence = CompatibilityEvidence::new("broker-original".into(), contract()?, vec![other])?;
+        assert_eq!(evidence.loaded.len(), 1);
         Ok(())
     }
 

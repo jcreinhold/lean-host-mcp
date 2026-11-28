@@ -88,17 +88,12 @@ own contracts in the [tool catalog](tool-catalog.md). Output carrier selection b
 
 ## Runtime control
 
-`lean_compatibility(mode = "loaded")` uses the same broker admission, actor mailbox, startup accounting, and worker-slot
-lifecycle as semantic calls. Its actor job opens a checked host session but submits no target proof. The broker owns one
-required host-binding subset per supported compiled-header ABI; loaded actor/generation receipts remain separate from
-that expected contract. Worker-session configuration enforces the subset after every recycle, and semantic trust
-preserves actual receipts independently of telemetry verbosity. This replaces caller-side binary/shim profiles rather
-than adding a second admission queue.
-
-`lean_compatibility(mode = "pure_v1")` describes the compiled expectations and the project and toolchain identity. It
-starts no worker or short run and claims no loaded runtime. Its expected binding fingerprints come from the same
-signature declarations and encoder as the typed host bindings, and every new or replacement session checks those
-expectations before it serves. The default `loaded` mode returns the receipts of a worker it opened.
+The broker owns one required host-binding subset per supported compiled-header ABI. Its binding fingerprints come from
+the same signature declarations and encoder as the typed host bindings, and every new or replacement session checks the
+subset before it serves. After each completed call the actor checks the host facts the child reported and keeps a
+receipt that binds them to its session and worker generation. The receipt is kept only while that generation is current.
+`lean_status` with `include: ["worker"]` reads the receipts of a project's resident workers without opening or asking a
+worker; check replies do not carry them.
 
 `lean_runtime` reads the pool under the broker registry mutex and changes nothing. Preparation utilities, startup locks,
 queued jobs, and background recycling/prewarming all join the activity count it reports. The guard survives caller

@@ -15,7 +15,6 @@
 //! carries the id at its top level, and a protocol error in its `data`.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,12 +31,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::broker::{ProjectBroker, ProjectHint};
+use crate::broker::ProjectBroker;
 use crate::cancellation::{with_cancellation, with_deadline};
 use crate::error::ServerError;
 use crate::request_log::RequestLog;
 use crate::requests::{self, REQUEST_ID, RequestError, RequestRunner, RowView};
-use crate::runtime_compatibility::{CompatibilityMode, CompatibilityRequest};
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
@@ -237,18 +235,6 @@ impl LeanHostService {
             }
             Err(error) => error.reply(&request.request_id, carrier),
         })
-    }
-
-    #[tool(
-        description = "Describe compiled native requirements without work using mode=\"pure_v1\", or verify an actual loaded worker using the default mode=\"loaded\". Pure discovery never starts a worker or preparer."
-    )]
-    async fn lean_compatibility(
-        &self,
-        Parameters(request): Parameters<CompatibilityRequest>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.direct(ToolCall::Compatibility(request), "lean_compatibility", &context)
-            .await
     }
 
     #[tool(
@@ -527,7 +513,6 @@ pub(crate) enum ToolCall {
     Semantic(SemanticCall),
     Build(crate::build::BuildRequest),
     Imports(tools::build::ImportsRequest),
-    Compatibility(CompatibilityRequest),
 }
 
 /// A call of one of the semantic tools.
@@ -564,7 +549,6 @@ impl ToolCall {
             "lean_status" => serde_json::from_value(args).map(|req| Self::Semantic(SemanticCall::Status(req))),
             "lean_build" => serde_json::from_value(args).map(Self::Build),
             "lean_imports" => serde_json::from_value(args).map(Self::Imports),
-            "lean_compatibility" => serde_json::from_value(args).map(Self::Compatibility),
             _ if DIRECT_ONLY.contains(&tool) => {
                 return Err(ToolCallError::UnknownTool(format!(
                     "{tool} does not run as a request; call it directly"
@@ -581,15 +565,12 @@ impl ToolCall {
     /// Refuse arguments that decode but that the tool never accepts.
     fn check(&self) -> Result<(), String> {
         match self {
-            Self::Compatibility(request) if request.project.trim().is_empty() => {
-                Err("explicit project required".to_owned())
-            }
             Self::Imports(request)
                 if request.files.is_empty() || request.files.len() > tools::build::MAX_IMPORT_FILES =>
             {
                 Err(format!("`files` needs 1 to {} files", tools::build::MAX_IMPORT_FILES))
             }
-            Self::Semantic(_) | Self::Build(_) | Self::Imports(_) | Self::Compatibility(_) => Ok(()),
+            Self::Semantic(_) | Self::Build(_) | Self::Imports(_) => Ok(()),
         }
     }
 
@@ -599,7 +580,6 @@ impl ToolCall {
             Self::Semantic(call) => call.project(),
             Self::Build(request) => request.project.clone(),
             Self::Imports(request) => request.project.clone(),
-            Self::Compatibility(request) => Some(request.project.clone()),
         }
     }
 
@@ -642,18 +622,6 @@ impl ToolCall {
                 }
                 Err(tools::build::ImportsError::Call(error)) => Err(error),
             },
-            Self::Compatibility(request) => {
-                let hint = ProjectHint::Explicit(PathBuf::from(request.project));
-                if matches!(request.mode, CompatibilityMode::PureV1) {
-                    let result = ctx
-                        .broker
-                        .describe_native_compatibility(&hint)
-                        .map_err(McpError::from)?;
-                    return Ok(carry(&result, carrier));
-                }
-                let result = ctx.broker.native_compatibility(hint).await.map_err(McpError::from)?;
-                Ok(carry(&result, carrier))
-            }
         }
     }
 }

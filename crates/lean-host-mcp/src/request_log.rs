@@ -315,7 +315,6 @@ pub(crate) mod tests {
                 details: None,
             }],
             trust: SemanticTrust {
-                    native_compatibility: None,
                     cli_file_verification: None,
                     source_sha256: None,
                 project_root: "/private/proofs".to_owned(),
@@ -401,7 +400,6 @@ pub(crate) mod tests {
                 errors: Vec::new(),
                 telemetry: None,
                 trust: SemanticTrust {
-                    native_compatibility: None,
                     cli_file_verification: None,
                     source_sha256: None,
                     project_root: String::new(),
@@ -448,7 +446,6 @@ pub(crate) mod tests {
                 errors: Vec::new(),
                 telemetry: None,
                 trust: SemanticTrust {
-                    native_compatibility: None,
                     cli_file_verification: None,
                     source_sha256: None,
                     project_root: String::new(),

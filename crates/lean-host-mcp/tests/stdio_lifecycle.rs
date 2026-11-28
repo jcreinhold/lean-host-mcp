@@ -86,12 +86,30 @@ async fn stdio_shutdown_after_tool_call_exits_worker_child() {
     assert_eq!(result.get("errors"), Some(&json!([])));
     assert_eq!(result.pointer("/data/status"), Some(&json!("found")));
     assert_eq!(result.pointer("/data/declaration/name"), Some(&json!("Nat.add_zero")));
+    // The check reply carries no compatibility record; lean_status does.
+    assert!(result.pointer("/trust/native_compatibility").is_none());
+    let status = server
+        .request_allow_error(
+            "tools/call",
+            json!({
+                "name": "lean_status",
+                "arguments": { "kind": "project", "include": ["worker"] }
+            }),
+        )
+        .await;
+    let status: Value = serde_json::from_str(
+        status
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .expect("status envelope"),
+    )
+    .expect("semantic JSON status");
     // Only the installed child can provide this receipt after opening its
     // checked Lean session. This isolated server has one request and one worker.
-    let loaded = result
-        .pointer("/trust/native_compatibility/loaded")
+    let loaded = status
+        .pointer("/data/worker/compatibility/loaded")
         .and_then(Value::as_array)
-        .expect("loaded worker handshake");
+        .expect("loaded worker receipt");
     let [receipt] = loaded.as_slice() else {
         panic!("expected one loaded generation")
     };

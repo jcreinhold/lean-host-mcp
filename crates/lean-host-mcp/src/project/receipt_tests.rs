@@ -222,6 +222,7 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
             restarts_by_cause: BTreeMap::new(),
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
+            compatibility: None,
         })),
         module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
         actor_scope: std::sync::Weak::new(),
@@ -449,15 +450,21 @@ async fn query(project: &LeanProject) -> Result<ProjectCall<LeanWorkerModuleQuer
         .await
 }
 
+/// A call that opens one host session and sends no target body.
+async fn open_session(
+    project: &LeanProject,
+    deadline: Instant,
+) -> Result<ProjectCall<Vec<LeanWorkerDeclarationSearchResult>>> {
+    project.search_declarations(Vec::new(), Vec::new(), deadline).await
+}
+
 /// One refused warm open replaces the worker before the target body, and the
 /// body runs once, on the replacement. This tests pre-body generation cycling,
 /// not Lean elaboration, which has separate real-worker coverage.
 #[tokio::test]
 async fn one_warm_prebody_cycle_runs_the_target_body_once() {
     let harness = ActorHarness::start(false);
-    harness
-        .project
-        .native_compatibility(admission_deadline())
+    open_session(&harness.project, admission_deadline())
         .await
         .expect("warm first protocol generation without executing a target");
     let old_pid = harness.requests("open_host_session")[0]["pid"].clone();
@@ -499,6 +506,15 @@ async fn one_warm_prebody_cycle_runs_the_target_body_once() {
         "old child is reaped; only replacement remains"
     );
     assert!(harness.requests("attempt_proof").is_empty());
+    let evidence = harness
+        .broker
+        .worker_compatibility(&harness.project.canonical_root)
+        .expect("compiled contract")
+        .expect("the completed call left a receipt");
+    assert_eq!(
+        evidence.loaded[0].worker_generation, 2,
+        "the receipt names the replacement"
+    );
     harness.finish().await;
 }
 
@@ -564,15 +580,13 @@ async fn immediate_or_past_admission_deadline_sends_no_frame_to_an_idle_worker()
             .expect("past deadline"),
         Instant::now(),
     ] {
-        let result = harness.project.native_compatibility(deadline).await;
+        let result = open_session(&harness.project, deadline).await;
         assert!(matches!(result, Err(ServerError::WorkerUnavailable(info))
             if matches!(info.reason.as_str(), "queue_wait_timeout" | "mailbox_admission_timeout")));
         assert!(harness.requests("open_host_session").is_empty());
         assert_eq!(harness.capacity.available_permits(), 0);
     }
-    harness
-        .project
-        .native_compatibility(admission_deadline())
+    open_session(&harness.project, admission_deadline())
         .await
         .expect("idle worker remains usable");
     assert_eq!(harness.requests("open_host_session").len(), 1);
@@ -587,7 +601,7 @@ async fn the_actor_queue_keeps_the_original_admission_deadline() {
     let admission_budget = Duration::from_secs(1);
     let harness = ActorHarness::start_with_runtime(false, None, None, Some(admission_budget));
     fs::write(harness.root.path().join("hold_runtime_metadata"), "").expect("hold the active request");
-    let mut active = Box::pin(harness.project.native_compatibility(admission_deadline()));
+    let mut active = Box::pin(open_session(&harness.project, admission_deadline()));
     super::tests::poll_pending(active.as_mut()).await;
     tokio::time::timeout(TEST_DEADLINE, async {
         while harness.requests("host_runtime_metadata").is_empty() {
@@ -605,7 +619,11 @@ async fn the_actor_queue_keeps_the_original_admission_deadline() {
         .replace(probe_tx)
         .expect("retain the actual actor sender");
     let hint = ProjectHint::Explicit(harness.project.canonical_root.clone());
-    let mut waiting = Box::pin(harness.broker.native_compatibility(hint.clone()));
+    let mut waiting = Box::pin(
+        harness
+            .broker
+            .search_declarations(hint.clone(), Vec::new(), Vec::new(), Vec::new()),
+    );
     super::tests::poll_pending(waiting.as_mut()).await;
     // The broker created its deadline during that poll. This ceiling stays
     // anchored there, even if observing the later handoff is delayed.
@@ -660,7 +678,7 @@ async fn the_actor_queue_keeps_the_original_admission_deadline() {
     active.await.expect("queued expiry does not cancel the active request");
     harness
         .broker
-        .native_compatibility(hint)
+        .search_declarations(hint, Vec::new(), Vec::new(), Vec::new())
         .await
         .expect("warm actor remains reusable");
     let opens = harness.requests("open_host_session");
@@ -818,19 +836,33 @@ async fn drain_during_timeout_retains_capacity_until_actor_and_children_exit() {
     harness.finish().await;
 }
 
+/// A completed call leaves its worker's receipt, and the broker reads it for
+/// `lean_status` without sending the worker anything.
 #[tokio::test]
-async fn cold_compatibility_opens_actual_session_without_target_proof() {
+async fn a_completed_call_leaves_a_receipt_for_status() {
     let harness = ActorHarness::start(false);
+    let root = harness.project.canonical_root.clone();
+    assert!(
+        harness
+            .broker
+            .worker_compatibility(&root)
+            .expect("compiled contract")
+            .is_none(),
+        "no call has completed"
+    );
     assert!(harness.requests("open_host_session").is_empty());
-    let call = harness
-        .project
-        .native_compatibility(admission_deadline())
+    open_session(&harness.project, admission_deadline())
         .await
         .expect("actual fake metadata compatibility");
-    let ((), runtime) = call.into_parts();
-    let evidence = runtime.native_compatibility.expect("actual receipt");
+    let evidence = harness
+        .broker
+        .worker_compatibility(&root)
+        .expect("compiled contract")
+        .expect("the completed call left a receipt");
     assert_eq!(evidence.server_instance_id, harness.broker.instance_id());
+    assert_eq!(evidence.loaded.len(), 1);
     assert_eq!(evidence.loaded[0].worker_generation, 1);
+    assert_eq!(evidence.loaded[0].worker_session_id, harness.project.session_id);
     assert_eq!(harness.requests("open_host_session").len(), 1);
     assert_eq!(harness.requests("host_runtime_metadata").len(), 1);
     assert!(harness.requests("process_module_query").is_empty());
@@ -840,12 +872,42 @@ async fn cold_compatibility_opens_actual_session_without_target_proof() {
     harness.finish().await;
 }
 
+/// A receipt names one worker generation. A replacement that has completed
+/// no call has no receipt to report.
+#[tokio::test]
+async fn a_replaced_worker_drops_the_old_receipt() {
+    let harness = ActorHarness::start(false);
+    let root = harness.project.canonical_root.clone();
+    open_session(&harness.project, admission_deadline())
+        .await
+        .expect("a completed call on the first generation");
+    assert!(
+        harness
+            .broker
+            .worker_compatibility(&root)
+            .expect("compiled contract")
+            .is_some()
+    );
+    assert!(
+        query(&harness.project).await.is_err(),
+        "the fake worker never answers this query"
+    );
+    assert_eq!(harness.requests("spawn").len(), 2, "one replacement generation");
+    assert!(
+        harness
+            .broker
+            .worker_compatibility(&root)
+            .expect("compiled contract")
+            .is_none(),
+        "the replacement has completed no call"
+    );
+    harness.finish().await;
+}
+
 #[tokio::test]
 async fn incompatible_session_metadata_refuses_before_target_body() {
     let harness = ActorHarness::start(false);
-    harness
-        .project
-        .native_compatibility(admission_deadline())
+    open_session(&harness.project, admission_deadline())
         .await
         .expect("establish actual contract");
     let mut incompatible =
@@ -964,7 +1026,10 @@ async fn lifecycle_ticks_preserve_residue_quiescence_and_one_cycle_per_quiet_per
 }
 
 /// Run one call the way a request does: under a read turn on the project.
-async fn call_under_turn(harness: &ActorHarness, lock: &crate::project_lock::ProjectLock) -> (u64, ProjectCall<()>) {
+async fn call_under_turn(
+    harness: &ActorHarness,
+    lock: &crate::project_lock::ProjectLock,
+) -> (u64, ProjectCall<Vec<LeanWorkerDeclarationSearchResult>>) {
     crate::project_lock::scope(async {
         let granted = crate::project_lock::ensure_read(
             lock,
@@ -974,7 +1039,7 @@ async fn call_under_turn(harness: &ActorHarness, lock: &crate::project_lock::Pro
         )
         .await
         .expect("read turn on the fixture");
-        let call = Box::pin(harness.project.native_compatibility(admission_deadline()))
+        let call = Box::pin(open_session(&harness.project, admission_deadline()))
             .await
             .expect("the fake worker serves the call");
         (granted, call)

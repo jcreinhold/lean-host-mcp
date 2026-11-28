@@ -21,9 +21,8 @@ use tokio::process::{Child, ChildStderr, Command};
 
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const EXPECTED_TOOLS: [&str; 11] = [
+const EXPECTED_TOOLS: [&str; 10] = [
     "lean_build",
-    "lean_compatibility",
     "lean_context",
     "lean_get",
     "lean_imports",
@@ -34,13 +33,14 @@ const EXPECTED_TOOLS: [&str; 11] = [
     "lean_trial",
     "lean_verify",
 ];
-const REMOVED_TOOLS: [&str; 6] = [
+const REMOVED_TOOLS: [&str; 7] = [
     "proof_state",
     "search_for_proof",
     "inspect_declaration",
     "try_proof_step",
     "verify_declaration",
     "find_references",
+    "lean_compatibility",
 ];
 
 #[tokio::test]
@@ -1816,125 +1816,4 @@ fn semantic_error_code(response: &Value) -> Option<String> {
         }
     }
     None
-}
-
-/// Pure discovery works before any worker or artifact exists. A trap
-/// executable makes accidental preparation visible.
-#[tokio::test]
-async fn streamable_http_pure_compatibility_never_opens_a_worker() {
-    use std::os::unix::fs::PermissionsExt;
-
-    for trap in [false, true] {
-        let scratch = tempfile::tempdir().unwrap();
-        let root = scratch.path().canonicalize().unwrap();
-        std::fs::write(root.join("lakefile.toml"), "name = \"pure\"\n").unwrap();
-        std::fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"version":"1.1.0","name":"pure","packages":[]}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-        let workers = root.join("workers");
-        let marker = root.join("worker-started");
-        if trap {
-            std::fs::create_dir(&workers).unwrap();
-            let executable = workers.join("lean-host-mcp-worker");
-            std::fs::write(
-                &executable,
-                format!("#!/bin/sh\ntouch {}\nexit 89\n", shell_quote_path(&marker)),
-            )
-            .unwrap();
-            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let processes = root.join("processes");
-        let root_s = root.to_str().unwrap();
-        let settings = [
-            ("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap()),
-            ("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", processes.to_str().unwrap()),
-        ];
-        let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s)], &settings).await;
-        let owner = StatelessClient::new(&server.url);
-        let before = owner.control(json!({})).await;
-        let mut session = server.new_session().await;
-        let response = session
-            .request(
-                "tools/call",
-                json!({
-                    "name":"lean_compatibility", "arguments":{"project":root_s,"mode":"pure_v1"}
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(response.json.get("error").is_none(), "{}", response.json);
-        let payload = &response.json["result"]["structuredContent"];
-        assert_eq!(payload["status"], "ok", "{payload}");
-        let native = &payload["native_compatibility"];
-        assert_eq!(native["mode"], "pure_v1");
-        assert_eq!(native["server_instance_id"], before["pool"]["instance_id"]);
-        assert_eq!(native["project_root"], root_s);
-        assert_eq!(native["lean_toolchain"], "leanprover/lean4:v4.35.0");
-        assert_eq!(native["worker_protocol_version"], 14);
-        assert!(native.get("loaded").is_none());
-        assert!(native.get("worker_generation").is_none());
-        let expected = &native["expected"];
-        let bindings: BTreeMap<String, String> =
-            serde_json::from_value(expected["required_host_bindings"].clone()).unwrap();
-        assert_eq!(bindings, lean_toolchain::host_shim_abi::expected_checked_bindings());
-        let digest_input = serde_json::to_vec(&(
-            &expected["schema"],
-            &expected["native_api"],
-            &expected["capabilities"],
-            &bindings,
-            &expected["enforcement"],
-        ))
-        .unwrap();
-        assert_eq!(native["contract_sha256"], sha256_hex(&digest_input));
-        let status = owner.control(json!({})).await;
-        assert_eq!(status["pool"]["occupied_slots"], 0);
-        assert_eq!(status["pool"]["outstanding_jobs"], 0);
-        assert!(status["pool"]["projects"].as_array().unwrap().is_empty());
-        assert!(!marker.exists(), "pure discovery must not invoke a worker");
-        assert!(!root.join(".lake").exists());
-        server.shutdown().await;
-    }
-}
-
-#[tokio::test]
-async fn streamable_http_pure_compatibility_rejects_unknown_mode_before_worker_admission() {
-    let scratch = tempfile::tempdir().unwrap();
-    let root = scratch.path().canonicalize().unwrap();
-    std::fs::write(root.join("lakefile.toml"), "name = \"pure\"\n").unwrap();
-    std::fs::write(root.join("lake-manifest.json"), "{}\n").unwrap();
-    std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-    let workers = root.join("absent-workers");
-    let server = HttpMcpServer::start_with_env(
-        &[("--lake-root", root.to_str().unwrap())],
-        &[("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap())],
-    )
-    .await;
-    let mut session = server.new_session().await;
-    for arguments in [
-        json!({"project":root,"mode":"future"}),
-        json!({"project":root,"mode":"pure_v1","unexpected":true}),
-    ] {
-        let response = session
-            .request("tools/call", json!({"name":"lean_compatibility","arguments":arguments}))
-            .await
-            .unwrap();
-        assert_eq!(response.json["result"]["isError"], true, "{}", response.json);
-        assert!(
-            response.json["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("failed to deserialize parameters")
-        );
-        assert!(response.json["result"].get("structuredContent").is_none());
-    }
-    let control = StatelessClient::new(&server.url);
-    let status = control.control(json!({})).await;
-    assert_eq!(status["pool"]["occupied_slots"], 0);
-    assert_eq!(status["pool"]["outstanding_jobs"], 0);
-    assert!(status["pool"]["projects"].as_array().unwrap().is_empty());
-    assert!(!root.join(".lake").exists());
-    server.shutdown().await;
 }

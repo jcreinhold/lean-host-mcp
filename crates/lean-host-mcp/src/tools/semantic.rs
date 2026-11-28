@@ -353,7 +353,7 @@ fn lean_status_schema() -> Schema {
         &[
             json!({
                 "type": "object",
-                "description": "Read cheap project, toolchain, worker, and artifact status without opening a worker.",
+                "description": "Read cheap project, toolchain, worker, and artifact status without opening a worker. The worker section carries the compatibility receipt of each resident worker that has completed a call.",
                 "properties": {
                     "kind": { "const": "project", "default": "project" },
                     "project": { "type": ["string", "null"], "description": "Optional project-root override." },
@@ -458,8 +458,6 @@ fn semantic_examples(tool: &str, allowed: &[&str]) -> Option<Value> {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SemanticTrust {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_file_verification: Option<Box<crate::envelope::CliFileVerification>>,
     /// Lowercase SHA-256 of the exact bytes the check read and ran on, when
     /// its result came from one source file's text. It equals that file's
@@ -476,7 +474,6 @@ pub struct SemanticTrust {
 impl SemanticTrust {
     fn unknown() -> Self {
         Self {
-            native_compatibility: None,
             cli_file_verification: None,
             source_sha256: None,
             project_root: String::new(),
@@ -489,7 +486,6 @@ impl SemanticTrust {
     fn from_parts(freshness: FreshnessIdentity, artifacts: Vec<ArtifactTrust>) -> Self {
         let artifacts = dedupe_artifacts(artifacts);
         Self {
-            native_compatibility: None,
             cli_file_verification: None,
             source_sha256: checked_source_sha256(&artifacts),
             project_root: freshness.project_root,
@@ -541,7 +537,7 @@ where
     pub telemetry: Option<Telemetry>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LeanStatusData {
     pub kind: String,
     pub project_root: String,
@@ -556,11 +552,16 @@ pub struct LeanStatusData {
     pub output: OutputStatus,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkerStatusData {
     pub opened: bool,
     pub status: TrustStatus,
     pub detail: String,
+    /// The compiled host contract and, for each of this project's resident
+    /// workers, the receipt of its last completed call on its current
+    /// generation. Absent when no resident worker has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -773,11 +774,25 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
             let project_root = identity.freshness.project_root.clone();
             let includes = status_includes(&request.include);
             let mut artifacts = Vec::new();
-            let worker = includes.contains(&StatusInclude::Worker).then(|| WorkerStatusData {
-                opened: false,
-                status: TrustStatus::NotApplicable,
-                detail: "lean_status does not open a worker".to_owned(),
-            });
+            let worker = if includes.contains(&StatusInclude::Worker) {
+                let compatibility = ctx
+                    .broker
+                    .worker_compatibility(Path::new(&project_root))
+                    .map_err(ServerError::BadProject)?;
+                let detail = if compatibility.is_some() {
+                    "lean_status does not open a worker; compatibility holds the receipts of resident workers"
+                } else {
+                    "lean_status does not open a worker; no resident worker has completed a call"
+                };
+                Some(WorkerStatusData {
+                    opened: false,
+                    status: TrustStatus::NotApplicable,
+                    detail: detail.to_owned(),
+                    compatibility,
+                })
+            } else {
+                None
+            };
             if worker.is_some() {
                 artifacts.push(ArtifactTrust::worker_toolchain_not_applicable(
                     "lean_status did not open a worker to inspect runtime generation",
@@ -894,9 +909,6 @@ where
     ) {
         response.warnings.push(warning);
     }
-    let compatibility = response
-        .runtime()
-        .and_then(|runtime| runtime.native_compatibility.clone());
     let cli_file_verification = response
         .runtime()
         .and_then(|runtime| runtime.cli_file_verification.clone());
@@ -909,7 +921,6 @@ where
         .transpose()
         .map_err(|err| ServerError::Internal(err.to_string()))?;
     let mut trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
-    trust.native_compatibility = compatibility;
     trust.cli_file_verification = cli_file_verification;
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
     Ok(SemanticResponse {
@@ -922,11 +933,7 @@ where
 }
 
 fn from_runtime_response(response: Response<Value>) -> SemanticResponse<Value> {
-    let compatibility = response
-        .runtime()
-        .and_then(|runtime| runtime.native_compatibility.clone());
-    let mut trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
-    trust.native_compatibility = compatibility;
+    let trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
     SemanticResponse {
         data: response.result,
@@ -1121,56 +1128,20 @@ mod tests {
     }
 
     #[test]
-    fn actual_compatibility_receipt_survives_quiet_telemetry() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use crate::runtime_compatibility::{
-            CompatibilityEvidence, ExpectedContract, LoadedHostRuntime, LoadedReceipt, SCHEMA,
-        };
+    fn check_replies_carry_no_compatibility_record() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
         let root = make_lake_dir(tmp.path());
-        let expected = ExpectedContract::new(std::collections::BTreeMap::from([(
-            "verify_declaration_batch".into(),
-            "a".repeat(64),
-        )]))?;
-        let receipt = LoadedReceipt {
-            schema: SCHEMA.into(),
-            contract_sha256: expected.digest()?,
-            server_instance_id: "original".into(),
-            project_root: root.to_string_lossy().into_owned(),
-            lean_toolchain: "leanprover/lean4:v4.35.0".into(),
-            worker_session_id: "actor-1".into(),
-            worker_generation: 7,
-            worker_version: "test".into(),
-            protocol_version: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
-            loaded: LoadedHostRuntime {
-                compiled_lean_version: "4.35.0".into(),
-                compiled_header_sha256: "b".repeat(64),
-                runtime_lean_version: Some("4.35.0".into()),
-                checked_host_bindings: expected.required_host_bindings.clone(),
-            },
-        };
-        let evidence = CompatibilityEvidence::new("original".into(), expected, vec![receipt])?;
         let runtime = RuntimeFacts {
-            native_compatibility: Some(evidence),
+            worker_generation: 7,
             ..RuntimeFacts::default()
         };
         let result = from_tool_response(
             Response::ok(json!({"verified":true}), freshness(&root)).with_runtime(runtime),
             ToolConfig::default(),
         )?;
-        assert!(result.telemetry.is_none());
-        assert_eq!(
-            result
-                .trust
-                .native_compatibility
-                .as_ref()
-                .map(|v| v.server_instance_id.as_str()),
-            Some("original")
-        );
         let json = serde_json::to_value(result)?;
-        assert_eq!(
-            json.pointer("/trust/native_compatibility/loaded/0/worker_generation"),
-            Some(&json!(7))
-        );
+        assert!(json.pointer("/trust/project_root").is_some());
+        assert!(json.pointer("/trust/native_compatibility").is_none());
         Ok(())
     }
 
@@ -1334,6 +1305,10 @@ mod tests {
         assert!(response.trust.artifacts.iter().any(|artifact| {
             artifact.artifact == ArtifactKind::Olean && artifact.status == TrustStatus::MissingBuild
         }));
+        // With no resident worker there is no receipt to report.
+        let data = response.data.as_ref().unwrap();
+        assert_eq!(data.pointer("/worker/opened"), Some(&json!(false)));
+        assert!(data.pointer("/worker/compatibility").is_none());
         assert!(broker.resident_paths().is_empty());
         drop(ctx);
         drop(broker);

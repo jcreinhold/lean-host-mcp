@@ -2,8 +2,8 @@
 
 Five semantic tools cover proof context, trials, lookup, verification, and status. `lean_context`, `lean_trial`,
 `lean_lookup`, and `lean_status` select a mode with `kind`; `lean_verify` takes target groups directly. Operational
-coordination uses `lean_compatibility` and `lean_runtime`; `lean_run` and `lean_get` start and read named requests.
-`lean_build` runs Lake, and `lean_imports` reads what Lake reports a file imports.
+coordination uses `lean_runtime`; `lean_run` and `lean_get` start and read named requests. `lean_build` runs Lake, and
+`lean_imports` reads what Lake reports a file imports.
 
 - Semantic tools: [context](#lean_context), [trial](#lean_trial), [verification](#lean_verify), [lookup](#lean_lookup),
   [status](#lean_status).
@@ -27,31 +27,24 @@ envelope. Negative proof/check verdicts remain successful tool executions with d
 
 ## Native compatibility
 
-`lean_compatibility` is a synchronous operational handshake:
+The broker binds its required host ABI subset for its lifetime and checks that subset on every host session, including
+after internal replacement. Extra compatible loaded operations are allowed. A missing or incompatible runtime is refused
+before the caller's proof runs. After each completed call, the worker's actor checks the host facts the child reported
+and keeps a receipt that binds them to its session and worker generation. `lean_status` reports these receipts:
 
 ```json
-{"name":"lean_compatibility","arguments":{"project":"/absolute/project"}}
+{"name":"lean_status","arguments":{"kind":"project","include":["worker"]}}
 ```
 
-The broker admits and opens a real host session under its ordinary worker capacity. The handshake executes no target
-proof. It returns `status: "ok"` and one `native_compatibility` object containing the broker instance, a contract
-digest, the expected native API/lifecycle/binding contract, and actual actor/generation-bound loaded receipts. Worker
-package versions are observations; compatibility is not tied to an executable hash or source checkout revision. Compiled
-Lean version/header facts are separate from `runtime_lean_version`, which comes through the loaded version shim.
+`data.worker.compatibility` holds the broker instance, a contract digest, the expected native API, lifecycle and binding
+contract, and one receipt for each of the project's resident workers that has completed a call on its current
+generation. It is absent when no worker has one; `lean_status` never opens a worker to get one. Worker package versions
+are observations; compatibility is not tied to an executable hash or source checkout revision. Compiled Lean version and
+header facts are separate from `runtime_lean_version`, which comes through the loaded version shim. Compatibility never
+certifies execution, a proof verdict, worker exit, absence of prior IO, or readiness of arbitrary first-party artifacts.
 
-The broker binds its required host ABI subset for its lifetime and checks that subset on every later host session,
-including after internal replacement. Extra compatible loaded operations are allowed. A missing or incompatible runtime
-is refused before the caller submits its proof. Compatibility never certifies execution, a proof verdict, worker exit,
-absence of prior IO, or readiness of arbitrary first-party artifacts.
-
-Save the contract and instance with the request. Semantic responses carry the actual call's receipt at
-`trust.native_compatibility`, even with quiet telemetry. Validate it against the saved contract before accepting a
-result. To recover a lost reply, read the same `request_id` with `lean_get` rather than sending the call under a new id.
-`lean_runtime` is an advisory snapshot and never opens a worker.
-
-`lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and the project
-and toolchain identity without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded
-handshake. A client requiring pure discovery must not remove the mode or fall back to loaded discovery after an error.
+Check replies do not carry receipts. To recover a lost reply, read the same `request_id` with `lean_get` rather than
+sending the call under a new id. `lean_runtime` is an advisory snapshot and never opens a worker.
 
 ## Tool Roles
 
@@ -84,7 +77,8 @@ The receipt includes lowercase SHA-256 strings `source_sha256`, `module_setup_sh
 identities and installed shim digests, the staged driver request bytes, and the returned `data` respectively. The `data`
 digest uses compact UTF-8 JSON with sorted object keys and unchanged array order. A caller must check the exact
 requested names and compare the source digest against its saved input before accepting a verdict. The receipt
-establishes CLI provenance. Loaded-worker ABI evidence continues to use `trust.native_compatibility`.
+establishes CLI provenance. `lean_status` reports loaded-worker ABI evidence; see
+[native compatibility](#native-compatibility).
 
 ### Named requests
 
@@ -889,6 +883,8 @@ Use `include` to request cheap status sections. The default is all sections:
 and does not open a worker. When the project build tree is absent it reports `olean` and `ilean` `missing_build` facts;
 when the build tree exists but no semantic query has checked source mtimes it reports artifact freshness as `unknown`.
 Worker runtime generation is likewise `not_applicable` because this status mode deliberately avoids opening a worker.
+The `worker` section's `compatibility` holds the receipts that resident workers kept from their last completed calls;
+see [native compatibility](#native-compatibility).
 
 ### `kind: "file_diagnostics"`
 

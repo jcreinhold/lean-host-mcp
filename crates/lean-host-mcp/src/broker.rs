@@ -712,44 +712,6 @@ impl ProjectBroker {
         })
     }
 
-    /// Describe compiled compatibility without opening, preparing or admitting a worker.
-    ///
-    /// # Errors
-    /// Returns project metadata, unsupported toolchain or helper-identity errors.
-    pub fn describe_native_compatibility(
-        &self,
-        hint: &ProjectHint,
-    ) -> Result<crate::runtime_compatibility::PureCompatibilityResponse> {
-        let meta = self.resolve_meta(hint)?;
-        crate::runtime_compatibility::PureCompatibilityResponse::describe(
-            self.instance_id(),
-            meta.canonical_root,
-            meta.toolchain,
-        )
-        .map_err(ServerError::BadProject)
-    }
-
-    /// Establish compatibility through normal worker admission and an actual
-    /// checked empty-import session, without executing a target proof.
-    ///
-    /// # Errors
-    /// Returns admission, worker startup, or loaded compatibility failures.
-    pub async fn native_compatibility(
-        &self,
-        hint: ProjectHint,
-    ) -> Result<crate::runtime_compatibility::CompatibilityResponse> {
-        let (project, admission_deadline) = self.project_for(hint).await?;
-        let call = project.native_compatibility(admission_deadline).await?;
-        let ((), runtime) = call.into_parts();
-        let native_compatibility = runtime
-            .native_compatibility
-            .ok_or_else(|| ServerError::Internal("actual native compatibility receipt is missing".into()))?;
-        Ok(crate::runtime_compatibility::CompatibilityResponse {
-            status: "ok".into(),
-            native_compatibility,
-        })
-    }
-
     /// Return runtime/freshness metadata for a project, opening its worker if
     /// this is the first call.
     ///

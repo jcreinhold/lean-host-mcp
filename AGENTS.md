@@ -117,7 +117,7 @@ either worker builder:
 ## Tool and response contracts
 
 The public proof surface is `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup`, and `lean_status`.
-`lean_runtime` reports worker activity and `lean_compatibility` checks a worker's compatibility; `lean_run` and
+`lean_runtime` reports worker activity and `lean_status` the resident workers' compatibility receipts; `lean_run` and
 `lean_get` start and read named requests, whose rows live in the SQLite table of `requests/`. `lean_build` runs Lake
 under the project's write turn, and `lean_imports` reads each file's import closure from Lake. `server.rs` owns
 registration; `tools/semantic.rs` adapts internal operations to public `{ data, errors, trust }` responses. The internal

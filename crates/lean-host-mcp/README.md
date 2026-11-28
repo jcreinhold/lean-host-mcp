@@ -27,8 +27,7 @@ project's `.local/lean-host-mcp/`, which Git ignores. It never writes a tracked 
 | `lean_trial` | In-memory proof-step and command experiments. |
 | `lean_verify` | Declaration verification for explicit, file, or module targets. |
 | `lean_lookup` | Declaration inspection, inventory, proof search, and references. |
-| `lean_status` | Project/toolchain status and file diagnostics. |
-| `lean_compatibility` | Compiled requirements or actual loaded-worker compatibility evidence. |
+| `lean_status` | Project/toolchain status, file diagnostics, and resident workers' compatibility receipts. |
 | `lean_runtime` | The server's build, settings and worker activity. |
 | `lean_run` | Start a named request, recorded before it runs and run at most once, and reply at once. |
 | `lean_get` | A named request's state, and its stored result once it has ended. |
