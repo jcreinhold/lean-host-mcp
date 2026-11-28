@@ -11,6 +11,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Breaking
 
+- Build against lean-rs 0.13.0 and lean-semantic-search 0.10.0, with worker protocol 15. Upgrade the server and its
+  workers together; `install` replaces a worker that 0.18 built, prepares the host artifacts again and builds a new
+  proof-search runtime. See
+  [upgrading to 0.19](https://github.com/jcreinhold/lean-host-mcp/blob/v0.19.0/docs/operations.md#upgrading-to-019).
+- `lean_lookup` `proof_search` puts its candidates in lean-semantic-search's order: declaration-search rows whose name
+  matched a search exactly, then semantic hits in their rank order, then the other declaration-search rows. Each
+  declaration appears once, where it first appears, and its `match_reason` lists all the evidence. Candidates carry no
+  `score`. The server's own ranking is gone: its score formula, the theorem and name-fragment bonuses, the rule that put
+  candidates no head or constant search supported below the rest, the bonus for names and modules under the goal's
+  namespace, and the separate scores for a search that only semantic search answered. Searches run in plan order,
+  broad-head searches last, and a candidate's kind, module and source come from its first declaration-search row, else
+  from the semantic hit. In the library, `ProofSearchCandidate` loses `score`; a `DeclarationSearchResult` row loses
+  `score` and `rank` and gains `name_match`, one of `exact`, `prefix` and `substring`;
+  `DeclarationSearchTimings.rank_micros` becomes `sort_micros`; and the funnel's `after_scope_filter` becomes
+  `after_conclusion_filter`.
+- The lean-rs supervisor now replaces a lost child and limits abnormal restarts itself: a timeout, a cancellation, a
+  child that exited or aborted, a lost session, a failed request or a failed start. `runtime.worker_restart_limit`
+  (default 3) and `runtime.worker_restart_window_secs` (default 60) set that limit, and planned cycles never count. Once
+  the window is full, the worker stays down until the oldest restart leaves it: calls fail retryable with
+  `details.retry_after_millis`, and `lean_status` reports `data.worker.restart_retry_after_millis`. Before, the server
+  counted these restarts itself, marked the project unhealthy at the limit, and opened a new supervisor on the next
+  call, which emptied the window; each supervisor allowed 256 restarts of any kind. That breaker, the 256 cap and the
+  server's restart retry policy are gone.
+- Restart causes take the supervisor's names: `rss_post_job` becomes `rss_ceiling`, `rss_hard_limit_exceeded` becomes
+  `rss_hard_limit`, and `child_exit`, `session_missing`, `request_failed` and `start_failed` appear by name where they
+  read `worker_internal`. The server sets no RSS limit, so the two RSS causes do not fire. Each restart logs its cause,
+  reason and planned flag, and the unplanned ones log at `warn`.
+- A worker restart before a call no longer taints its verdict: the supervisor restarts before it sends a request and
+  resends only to a child that never ran it. A `lean_verify` row reads `worker_recycled`, and
+  `retry_tainted_non_positive` on `lean_verify` or `lean_trial` `proof_step` retries, only when a restart that nobody
+  planned left the final attempt unfinished.
 - A config file that does not parse, or a value of the wrong type, stops the server at startup with an error that names
   the file or the key. Before, the server logged it and served with the defaults. `ConfigFile::load`, `store::store_dir`
   and `toolchain::workers_dir` return that error.
@@ -45,6 +76,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   name no library matches. A module Lake cannot answer for, such as `Init`, gets its own `error`, code `unknown_module`
   or `module_header_failed`, and the rest still answer. `files` may now be empty, and the reply always holds `modules`.
 - In the library, `build::DEFAULT_TIMEOUT_SECS` names the default `[build] timeout_secs`.
+- `scripts/check-lake-native.sh`, which CI and `scripts/prerelease.sh` run, fails when shipped code reads a Lake file
+  that a Lake command can answer for. The outline's comparison of an index's time with its source is the one exception.
 
 ### Changed
 
@@ -111,18 +144,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   reply from another contract version fails the search with a message that names the field that differs. A request over
   16 MiB now fails in the driver, which names the request file, rather than in the server before Lean starts.
 - A `search_for_proof` candidate that semantic search found carries the kind and module of its declaration, such as
-  `definition` or `instance`; before, its kind always read `theorem`. Only a theorem gets a `suggested_snippet` and the
-  ranking's theorem bonus, as with the other searches.
+  `definition` or `instance`; before, its kind always read `theorem`. Only a theorem gets a `suggested_snippet`, as with
+  the other searches.
 - `search_for_proof` keeps every candidate that semantic search returns, and lists its head evidence,
   `semantic:role_head:N`, in `match_reason`. Before, the server moved that evidence to the funnel's `broad_pruning` and
   dropped a candidate that had no other, listing it there as `semantic:diagnostic_only:NAME`. lean-semantic-search still
-  drops a candidate that matched only a broad head such as `Eq`. One that matched only a specific head now appears,
-  below every candidate that a shared constant, a statement fingerprint, or a head or required-constants search
-  supports.
+  drops a candidate that matched only a broad head such as `Eq`. One that matched only a specific head now appears.
 - `[build] timeout_secs` also limits the semantic search runtime: install's build and a server's open each wait at most
   that long for the cache entry's lock, and then for Lake. Install reads the build tables before it changes anything, so
   a broken one stops it first, and a server's semantic search that must open the runtime fails with the problems they
   name.
+- A server opens the semantic search runtime by asking Lake: `lake build --no-build LeanSemanticSearch` says whether its
+  modules are current, and `lake env` names their import path, which the driver gets on `LEAN_PATH`. The open runs once
+  per toolchain and sysroot and takes about 0.65 s on Lean 4.36, and `[build] timeout_secs` limits both runs together. A
+  `lake env` that fails, stops or runs past that limit fails the search with a message that names `lake env` and ends
+  with the end of its log; an answer the server cannot read fails it with "could not learn the semantic-search runtime's
+  import path from Lake". The runtime's package keeps what `lake env` printed in `lake-env.txt`, and `lake-output.log`
+  holds the build output, then `lake env`'s errors. The runtime's digest changed, so `install` builds a new entry in
+  `semantic-runtimes/` and leaves the old one.
+- The server asks Lake for a project's import roots with lean-toolchain's `lake env` command, under the read turn and a
+  `broker.max_lean_runs` permit, and hands them to each worker, which gives them to lean-rs through
+  `project_import_roots`; the worker child runs no Lake. The roots come in Lake's order, dependencies first and the root
+  package last, and the server asks again after a change to the lakefile, the toolchain pin or `lake-manifest.json`. The
+  first call after a start or such a change waits for that run, about 0.3 s on the test fixture. Before, the server
+  built the roots from the manifest's package list, the root package first, each under `.lake/build/lib/lean`, so a
+  package that moved its `buildDir` lost its modules. `lake_meta.rs` no longer parses the manifest.
+- A module's `.ilean` lies where Lean would look: on the first import root that holds the module's first name component.
+  Project-scope references scan the root package's import directory, the last root, and `lean_imports` names a source
+  for a module whose `.olean` lies there. Before, all three looked under `.lake/build`.
+- `lean_status` runs no Lake, so its `olean` and `ilean` rows read `unknown`, with a note, until Lake has named the
+  roots since the server started or the config last changed. Then they look at the root package's import directory:
+  `missing_build` when it is absent, `unknown` otherwise. Before, they looked at `.lake/build/lib/lean`.
+- A worker child that dies while idle is replaced by the next call, which counts the replacement toward the restart
+  limit; until then the server serves no cached answer from the dead generation. Before, the death closed the project's
+  actor, and the next call opened a new one.
+- A worker call that reached no child, as when its child failed to start, counts as not started, not as unknown, so a
+  named request that fails that way past its deadline reads `timed_out`, not `done`.
+- `install`'s smoke project keeps its import root at `smoke-project/lean`, since no Lake builds it.
 - The server takes a file's imports from its header alone, read as Lean reads it: whitespace, `--` comments and nested
   `/- -/` comments may come before and between `module`, `prelude` and the `import` commands, and a doc comment or any
   other word ends the header. Before, it took every line that began with `import`, even one inside a comment or after

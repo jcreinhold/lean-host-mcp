@@ -61,7 +61,7 @@ it starts. The [tool catalog](docs/tool-catalog.md) gives every tool and reply.
 | `lean-host-mcp` and `lean-host-mcp-worker` | 0.19.0 |
 | `lean-rs` and `lean-toolchain` | 0.13.0 |
 | `lean-semantic-search` | 0.10.0 |
-| Worker protocol | 14 |
+| Worker protocol | 15 |
 | Lean | 4.30.0 through 4.36.0 |
 
 Upgrade the server and its workers together: the server refuses a worker whose protocol differs from its own, and

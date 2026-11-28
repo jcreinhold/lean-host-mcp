@@ -21,6 +21,7 @@ cargo test --locked -p lean-host-mcp-worker --all-targets
 scripts/test-installed-stdio.sh --all-targets  # an installed worker's EOF and exit
 scripts/test-installed-module-setup.sh         # the packaged pair and proof search
 scripts/check-parent-link.sh                   # build the release parent and inspect its link set
+scripts/check-lake-native.sh                   # shipped code reads no Lake file (needs rg)
 CARGO_NET_OFFLINE=true cargo test --locked -p lean-host-mcp --test http_transport \
     install_and_serve_keep_no_state_in_an_empty_home -- --ignored
 ```
@@ -69,8 +70,9 @@ workload against one server and reports whether residue grows with the number of
   Cargo for dependency overrides. If the native tool can enforce the requirement with a flag or one call, use that.
   Otherwise add one check at the one point where the requirement can fail, and delete it when the requirement goes.
 - Never unlock `server.lock` or `children.lock`, and never signal a process group whose child file is free.
-- Start every Lake run through the server's turns: builds through `lean_build`, reads through `lake_reader`. Never walk
-  Lake's import graph.
+- Start every Lake run through the server's turns: builds through `lean_build`, reads through `lake_run`. Never walk
+  Lake's import graph, and never read a Lake file that a Lake command can answer for; `scripts/check-lake-native.sh`
+  names the one exception.
 - Only `crates/lean-host-mcp-worker` links `libleanshared`. The parent takes the worker crate's library with default
   features off, and Lean runtime types stay in the child. The parent's `build.rs` embeds Git identity only.
 - Keep worker handles inside the `LeanProject` controller and borrowed `LeanWorkerSession<'_>` values in their stack
@@ -82,8 +84,8 @@ workload against one server and reports whether residue grows with the number of
 - RSS is telemetry only: add no RSS or request-count restart limit. Import count is not a sizing unit either; the import
   backstop only covers statistics that read zero. Keep the heap ceiling derived from the residue budget, not a fixed
   cap. Keep the pool size and the residue budget apart, and tie reuse hints and `imports_seen` to the pool size. Keep
-  the guard against cycling with no work between, the supervisor's restart limit above planned cycling, and the actor's
-  crash-loop breaker.
+  the guard against cycling with no work between, and leave lost children and the restart limit to the lean-rs
+  supervisor: never open a new supervisor to get around a full restart window.
 
 ## Contracts and upkeep
 

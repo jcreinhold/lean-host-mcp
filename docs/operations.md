@@ -157,7 +157,7 @@ append = "each"                     # the request's args go at the end of both s
 Each step runs as `lake <args>` in the Lake root; the [tool catalog](tool-catalog.md#lean_build) gives the order and the
 reply. A step whose `lake` exits while others in its process group still run gets one second; then the server stops the
 group, and the step ends the build with no exit code. Steps run with the server's environment, plus `LEAN_SYSROOT` set
-to the project's toolchain and `LAKE_ARTIFACT_CACHE=false`, so builds land in each package's `.lake/build`. Set a
+to the project's toolchain and `LAKE_ARTIFACT_CACHE=false`, so builds land in each package's own build directory. Set a
 variable such as `LEAN_NUM_THREADS` where the server starts. A target or argument from a client may not be empty or
 start with `-`, so a client cannot pass Lake an option such as `-d`. Recipe words come from the tracked config, and Lake
 reports its own errors in them.
@@ -206,11 +206,12 @@ The lines hold no source text, names, imports, diagnostics, request ids or full 
 `request_id`, a `lean_get` and a `lean_runtime` call log nothing. When a call ends before its reply, a warning says that
 the worker's end is not confirmed.
 
-Each worker recycle logs one line with `cause`, `reason`, `worker_generation`, `planned` and `restarts_total`: at `warn`
-for crashes and limits (`child_abort`, `child_exit`, `session_missing`, `worker_internal`, `timeout`, `cancelled`,
-`rss_hard_limit_exceeded`, and `restart limit exceeded; marking project unhealthy`), at `info` for `artifacts_rebuilt`,
-`import_residue` and `rss_post_job`, and at `debug` for `import_residue_idle`, `max_imports`, `max_requests`, `idle` and
-`explicit`.
+Each worker recycle logs one line with `cause`, `reason`, `worker_generation`, `planned` and `restarts_total`. Abnormal
+restarts log at `warn`: `timeout`, `cancelled`, `child_abort`, `child_exit`, `session_missing`, `request_failed`,
+`start_failed`, `rss_hard_limit` and `worker_internal`. Of the planned ones, `artifacts_rebuilt`, `import_residue`,
+`import_accounting_unknown` and `rss_ceiling` log at `info`, and `import_residue_idle`, `max_imports`, `max_requests`,
+`idle` and `explicit` at `debug`. The server sets no RSS limit, so the two RSS causes do not fire. For a child that
+died, `reason` ends with what the child last wrote to stderr.
 
 The default filter, `info,rmcp=warn`, hides routine MCP session lines and keeps the SDK's warnings. Use
 `RUST_LOG=info,rmcp=debug` for transport detail and `RUST_LOG=lean_host_mcp=debug` for the runtime; the estimate of the
@@ -239,19 +240,33 @@ server whose parent changed, the listing suggests `kill -TERM <pid>` for that ex
 
 ### Upgrading to 0.19
 
-A 0.19 server and its worker upgrade together, with lean-rs 0.13 and lean-semantic-search 0.10.
+A 0.19 server and its worker upgrade together, with lean-rs 0.13, lean-semantic-search 0.10 and worker protocol 15.
 
 1. Stop the server and any build on the project. A 0.19 server, and `install`, refuse to start while a 0.18 server holds
    the store.
 2. Run `lean-host-mcp install --lake-root PROJECT` with the new binary. It builds a worker in a new generation, since
-   another release built the old one, and builds the new proof-search runtime into the store. Use `install-worker` for a
-   worker installed on its own.
+   another release built the old one, and builds the new proof-search runtime into a new entry in the store's
+   `semantic-runtimes/`; the old entry stays there unused. Use `install-worker` for a worker installed on its own.
 3. Run `lean-host-mcp config check --lake-root PROJECT`. A config file that does not parse now stops the server at
    startup, where 0.18 served with the defaults.
-4. Start the server again.
+4. Start the server again. Its first call asks Lake for the import roots, about 0.3 s on a small project, and the server
+   asks again after each change to the lakefile, the toolchain pin or the manifest.
 
-Clients: `lean_compatibility` is gone, so call `lean_status` with `include: ["worker"]` and read
-`data.worker.compatibility`. A client that lists trust statuses should add `unknown_import`.
+Clients:
+
+- `lean_compatibility` is gone, so call `lean_status` with `include: ["worker"]` and read `data.worker.compatibility`.
+- A client that lists trust statuses should add `unknown_import`.
+- Proof search candidates lose `score`. They come with exact name matches first, then the semantic hits in rank order,
+  then the other declaration-search rows.
+- Once abnormal worker restarts reach `runtime.worker_restart_limit` within the window, the worker stays down: calls
+  fail with a retryable `runtime_unavailable` whose `details.retry_after_millis` says how long to wait, and
+  `lean_status` reports `data.worker.restart_retry_after_millis`.
+- Restart causes take lean-rs's names: `rss_post_job` is now `rss_ceiling`, `rss_hard_limit_exceeded` is
+  `rss_hard_limit`, and `child_exit`, `session_missing`, `request_failed` and `start_failed` appear by name instead of
+  as `worker_internal`.
+- A restart before a call no longer taints its verdict; only a restart that left the call unfinished does.
+- `lean_status` project rows for `olean` and `ilean` read `unknown` until Lake has named the import roots since the
+  server started or the Lake configuration changed.
 
 ### Installing workers
 
@@ -349,3 +364,7 @@ An admission timeout, `project_admission_timeout`, `mailbox_admission_timeout` o
 never ran: retry it, or raise `runtime.request_timeout_millis` or `broker.max_lean_runs` when calls often wait. A fresh
 retry that completes returns usable data with a warning about the failed first attempt; a failed or uncertain retry
 returns none.
+
+A reason that starts with `restart_limit_exceeded` means `runtime.worker_restart_limit` abnormal restarts fell within
+`runtime.worker_restart_window_secs`, so the worker stays down. Wait `details.retry_after_millis`, then retry; the
+`warn` lines in the log name each restart's cause ([logs](#logs)).

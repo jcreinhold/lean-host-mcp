@@ -81,7 +81,8 @@ every Lake library still fails in Lean: `lean_status` `file_diagnostics` shows L
 `lean_verify` `file_all` warns that the header could not be parsed.
 
 Runtime failures appear in `errors` with `code`, `details` and a `retryable` flag; follow the flag, since some refusals
-need an install, not a retry. Warnings appear there too, with `severity: "warning"` and an optional `next_action`.
+need an install, not a retry. While abnormal restarts keep the worker down, `details.retry_after_millis` says how long
+to wait before the retry. Warnings appear there too, with `severity: "warning"` and an optional `next_action`.
 
 Flags named `*_truncated`, `partial`, and advisory lists such as `post_closure_diagnostics`, `entry_goals` and `locals`
 are left out when false or empty; an absent flag means complete. Verdict and trust facts, `contains_sorry`,
@@ -167,9 +168,9 @@ An error in a candidate's `diagnostics` means it failed. A `closed` candidate ke
 Each diagnostic names its `coordinate_space`: `synthetic_range` is a place in the trial buffer, and only an
 `original_range` is a place in the file.
 
-`retry_tainted_non_positive: true` asks for one retry when the worker was recycled during the call and no candidate
-closed or progressed; the reply then holds the retry's rows. If the retry is also tainted, the reply keeps the taint
-warning and the choice returns to you.
+`retry_tainted_non_positive: true` asks for one retry when a worker restart that nobody planned left the call unfinished
+and no candidate closed or progressed; the reply then holds the retry's rows. If the retry is also tainted, the reply
+keeps the taint warning and the choice returns to you.
 
 ### `kind: "command"`
 
@@ -217,8 +218,8 @@ and one row per declaration:
   deleted file, it reads the declarations from the module's `.ilean` with a `stale_build` fact, names the file
   `<lean_verify module M>`, and its rows read `not_found`; check such a module with `lean_trial` `command`,
   `#print axioms` and the module in `imports`.
-- `retry_tainted_non_positive: true` retries a batch once when the worker was recycled during it and some row would read
-  `worker_recycled`; `verified` rows never retry.
+- `retry_tainted_non_positive: true` retries a batch once when a worker restart that nobody planned left it unfinished
+  and some row would read `worker_recycled`; `verified` rows never retry.
 - For one `explicit` file group, a complete verdict carries `trust.cli_file_verification`, schema
   `lean-host-cli-file-verification-v1`. It names the `server_instance_id`, `project_root`, `source_file`,
   `lean_toolchain`, `lean_executable` and the `runtime_lean_version` the Lean process reported, and holds lowercase
@@ -240,7 +241,9 @@ Lookups that read the project's build hold the project's read turn, so no build 
   `next_action`, since no build refreshes the index of a module that is gone. A missing file, or a module with neither
   source nor index, is `not_found`. `limit` defaults to 200, at most 1,000.
 - `kind: "proof_search"` ranks declarations for a goal, from a position in a file or from goal text with `imports`.
-  `mode` is `next_step`, `exact`, `apply`, `rewrite` or `simp`; `limit` defaults to 10, at most 20.
+  `mode` is `next_step`, `exact`, `apply`, `rewrite` or `simp`; `limit` defaults to 10, at most 20. Candidates whose
+  name matched a search exactly come first, then semantic search's hits in its rank order, then the other declaration
+  search rows; each declaration appears once, and its `match_reason` lists all the evidence. No score is given.
 - `kind: "references"` finds uses of a full name. `scope: "file"` elaborates one `file` in a worker, so it reflects the
   current text. `scope: "project"` reads the `.ilean` indexes of the last build without a worker, then asks Lake for the
   source of each module with hits; `files` keeps only hits in those files. The `ilean` / `project` row reads `unknown`,
@@ -258,14 +261,17 @@ Lookups that read the project's build hold the project's read turn, so no build 
 ## `lean_status`
 
 `kind: "project"` reports the project, its toolchain, its build and the server's settings. It runs no Lake, reads no
-source and opens no worker, so the `olean` and `ilean` rows read `missing_build` when the build tree is absent and
-`unknown` otherwise, and the worker generation reads `not_applicable`. `include` picks `toolchain`, `worker` and
-`artifacts`; the default is all.
+source and opens no worker. The `olean` and `ilean` rows look at the root package's import directory among the import
+roots Lake last named: they read `missing_build` when it is absent and `unknown` otherwise. They read `unknown` with a
+note to run a check first when Lake has named no roots since the server started or the Lake configuration changed. The
+worker generation reads `not_applicable`. `include` picks `toolchain`, `worker` and `artifacts`; the default is all.
 
 With `worker`, `data.worker.compatibility` holds the broker instance, a contract digest, the native API, lifecycle and
 binding contract it expects, and one receipt for each resident worker that has completed a call on its current
 generation. It is absent when no worker has one. A receipt records what the worker reported; it never shows that a call
 ran, that a proof holds, that a worker exited, or that no earlier IO happened. Check replies carry no receipt.
+`data.worker.restart_retry_after_millis` appears while abnormal restarts keep the project's worker down, and says how
+long they will.
 
 `kind: "file_diagnostics"` checks a `file` as `lake build` does: it runs `lean --json` from the project root with the
 setup `lake setup-file` prints, on the text the server read and hashed, and returns each message at Lean's position.
@@ -313,11 +319,12 @@ Reports imports as Lake reads them, under the project's read turn, and builds no
 ```
 
 For each of up to 16 `files`, the reply lists the whole import closure from `lake setup-file`, not only the direct
-imports: each `module`, the `olean` Lake loads, and, for a module built under the root's own `.lake/build`, the `source`
-Lake names under its library's `srcDir`; for a dependency's module, `source` is null. When an import is missing or stale
-the call fails as a whole, with `isError` and code `setup_file_failed`, naming the file and quoting Lake; the code is
-`unknown_import` when an import names no module, `invalid_request` for a file the server cannot read, and
-`module_sources_failed` when Lake cannot answer the source query.
+imports: each `module`, the `olean` Lake loads, and, for a module whose `.olean` lies in the root package's own import
+directory, the last one `lake env` puts on `LEAN_PATH`, the `source` Lake names under its library's `srcDir`; for a
+dependency's module, `source` is null. When an import is missing or stale the call fails as a whole, with `isError` and
+code `setup_file_failed`, naming the file and quoting Lake; the code is `unknown_import` when an import names no module,
+`invalid_request` for a file the server cannot read, and `module_sources_failed` when Lake names no import directories
+or cannot answer the source query.
 
 For each of up to 128 `modules`, in request order, the reply gives the `source` Lake names and the direct `imports` its
 header lists, each with `all`, `public` and `meta` flags. Outside the module system every import is public. Lean adds

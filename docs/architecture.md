@@ -15,7 +15,7 @@ server, with Lake as the only build system.
 | Concurrent | Checks from different sessions run at once, up to set limits; a build waits for running checks, then runs alone | `many_clients_share_one_project`; `tests/requests.rs`: `two_file_checks_run_lean_at_once` |
 | Warm | Repeated checks on the same imports reuse a loaded worker; only builds and memory limits restart it | `tests/smoke_perf.rs`: `repeated_calls_on_one_import_profile_never_recycle_the_worker`, `alternating_import_profiles_reuse_pooled_sessions_and_never_recycle`; `tests/e2e.rs`: `a_project_under_its_soft_budget_never_cycles_for_residue` |
 | Contained | When the server stops or dies, its children stop; the next server serves only after they have exited | `tests/requests.rs`: `the_next_server_serves_only_after_a_killed_servers_build_exits`, `a_killed_servers_workers_exit_and_the_next_build_runs`; `tests/project_workers.rs`: `after_a_kill_during_worker_start_the_next_server_has_every_slot`; `tests/stdio_lifecycle.rs`: `stdio_shutdown_on_stdin_eof_exits_parent` |
-| Lake-native | Lake decides what to build, where outputs live and whether they are current; the server reads none of Lake's files | `tests/build_path.rs`: `build_path_never_queries_the_import_graph`. None yet for file reads: the server still reads the files [listed below](#where-the-server-still-reads-lakes-layout), so an `rg` check cannot pass |
+| Lake-native | Lake decides what to build, where outputs live and whether they are current; the server reads none of Lake's files | `tests/build_path.rs`: `build_path_never_queries_the_import_graph`; `scripts/check-lake-native.sh`, run by CI's "Lake-native check" job, which allows the [one exception](#what-the-server-reads-itself) |
 
 Not goals: several servers or worktrees on one checkout; guarding the checkout against Lake commands that bypass the
 server; a general-purpose SDK; public tools for raw elaboration, kernel checks or cursor queries; text search. The
@@ -50,7 +50,7 @@ crates/lean-host-mcp/src/
   broker.rs                ProjectBroker: the served root, worker slots, short-run permits, idle retirement
   broker/control.rs        activity snapshots for lean_runtime
   broker/host_artifacts.rs the installed shims a worker reads before it opens
-  broker/module_setup.rs   every Lake run that reads the project: setup-file and query
+  broker/module_setup.rs   every Lake run that reads the project: setup-file, query and env
   broker/reader.rs         the permit, read share and exit codes of each short run a check starts
   broker/verify_file.rs    file checks through the Lean drivers in lake/
   broker/semantic_file.rs  proof search through lean-semantic-search's driver
@@ -65,7 +65,7 @@ crates/lean-host-mcp/src/
   requests/                named requests: the SQLite table, one launch per id, recovery at start
   cache.rs                 the module-query cache, valid while its worker generation lives
   ilean.rs                 a reader for Lean's .ilean indexes
-  lake_meta.rs             the Lake root, its toolchain pin, a manifest fingerprint, the manifest's roots
+  lake_meta.rs             the Lake root, its toolchain pin, a manifest fingerprint
   toolchain.rs             the pin's elan toolchain and worker, and the readiness gate
   host_preparation.rs      the worker's readiness mode, and the preparation install runs
   runtime_compatibility.rs the host bindings a worker session must have
@@ -82,7 +82,7 @@ crates/lean-host-mcp/src/
 
 crates/lean-host-mcp-worker/src/
   lib.rs                   worker.json, the deployment record both sides check; no Lean
-  main.rs, authority.rs    the worker child: serves one project's build through its launch roots
+  main.rs, authority.rs    the worker child: serves one project's build through the import roots Lake gave
 ```
 
 ## One server per checkout
@@ -141,8 +141,14 @@ until the request ends. A short run whose process group outlives its request kee
 (`project_lock::read_share`) until the group exits. Each finished write turn adds one to the root's finished-build
 count.
 
-Every Lake run that reads the project starts in `lake_reader` (`broker/module_setup.rs`), which takes the request's read
+Every Lake run that reads the project starts in `lake_run` (`broker/module_setup.rs`), which takes the request's read
 turn first. So no such run overlaps a build, and the check it serves keeps the same turn.
+
+Outside the write turn the server runs only Lake commands that build nothing, and it asks Lake for no shared library
+while it serves. Each worker session loads only the installed shims, so lean-rs never asks for the project's library,
+and the server hands each worker the shims that install prepared, so the child builds none. Install builds the shims
+through the worker's preparation mode, in a new generation that no server reads until install selects it, while it holds
+the store.
 
 `lean_build` (`build.rs`, `tools/build.rs`) plans the run from the `[build]` and `[recipes]` config and refuses a
 request that does not fit it. It takes the write turn, stops the project's workers and waits until each has exited
@@ -220,12 +226,15 @@ only then selects the generation; a failure leaves the earlier selection in plac
 hashes the shim files again and finds the `.olean` Lean will load for each driver module by Lean's `findOLean` rule over
 the recorded roots (`broker/verify_file.rs`).
 
-**Import roots.** The worker reads the project's own build in place. At launch the broker names the import roots in
-Lean's search order, from the Lake manifest (`lake_meta::manifest_artifact_roots`): the root package's
-`.lake/build/lib/lean`, then each manifest package's. The worker admits an import only when the request's roots are
-exactly the launch roots, in order, then the shim roots, and no root holds a package whose compiled code the worker
-runs, such as `Init`. No lock guards these roots: only the server that launched the worker builds the checkout, and it
-stops the worker first. The server copies no files and hashes no build outputs.
+**Import roots.** The worker reads the project's own build in place. Before it opens a worker, the broker asks Lake for
+the import roots (`ProjectBroker::import_roots`): it runs lean-toolchain's `lake env` command under the request's read
+turn and reads the answer with `read_lean_path`. The roots come in Lean's search order, dependencies first and the root
+package last, without Lake's own library directory, and the broker keeps them until the lakefile, the toolchain pin or
+the manifest changes. The worker gets them at launch and hands them to lean-rs through `project_import_roots`, so its
+child runs no Lake. It admits an import only when the request's roots are exactly the launch roots, in order, then the
+shim roots, and no root holds a package whose compiled code the worker runs, such as `Init`. No lock guards these roots:
+only the server that launched the worker builds the checkout, and it stops the worker first. The server copies no files
+and hashes no build outputs.
 
 **Session choice.** A tool that reads a client's file picks the worker session by the file's imports. `read_query_file`
 (`tools/source_input.rs`) takes them from a scan of the header in the same bytes it hashes and sends. The scan reads the
@@ -242,18 +251,27 @@ ceiling is a backstop above every residue budget, since crossing it aborts the c
 ([sizing](operations.md#sizing)). The session pool keeps outgoing environments apart from the budget, since keeping one
 costs about 70 MiB and importing it again costs gigabytes. `max_imports` (32) backs up statistics that read zero. Above
 60% of the budget, a quiet actor cycles as `import_residue_idle` after two seconds, at most once per quiet period, and
-prewarms the latest profile if it served it within a minute. Planned cycles do not count toward the actor's crash-loop
-breaker (`project/restart.rs`).
+prewarms the latest profile if it served it within a minute.
 
 **Rebuilt outputs.** A pooled environment is a snapshot of its imports, so no build may change the files under a live
 worker, and builds stop workers first. As a backstop, each job carries the finished-build count of its read turn; a
 count above the one under which the live generation first loaded imports cycles the worker before the job as
 `artifacts_rebuilt` and drops every pooled profile.
 
-**No replay.** Lean elaboration and tactics may do IO, so a worker's death never permits a replay. The opt-in
-`retry_tainted_non_positive` policy allows one retry of a non-positive trial or verification verdict after a mid-call
-recycle. The reply keeps the earlier failure apart and carries a warning, and a tainted or interrupted final attempt is
-never cached.
+**Restarts.** The lean-rs supervisor replaces a lost child itself and counts each abnormal restart: a timeout, a
+cancellation, a child that exited or aborted, a lost session, a failed request or a failed start. Once
+`runtime.worker_restart_limit` of them fall within `runtime.worker_restart_window_secs`, it refuses the next: the worker
+stays down, calls fail retryable with `retry_after_millis`, and `lean_status` reports `restart_retry_after_millis` until
+the oldest restart leaves the window. Planned cycles never count: the supervisor's own and this server's
+`artifacts_rebuilt` and `import_residue_idle`. The actor records each restart under the supervisor's cause name, planned
+flag and description (`project/restart.rs`). A child that dies while idle is replaced by the next call, which counts the
+replacement; until then the cache serves nothing from the dead generation.
+
+**No replay.** Lean elaboration and tactics may do IO, so a worker's death never permits a replay. The supervisor makes
+its restarts before it sends a request and resends one only to a child that never ran it, so a value that comes back ran
+once. A verdict is tainted only when a restart nobody planned left the call's final attempt unfinished. The opt-in
+`retry_tainted_non_positive` policy allows one retry of a tainted non-positive trial or verification verdict. The reply
+keeps the earlier failure apart and carries a warning, and a tainted or interrupted final attempt is never cached.
 
 **Receipts.** After each completed call the actor checks the host facts the child reported and keeps a receipt bound to
 its session and worker generation while that generation lives; `lean_status` reads it without asking a worker.
@@ -272,15 +290,18 @@ and background cycling all count as activity (`broker/control.rs`).
 | The worker record keeps paths relative to its generation, stays under 1 MiB, and resolves no path outside the shims. | `crates/lean-host-mcp-worker/src/lib.rs`: `the_record_stores_generation_paths_relative_and_read_resolves_them`, `read_refuses_a_record_over_one_mebibyte`, `resolve_in_refuses_a_path_that_leaves_the_shims` |
 | The parent binary never links `libleanshared`. | `scripts/check-parent-link.sh`, run by CI's "Check the parent link set" step |
 | A worker serves trials, proof positions, lookups and checks of modules without a source file from the project's own build, path dependencies included. | `tests/project_workers.rs`: `a_trial_imports_a_dependency_module_and_prints_its_axioms`, `a_proof_position_and_a_lookup_answer_from_the_project_build`, `a_module_without_a_source_file_is_checked_in_a_worker` |
+| The import roots are what `lake env` reports, the broker asks again after a lakefile edit, and Lake builds nothing. | `broker/module_setup.rs`: `import_roots_are_what_lake_env_reports` |
 | A worker admits an import only through its launch roots, in order, then the shim roots, while no root holds `Init`; the server refuses to start with `LEAN_PATH` set. | `tests/project_workers.rs`: `an_import_through_other_roots_is_refused`, `an_import_root_that_holds_init_is_refused`; `tests/http_transport.rs`: `an_inherited_lean_path_refuses_startup` |
 | The header scan finds the imports Lean's parser finds, from the bytes the server hashes. | `tools/source_input.rs`: `header_imports_handles_public_meta_and_all`, `header_imports_skips_a_copyright_block_before_module`, `header_imports_skips_a_comment_inside_a_line`, `header_imports_skips_nested_block_comments`, `header_imports_stops_at_the_first_token_after_the_header`; `tools/position.rs`: `read_query_file_imports_are_the_header_scan_of_its_source` |
 | The heap ceiling stays above every residue budget, and the pool size and the budget are set apart. | `project/runtime_config.rs`: `the_heap_ceiling_stays_above_every_residue_budget_the_resolver_can_produce`, `pool_capacity_and_the_residue_budget_are_independent_knobs`, `the_residue_budget_defaults_to_one_childs_share_of_this_machine` |
 | Repeated calls on held import profiles never recycle the worker; a project under its soft budget never cycles for residue, and an idle one over it cycles between calls. | `tests/smoke_perf.rs`: `repeated_calls_on_one_import_profile_never_recycle_the_worker`, `alternating_import_profiles_reuse_pooled_sessions_and_never_recycle`; `tests/e2e.rs`: `a_project_under_its_soft_budget_never_cycles_for_residue`, `an_idle_project_over_its_soft_budget_cycles_between_calls` |
 | A sweep of changed files recycles only on its residue budget, and the recycle comes before Lean's heap ceiling aborts the child. | `tests/kanproofs_eval.rs`: `a_changed_file_sweep_recycles_only_on_its_residue_budget`, `the_residue_recycle_reaches_the_child_before_the_heap_ceiling_aborts_it` |
 | Lifecycle polls keep healthy idle workers warm without health calls and cycle a quiet actor at most once per quiet period. | `project/receipt_tests.rs`: `lifecycle_polls_keep_healthy_idle_workers_warm_without_health_rpcs`, `lifecycle_ticks_preserve_residue_quiescence_and_one_cycle_per_quiet_period` |
-| Planned cycles do not count toward the abnormal-restart limit. | `project/restart.rs`: `planned_restart_causes_do_not_consume_abnormal_restart_budget` |
+| Only the server's own cycles and the supervisor's planned ones are planned, and planned cycles do not count toward the abnormal-restart limit. | `project/restart.rs`: `only_the_servers_own_cycles_are_planned`, `a_failure_the_supervisor_restarts_for_has_the_supervisors_name`, `a_supervisor_restart_keeps_its_name_class_and_description`; lean-rs `lean-rs-worker-parent/tests/worker_shutdown.rs`: `planned_restarts_do_not_use_the_restart_window` |
+| A full restart window keeps the worker down and says for how long, and the worker starts again once the window clears. | `project/receipt_tests.rs`: `a_full_restart_window_keeps_the_worker_down_and_says_for_how_long`; lean-rs `lean-rs-worker-parent/tests/worker_shutdown.rs`: `exhausted_worker_starts_again_after_the_window` |
+| A child that dies while idle is replaced once by the next call, which counts the replacement, and no cached answer outlives it. | `project/receipt_tests.rs`: `idle_worker_death_is_replaced_by_the_next_call` |
 | A job whose read turn follows a newer build replaces the worker once, and an unchanged query sees a rebuilt dependency. | `project/receipt_tests.rs`: `a_build_finished_since_load_replaces_the_worker_once`; `tests/artifact_invalidation.rs`: `unchanged_query_sees_a_rebuilt_dependency` |
-| A worker's death after a call took effect never replays the proof attempt; only an explicit, completed retry clears an earlier failure. | `project/receipt_tests.rs`: `abrupt_worker_exit_after_effect_never_replays_actual_proof_attempt`; `tools/proof_action.rs`: `retry_tainted_non_positive_defaults_to_false_and_parses_absent_field`, `taint_retry_surfaces_through_retry_count`; `diagnosis.rs`: `only_explicit_completed_retry_clears_previous_failure_not_final_restart` |
+| A worker's death after a call took effect never replays the proof attempt; only a completed final attempt clears a restart or an earlier failure. | `project/receipt_tests.rs`: `abrupt_worker_exit_after_effect_never_replays_actual_proof_attempt`; `tools/proof_action.rs`: `retry_tainted_non_positive_defaults_to_false_and_parses_absent_field`, `taint_retry_surfaces_through_retry_count`; `diagnosis.rs`: `only_a_completed_final_attempt_clears_a_restart_or_earlier_failure` |
 | A completed call leaves a receipt that `lean_status` reads without opening a worker; a replaced worker drops it; check replies carry none. | `project/receipt_tests.rs`: `a_completed_call_leaves_a_receipt_for_status`, `a_replaced_worker_drops_the_old_receipt`; `tools/semantic.rs`: `lean_status_does_not_open_worker_and_reports_trust_artifacts`, `check_replies_carry_no_compatibility_record` |
 
 ## Short runs
@@ -305,11 +326,13 @@ A file check reports what `lake build` reports, and an exit code that disagrees 
 
 ## Lake's answers
 
-The server asks Lake each question Lake can answer. Every run goes through `lake_reader` as
-`lake --no-build --no-cache ARGS`, with Lake's cache pointed at the run's private directory under the store's `runs/`:
+The server asks Lake each question Lake can answer. Every run starts in `lake_run` as a short run, with Lake's cache
+pointed at the run's private directory under the store's `runs/`. The import roots come from lean-toolchain's `lake env`
+command, and every other run goes through `lake_reader` as `lake --no-build --no-cache ARGS`:
 
 | Question | Lake run |
 | --- | --- |
+| The project's import roots | `env`, from `LakeWorkspace::lean_path_command`, read by `read_lean_path`; once, then again after the lakefile, the toolchain pin or the manifest changes. It takes about 0.3 s on the test fixture |
 | A file's options | `setup-file FILE '{"imports":[],"isModule":false}'`; Lake reads the second argument as the header (`setupServerModule` in `Lake/Build/Module.lean`), so it checks no import |
 | A file's imports, and whether they are built | `setup-file FILE`; exit 3 lists the targets that need a build |
 | Whether a failed import names a module | `query +MODULE:lean`, for at most 8 names per failure |
@@ -332,12 +355,17 @@ records the options and the host's heartbeat limit, which overrides the project'
 Lake knows but has not built. `lean_imports` reads each file's import closure from `lake setup-file` and the sources and
 headers of modules from the queries above.
 
-### Where the server still reads Lake's layout
+### What the server reads itself
 
-- `lake_meta.rs` reads `lake-manifest.json` for the project's fingerprint, for the worker's and the proof-search
-  reader's import roots, and for the package roots that tell first-party modules from dependencies.
-- `ilean.rs` reads the indexes under the root package's `.lake/build/lib/lean`.
+- `lake_meta.rs` hashes `lake-manifest.json` for the project's fingerprint, and stats it with the lakefile and the
+  toolchain pin to notice a changed configuration. It parses nothing in them.
+- `ilean.rs` finds a module's index as Lean finds its `.olean`: on the first import root that holds a directory or an
+  index named for the module's first component. A reference scan reads only the last root, the root package's.
+- `lean_imports` names a source only for a module whose `.olean` lies in that last root.
 - The declaration outline compares one module's source and index modification times ([below](#reference-indices)).
+
+`scripts/check-lake-native.sh` fails when shipped code names a path under `.lake`, one of Lake's layout fields, a trace
+file or a shared library, or compares two file times. The outline's comparison is its one exception.
 
 | Invariant | Test |
 | --- | --- |
@@ -346,7 +374,8 @@ headers of modules from the queries above.
 | A check reads the module inputs and headers Lake reads. | `broker/module_setup.rs`: `module_inputs_are_what_lake_reads`, `a_header_parses_as_lake_prints_it` |
 | A file check with an out-of-date import builds nothing and replies `needs_build`, naming each target Lake lists and the `lean_build` call that builds it. | `broker/module_setup.rs`: `no_build_exit_names_the_targets_lake_lists`; `diagnosis.rs`: `out_of_date_setup_is_needs_build_with_one_stale_row_per_target`; `tests/build_requests.rs`: `a_file_check_with_a_stale_import_names_the_module_to_build` |
 | An import that names no module gets an `unknown_import` row, a module Lake knows but has not built gets a build row, and no reply says to run `lake`. | `broker/module_setup.rs`: `a_failed_setup_names_its_module_jobs_and_bad_imports_once_each`, `only_a_missing_name_or_source_names_no_module`; `diagnosis.rs`: `unknown_imports_say_to_fix_the_import_with_one_row_each`, `unloaded_modules_read_the_module_lean_could_not_load`, `needs_build_text_names_lean_build_not_lake_and_avoids_the_word_ambiguous`; `tests/build_requests.rs`: `a_file_check_of_an_import_that_names_no_module_says_to_fix_it`, `a_trial_tells_an_import_that_names_no_module_from_an_unbuilt_one` |
-| `lean_imports` lists what Lake reports, sources under a library's `srcDir` included, and names the file whose import is stale. | `tests/build_requests.rs`: `imports_list_the_whole_closure_with_first_party_sources`, `imports_name_sources_under_a_library_src_dir`, `imports_of_a_file_with_a_stale_import_are_an_error_naming_the_file`, `imports_of_modules_list_each_header_and_the_source_lake_reads` |
+| `lean_imports` lists what Lake reports, sources under a library's `srcDir` or a moved `buildDir` included, and names the file whose import is stale. | `tests/build_requests.rs`: `imports_list_the_whole_closure_with_first_party_sources`, `imports_name_sources_under_a_library_src_dir`, `imports_name_sources_under_a_moved_build_dir`, `imports_of_a_file_with_a_stale_import_are_an_error_naming_the_file`, `imports_of_modules_list_each_header_and_the_source_lake_reads` |
+| Shipped code reads no Lake file beyond the outline's one exception. | `scripts/check-lake-native.sh`, run by CI's "Lake-native check" job |
 
 ## Reference indices
 
@@ -355,10 +384,11 @@ headers of modules from the queries above.
 index's declarations to a source outline. The reader accepts only version 5 (`Lean/Server/References.lean`); its module
 docs give the schema. Callers hold the project's read turn, so no build writes an index while it is read.
 
-A reference reply reads every index in the root package's build directory, skipping `.lake/packages/` and counting each
-index it cannot read, then asks Lake for the sources of the modules with hits in one `lake query`. It makes no freshness
-check: `lake build --no-build` on the modules with hits walks each one's import closure, which costs as much as the
-lookup or more, 1–4 s per reply on a 5,000-module project.
+A reference reply reads every index in the root package's import directory, the last import root, and counts each index
+it cannot read. Lake writes each dependency's indexes under that dependency's own root, so the scan reads none of them.
+It then asks Lake for the sources of the modules with hits in one `lake query`. It makes no freshness check:
+`lake build --no-build` on the modules with hits walks each one's import closure, which costs as much as the lookup or
+more, 1–4 s per reply on a 5,000-module project.
 
 The declaration outline still compares one module's source and index modification times before it adds the index's rows,
 since those rows carry spans in the source that was built. A stale index costs only those rows, and Lake's check would
@@ -371,7 +401,8 @@ scan runs serially under `spawn_blocking`; revisit that if a real scan passes on
 | Invariant | Test |
 | --- | --- |
 | A lookup finds definitions and uses across modules and skips local variables and other names. | `ilean.rs`: `resolves_def_and_usages_across_modules`, `ignores_fvar_keys_and_mismatched_consts`, `a_module_without_hits_forms_no_group`, `null_definition_yields_only_usages` |
-| An unbuilt project, a missing index and a bad index each get their own outcome, and a bad index is skipped and counted. | `ilean.rs`: `unbuilt_project_reports_not_built`, `malformed_file_is_skipped_not_fatal`, `declarations_in_module_reports_missing_module_index`, `declarations_in_module_reports_project_not_built` |
+| An unbuilt project, a missing index and a bad index each get their own outcome, and a bad index is skipped and counted. | `ilean.rs`: `unbuilt_project_reports_not_built`, `malformed_file_is_skipped_not_fatal`, `declarations_in_module_finds_no_missing_module_index`, `declarations_in_module_finds_nothing_in_an_unbuilt_project` |
+| A module's index lies on the first import root that holds its package. | `ilean.rs`: `a_module_index_lies_on_the_first_root_that_holds_its_package` |
 | Only version 5 parses, wherever the version field sits. | `ilean.rs`: `unknown_version_is_rejected_with_typed_error`, `version_may_be_the_last_field`, `future_version_with_unreadable_shape_is_unsupported`, `missing_version_is_a_json_error` |
 | Coordinate arrays have exact lengths, and each part of an index parses alone. | `ilean.rs`: `location_array_arity_is_bounded`, `declaration_info_array_arity_is_exact`, `projections_are_independent`, `declarations_in_module_reads_decl_ranges_from_ilean` |
 | A reference reply names the source Lake reads, leaves out modules Lake names no source for, and says it comes from the last build. | `tools/position.rs`: `project_references_name_the_file_lake_reads`, `project_references_leave_out_modules_lake_names_no_source_for`, `project_references_say_they_come_from_the_last_build` |
@@ -431,23 +462,30 @@ and the whole output before IPC, and the host caps candidates and reference fan-
 | --- | --- |
 | An entry from a retired generation misses, and so does an entry from before a finished build. | `cache.rs`: `a_retired_generations_cache_entries_miss`, `a_finished_build_misses_unchanged_source` |
 | The key holds the options, the imports and the build count, and one file's answer never serves another question. | `cache.rs`: `query_context_includes_options_imports_and_build_count`, `one_files_answer_is_never_served_for_a_different_question` |
-| An interrupted call caches nothing, and only a completed final retry is cached. | `cache.rs`: `interrupted_call_cannot_cache_empty_outcome_for_retry`, `retry_cache_requires_explicit_completed_final_attempt` |
+| An interrupted call caches nothing, and a completed final attempt is cached, even after a restart before it. | `cache.rs`: `interrupted_call_cannot_cache_empty_outcome_for_retry`, `retry_cache_requires_explicit_completed_final_attempt` |
 
 ## Proof search
 
 `install` builds the lean-semantic-search runtime into `<store>/semantic-runtimes` (`project/semantic_runtime.rs`); a
 server only opens it, and a runtime that needs a build fails the call with the install command. Opening runs
-`lake build --no-build LeanSemanticSearch` in the runtime's package once per toolchain and sysroot in each server
-process, at the first search that needs it, and again after a failed open. It builds nothing. It takes no
-`max_lean_runs` permit and has no child file, but it holds `children.lock`, and `[build] timeout_secs` limits its wait
-for the cache entry's lock and then its run. Each search runs the runtime's driver, `LeanSemanticSearchDriver.lean`, as
-a short run (`broker/semantic_file.rs`), and the contract crate's `DriverReply::parse` checks the reply before the
-server reads a row. `tools/proof_search.rs` merges those hits with lean-rs declaration search and ranks them.
+`lake build --no-build LeanSemanticSearch` in the runtime's package, which says whether its modules are current, then
+`lake env`, which says where they lie; the two take about 0.65 s on Lean 4.36. A server opens the runtime once per
+toolchain and sysroot, at the first search that needs it, and again after a failed open. It builds nothing. The open
+takes no `max_lean_runs` permit and has no child file, but it holds `children.lock`, and `[build] timeout_secs` limits
+its wait for the cache entry's lock and then both Lake runs together. Each search runs the runtime's driver,
+`LeanSemanticSearchDriver.lean`, as a short run (`broker/semantic_file.rs`) with the runtime's import path on
+`LEAN_PATH`, and the contract crate's `DriverReply::parse` checks the reply before the server reads a row.
+
+`tools/proof_search.rs` runs lean-rs declaration searches in plan order, broad-head searches last, and puts their rows
+and the semantic hits in one order with search's `merge_hits`: rows whose name matched exactly, then the semantic hits
+in rank order, then the other rows in search order. Each declaration appears once, at its first place, with all its
+evidence. No score orders the candidates.
 
 | Invariant | Test |
 | --- | --- |
 | A reply from another contract version fails the search, and each hit takes its module, name and kind from its row. | `semantic_search.rs`: `a_reply_from_another_contract_fails_the_search`, `candidates_take_module_name_and_kind_from_their_row` |
 | A runtime that needs a build tells the operator to run `install` again. | `project/semantic_preparation_tests.rs`: `an_unbuilt_runtime_tells_the_operator_to_rerun_install` |
+| Exact name matches come first, then the semantic hits in rank order, then the other rows; a declaration found twice appears once with all its evidence. | `tools/proof_search.rs`: `candidates_come_exact_names_first_then_semantic_hits_then_other_lexical_hits`, `a_declaration_found_twice_appears_once_with_all_its_evidence`, `semantic_candidates_keep_retrievals_order`, `plan_searches_runs_a_broad_head_search_last` |
 
 ## Transport, replies and config
 
