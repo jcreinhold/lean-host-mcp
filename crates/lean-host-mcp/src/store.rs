@@ -16,7 +16,6 @@
 //! `children/` and `children.lock`, the inputs of short runs `runs/`, and the
 //! named requests table.
 
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -24,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::children::{self, ChildrenLock};
-use crate::config_file::{self, ConfigFile};
+use crate::config_file::{self, ConfigFile, Env};
 
 /// Env var that overrides the store directory for every Lake root. It beats
 /// the config files' `[install] store_dir`.
@@ -117,17 +116,21 @@ fn lock(store: &Path, root: &Path, waits: children::Waits) -> anyhow::Result<Hel
 /// The store directory for Lake root `root`: `flag` (a CLI flag), then
 /// `LEAN_HOST_MCP_STORE_DIR`, then `[install] store_dir` from the root's config
 /// files, then `<root>/.local/lean-host-mcp/store`.
-#[must_use]
-pub fn store_dir(root: &Path, flag: Option<&Path>) -> PathBuf {
-    store_dir_with(root, flag, std::env::var_os(STORE_DIR_ENV))
+///
+/// # Errors
+///
+/// Names the config file that cannot be read or parsed.
+pub fn store_dir(root: &Path, flag: Option<&Path>) -> Result<PathBuf, String> {
+    store_dir_with(root, flag, &config_file::process_env)
 }
 
-/// [`store_dir`] with the env var's value passed in.
-pub(crate) fn store_dir_with(root: &Path, flag: Option<&Path>, env: Option<OsString>) -> PathBuf {
+/// [`store_dir`] with the env lookup passed in.
+pub(crate) fn store_dir_with(root: &Path, flag: Option<&Path>, env: Env<'_>) -> Result<PathBuf, String> {
     config_file::pick_dir(
         flag,
         env,
-        || ConfigFile::load(Some(root)).install.store_dir(root),
+        STORE_DIR_ENV,
+        || Ok(ConfigFile::load(Some(root))?.install.store_dir(root)),
         || config_file::local_dir(root).join("store"),
     )
 }

@@ -9,16 +9,19 @@
 //!
 //! The files are one layer in the precedence stack
 //! `CLI > env > local file > tracked file > default`: every field here is
-//! `Option`, and a set env var still wins over a file value (see
-//! `ProjectRuntimeConfig::from_env_with_file` /
-//! `BrokerConfig::from_env_with_file`). A missing file contributes
-//! nothing; a malformed file is logged and ignored, leaving env and the
-//! built-in defaults in charge.
+//! `Option`, and a set env var still wins over a file value. Every setting
+//! reads its env var through [`env_value`], so an empty one counts as unset
+//! everywhere, and parses it through [`setting`]. A missing file contributes
+//! nothing. A file that cannot be read or parsed, or a value of the wrong
+//! type, is an error that names the file: the server refuses to start rather
+//! than serve with the defaults.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::Deserialize;
 
@@ -66,31 +69,85 @@ pub(crate) fn ensure_local_dir(root: &Path) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// The directory an env var names, if it is set and not empty.
-#[must_use]
-pub(crate) fn env_dir(name: &str) -> Option<PathBuf> {
-    nonempty(std::env::var_os(name))
+/// Reads one env var. The server passes [`process_env`]; tests pass a fixed
+/// list, so they need not set the process environment.
+pub(crate) type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+/// The process environment, as an [`Env`].
+pub(crate) fn process_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
 }
 
-fn nonempty(value: Option<OsString>) -> Option<PathBuf> {
-    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+/// The value of env var `name`, or `None` when it is unset, empty or only
+/// white space.
+pub(crate) fn env_value(env: Env<'_>, name: &str) -> Option<OsString> {
+    env(name).filter(|value| !value.to_string_lossy().trim().is_empty())
 }
 
-/// Pick a directory by the config precedence.
+/// One setting by `env var > config file`: the trimmed value of env var
+/// `name` parsed as `T`, else `file`. The caller applies the default.
 ///
-/// The order is a CLI flag, then an env var's value, then the config files'
-/// value, then the default. An empty env value counts as unset. The env value
-/// is an argument so tests need not set the process environment.
+/// # Errors
+///
+/// Names the variable when its value is not UTF-8 or does not parse.
+pub(crate) fn setting<T>(env: Env<'_>, name: &str, file: Option<T>) -> Result<Option<T>, String>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    let Some(value) = env_value(env, name) else {
+        return Ok(file);
+    };
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{name} is not valid UTF-8"))?
+        .trim();
+    text.parse()
+        .map(Some)
+        .map_err(|error| format!("{name}={text:?} does not parse: {error}"))
+}
+
+/// [`setting`] with `default` filled in, for a value that must be positive.
+///
+/// # Errors
+///
+/// As [`setting`], and names the variable when the value from either source
+/// is zero.
+pub(crate) fn positive_setting<T>(env: Env<'_>, name: &str, file: Option<T>, default: T) -> Result<T, String>
+where
+    T: FromStr + PartialEq + From<u8>,
+    T::Err: fmt::Display,
+{
+    let value = setting(env, name, file)?.unwrap_or(default);
+    if value == T::from(0) {
+        return Err(format!(
+            "{name} is 0, from the env var or the config file; it must be positive"
+        ));
+    }
+    Ok(value)
+}
+
+/// A directory by `CLI flag > env var > config file > default`: `flag`, then
+/// env var `name`, then what `configured` reads from the config files, then
+/// `default`.
+///
+/// # Errors
+///
+/// Returns the error `configured` returns.
 pub(crate) fn pick_dir(
     flag: Option<&Path>,
-    env: Option<OsString>,
-    configured: impl FnOnce() -> Option<PathBuf>,
+    env: Env<'_>,
+    name: &str,
+    configured: impl FnOnce() -> Result<Option<PathBuf>, String>,
     default: impl FnOnce() -> PathBuf,
-) -> PathBuf {
-    flag.map(Path::to_path_buf)
-        .or_else(|| nonempty(env))
-        .or_else(configured)
-        .unwrap_or_else(default)
+) -> Result<PathBuf, String> {
+    if let Some(flag) = flag {
+        return Ok(flag.to_path_buf());
+    }
+    if let Some(value) = env_value(env, name) {
+        return Ok(PathBuf::from(value));
+    }
+    Ok(configured()?.unwrap_or_else(default))
 }
 
 /// Merged view of the config files. All fields optional: an absent field
@@ -220,40 +277,41 @@ impl InstallFileConfig {
 }
 
 impl ConfigFile {
-    /// Load and merge the config files of the Lake root `root`: the tracked
-    /// file is the base and the local file overlays it per key. `None` reads
-    /// nothing. A missing file contributes nothing; a malformed file is logged
-    /// and skipped. Never fails: the worst case is an empty config (env +
-    /// defaults).
-    #[must_use]
-    pub fn load(root: Option<&Path>) -> Self {
-        let Some(root) = root else {
-            return Self::default();
-        };
-        let mut merged =
-            read_toml(&root.join(TRACKED_FILE_NAME)).unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
-        if let Some(local) = read_toml(&local_file(root)) {
-            merge_toml(&mut merged, local);
+    /// The config files of the Lake root `root`, read by [`load_table`]. `None`
+    /// reads nothing and gives the empty config.
+    ///
+    /// # Errors
+    ///
+    /// Names the file that cannot be read or parsed, or the value whose type
+    /// does not match the schema.
+    pub fn load(root: Option<&Path>) -> Result<Self, String> {
+        match root {
+            Some(root) => Self::from_table(load_table(root)?),
+            None => Ok(Self::default()),
         }
-        match merged.try_into() {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::warn!(error = %err, "merged config did not match the schema; ignoring it");
-                Self::default()
-            }
-        }
+    }
+
+    /// The settings in a merged config table. Tables this schema does not
+    /// name, such as `[build]`, are left to their own readers.
+    ///
+    /// # Errors
+    ///
+    /// Names the value whose type does not match the schema.
+    pub(crate) fn from_table(table: toml::Table) -> Result<Self, String> {
+        toml::Value::Table(table)
+            .try_into()
+            .map_err(|error: toml::de::Error| format!("config: {}", error.to_string().trim_end()))
     }
 }
 
-/// The config files of Lake root `root`, merged as [`ConfigFile::load`]
-/// merges them, but failing on a file that cannot be read or parsed. Builds
-/// read their tables through this: a typo in a recipe must stop the build,
-/// not drop the recipe. A missing file contributes nothing.
+/// The config files of Lake root `root`, merged: the tracked file is the base
+/// and the local file overlays it per key. A missing file contributes
+/// nothing. Every reader of the files starts here.
 ///
 /// # Errors
 ///
 /// Names the file and the read or parse error.
-pub(crate) fn load_strict(root: &Path) -> Result<toml::Table, String> {
+pub(crate) fn load_table(root: &Path) -> Result<toml::Table, String> {
     let mut merged = toml::Value::Table(toml::Table::new());
     for path in [root.join(TRACKED_FILE_NAME), local_file(root)] {
         let contents = match fs::read_to_string(&path) {
@@ -272,19 +330,6 @@ pub(crate) fn load_strict(root: &Path) -> Result<toml::Table, String> {
         | toml::Value::Boolean(_)
         | toml::Value::Datetime(_)
         | toml::Value::Array(_) => Err("merged config is not a table".to_owned()),
-    }
-}
-
-/// Read and parse one TOML file. Missing file → `None` (silent); parse error
-/// → `None` with a warning, so a typo in one file can't take down startup.
-fn read_toml(path: &Path) -> Option<toml::Value> {
-    let contents = fs::read_to_string(path).ok()?;
-    match toml::from_str::<toml::Value>(&contents) {
-        Ok(value) => Some(value),
-        Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "config file parse failed; ignoring");
-            None
-        }
     }
 }
 
@@ -337,7 +382,7 @@ mod tests {
             "[runtime]\nlean_max_memory_kib = 8\nrequest_timeout_millis = 16\n",
         )
         .unwrap();
-        let config = ConfigFile::load(Some(&root));
+        let config = ConfigFile::load(Some(&root)).unwrap();
 
         // Local overrode the one runtime key it set...
         assert_eq!(config.runtime.lean_max_memory_kib, Some(8));
@@ -353,8 +398,8 @@ mod tests {
         // A file in an ancestor of the root, or in the working directory, is
         // not a config file of this root.
         fs::write(dir.path().join(TRACKED_FILE_NAME), "[broker]\nmax_workers = 3\n").unwrap();
-        assert!(ConfigFile::load(Some(&root)).broker.max_workers.is_none());
-        assert!(ConfigFile::load(None).broker.max_workers.is_none());
+        assert!(ConfigFile::load(Some(&root)).unwrap().broker.max_workers.is_none());
+        assert!(ConfigFile::load(None).unwrap().broker.max_workers.is_none());
     }
 
     #[test]
@@ -363,23 +408,80 @@ mod tests {
         fs::write(root.join(TRACKED_FILE_NAME), "[install]\nworkers_dir = 'workers'\n").unwrap();
         ensure_local_dir(&root).unwrap();
         fs::write(local_file(&root), "[install]\nstore_dir = '/state/store'\n").unwrap();
-        let install = ConfigFile::load(Some(&root)).install;
+        let install = ConfigFile::load(Some(&root)).unwrap().install;
         assert_eq!(install.workers_dir(&root), Some(root.join("workers")));
         assert_eq!(install.store_dir(&root), Some(PathBuf::from("/state/store")));
         assert!(install.binary.is_none());
     }
 
+    /// An env lookup that knows only `NAME`, set to `value`.
+    fn one_var(value: &'static str) -> impl Fn(&str) -> Option<OsString> {
+        move |name| (name == "NAME").then(|| OsString::from(value))
+    }
+
     #[test]
     fn pick_dir_follows_flag_env_file_default() {
         let flag = Path::new("/flag");
-        let env = || Some(OsString::from("/env"));
-        let file = || Some(PathBuf::from("/file"));
+        let env = one_var("/env");
+        let file = || Ok(Some(PathBuf::from("/file")));
         let default = || PathBuf::from("/default");
-        assert_eq!(pick_dir(Some(flag), env(), file, default), flag);
-        assert_eq!(pick_dir(None, env(), file, default), Path::new("/env"));
-        assert_eq!(pick_dir(None, Some(OsString::new()), file, default), Path::new("/file"));
-        assert_eq!(pick_dir(None, None, file, default), Path::new("/file"));
-        assert_eq!(pick_dir(None, None, || None, default), Path::new("/default"));
+        let pick = |flag, env: Env<'_>, file: fn() -> Result<Option<PathBuf>, String>| {
+            pick_dir(flag, env, "NAME", file, default).unwrap()
+        };
+        assert_eq!(pick(Some(flag), &env, file), flag);
+        assert_eq!(pick(None, &env, file), Path::new("/env"));
+        assert_eq!(pick(None, &one_var(""), file), Path::new("/file"));
+        assert_eq!(pick(None, &one_var(" \n"), file), Path::new("/file"));
+        assert_eq!(pick(None, &|_| None, file), Path::new("/file"));
+        assert_eq!(pick(None, &|_| None, || Ok(None)), Path::new("/default"));
+        assert_eq!(
+            pick_dir(None, &|_| None, "NAME", || Err("bad file".to_owned()), default),
+            Err("bad file".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_setting_takes_a_set_env_var_over_the_file() {
+        assert_eq!(setting::<u64>(&one_var(" 7 "), "NAME", Some(3)), Ok(Some(7)));
+        assert_eq!(setting::<u64>(&|_| None, "NAME", Some(3)), Ok(Some(3)));
+        assert_eq!(setting::<u64>(&|_| None, "NAME", None), Ok(None));
+    }
+
+    /// An empty env var counts as unset for every setting, whatever its type.
+    #[test]
+    fn a_setting_treats_an_empty_env_var_as_unset() {
+        for value in ["", "  ", "\t\n"] {
+            assert_eq!(setting::<u64>(&one_var(value), "NAME", Some(3)), Ok(Some(3)));
+            assert_eq!(setting::<String>(&one_var(value), "NAME", None), Ok(None));
+        }
+    }
+
+    #[test]
+    fn a_setting_names_the_env_var_that_does_not_parse() {
+        let error = setting::<u64>(&one_var("seven"), "NAME", Some(3)).unwrap_err();
+        assert!(error.starts_with("NAME=\"seven\""), "{error}");
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_is_an_error_naming_it() {
+        let (_dir, root) = project();
+        fs::write(root.join(TRACKED_FILE_NAME), "[broker\nmax_workers = 3\n").unwrap();
+        let error = ConfigFile::load(Some(&root)).unwrap_err();
+        assert!(error.contains(TRACKED_FILE_NAME), "{error}");
+    }
+
+    /// A value of the wrong type stops the load. The old loader dropped the
+    /// whole config instead, so one typo put every setting back to its default.
+    #[test]
+    fn a_value_of_the_wrong_type_is_an_error_naming_its_key() {
+        let (_dir, root) = project();
+        fs::write(
+            root.join(TRACKED_FILE_NAME),
+            "[runtime]\nlean_max_memory_kib = 5\n[broker]\nmax_workers = 'eight'\n",
+        )
+        .unwrap();
+        let error = ConfigFile::load(Some(&root)).unwrap_err();
+        assert!(error.contains("max_workers"), "{error}");
     }
 
     #[test]
@@ -402,7 +504,7 @@ mod tests {
             "[launcher]\nmode = 'managed'\n[broker]\nmax_workers = 2\n",
         )
         .unwrap();
-        assert_eq!(ConfigFile::load(Some(&root)).broker.max_workers, Some(2));
+        assert_eq!(ConfigFile::load(Some(&root)).unwrap().broker.max_workers, Some(2));
     }
 
     #[test]

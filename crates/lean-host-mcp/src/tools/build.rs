@@ -40,7 +40,7 @@ pub(crate) async fn lean_build_as(
     id: &str,
 ) -> Result<BuildOutcome, McpError> {
     let build = plan_build(ctx, &request)?;
-    let store = crate::store::store_dir(&build.root, None);
+    let store = crate::store::store_dir(&build.root, None).map_err(ServerError::BadProject)?;
     crate::store::create_store_dir(&store, &build.root).map_err(ServerError::Io)?;
     let log = log_path(&store, id).map_err(ServerError::Io)?;
     run_planned(ctx, build, id, &log, None).await

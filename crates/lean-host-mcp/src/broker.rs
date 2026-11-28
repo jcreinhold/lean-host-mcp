@@ -58,7 +58,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
 use crate::cancellation::CallCancellation;
-use crate::config_file::BrokerFileConfig;
+use crate::config_file::{self, BrokerFileConfig, Env};
 use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::lake_meta::{LakeProjectMeta, ProjectInputStamp};
@@ -139,92 +139,27 @@ impl BrokerConfig {
     /// [`ServerError::Internal`] when an env var does not parse or a worker
     /// or short-run limit is zero. An idle timeout of zero turns idle retirement off.
     pub fn from_env_with_file(lake_root: Option<PathBuf>, file: &BrokerFileConfig) -> Result<Self> {
-        let env = PoolEnv {
-            max_workers: std::env::var("LEAN_HOST_MCP_MAX_WORKERS").ok(),
-            max_workers_per_project: std::env::var("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT").ok(),
-            max_lean_runs: std::env::var("LEAN_HOST_MCP_MAX_LEAN_RUNS").ok(),
-            idle_timeout_secs: std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok(),
-        };
-        parse_pool_config(lake_root, &env, file)
+        parse_pool_config(lake_root, &config_file::process_env, file)
     }
 }
 
-/// The pool's env vars, as read.
-#[derive(Debug, Default)]
-struct PoolEnv {
-    max_workers: Option<String>,
-    max_workers_per_project: Option<String>,
-    max_lean_runs: Option<String>,
-    idle_timeout_secs: Option<String>,
-}
-
-/// Pure parser behind [`BrokerConfig::from_env_with_file`].
-fn parse_pool_config(lake_root: Option<PathBuf>, env: &PoolEnv, file: &BrokerFileConfig) -> Result<BrokerConfig> {
-    let max_workers = nonzero(
-        resolve_usize(
-            "LEAN_HOST_MCP_MAX_WORKERS",
-            env.max_workers.as_deref(),
-            file.max_workers,
-            DEFAULT_MAX_WORKERS,
-        )?,
-        "max_workers must be positive",
-    )?;
-    let max_workers_per_project = nonzero(
-        resolve_usize(
-            "LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT",
-            env.max_workers_per_project.as_deref(),
-            file.max_workers_per_project,
-            1,
-        )?,
-        "max_workers_per_project must be positive",
-    )?;
-    let max_lean_runs = nonzero(
-        resolve_usize(
-            "LEAN_HOST_MCP_MAX_LEAN_RUNS",
-            env.max_lean_runs.as_deref(),
-            file.max_lean_runs,
-            DEFAULT_MAX_LEAN_RUNS,
-        )?,
-        "max_lean_runs must be positive",
-    )?;
-    let idle_timeout = Duration::from_secs(resolve_u64(
-        "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS",
-        env.idle_timeout_secs.as_deref(),
-        file.idle_timeout_secs,
-        DEFAULT_IDLE_TIMEOUT_SECS,
-    )?);
+/// [`BrokerConfig::from_env_with_file`] with the env lookup passed in.
+fn parse_pool_config(lake_root: Option<PathBuf>, env: Env<'_>, file: &BrokerFileConfig) -> Result<BrokerConfig> {
+    let positive = |name: &str, file: Option<usize>, default: usize| {
+        config_file::positive_setting(env, name, file, default)
+            .and_then(|value| NonZeroUsize::new(value).ok_or_else(|| format!("{name} is 0")))
+            .map_err(ServerError::Internal)
+    };
+    let idle_timeout_secs = config_file::setting(env, "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS", file.idle_timeout_secs)
+        .map_err(ServerError::Internal)?
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
     Ok(BrokerConfig {
         lake_root,
-        max_workers,
-        max_workers_per_project,
-        max_lean_runs,
-        idle_timeout,
+        max_workers: positive("LEAN_HOST_MCP_MAX_WORKERS", file.max_workers, DEFAULT_MAX_WORKERS)?,
+        max_workers_per_project: positive("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT", file.max_workers_per_project, 1)?,
+        max_lean_runs: positive("LEAN_HOST_MCP_MAX_LEAN_RUNS", file.max_lean_runs, DEFAULT_MAX_LEAN_RUNS)?,
+        idle_timeout: Duration::from_secs(idle_timeout_secs),
     })
-}
-
-/// Resolve a `usize` knob through `env > file > default`. The env string is
-/// parsed here; the file value is already typed.
-fn resolve_usize(name: &str, env: Option<&str>, file: Option<usize>, default: usize) -> Result<usize> {
-    match env {
-        Some(s) => s
-            .parse()
-            .map_err(|e| ServerError::Internal(format!("{name}={s:?} not a usize: {e}"))),
-        None => Ok(file.unwrap_or(default)),
-    }
-}
-
-/// Resolve a `u64` knob through `env > file > default`.
-fn resolve_u64(name: &str, env: Option<&str>, file: Option<u64>, default: u64) -> Result<u64> {
-    match env {
-        Some(s) => s
-            .parse()
-            .map_err(|e| ServerError::Internal(format!("{name}={s:?} not a u64: {e}"))),
-        None => Ok(file.unwrap_or(default)),
-    }
-}
-
-fn nonzero(value: usize, zero_message: &str) -> Result<NonZeroUsize> {
-    NonZeroUsize::new(value).ok_or_else(|| ServerError::Internal(zero_message.to_owned()))
 }
 
 /// A call's `project` field. `Default` selects the served root; `Explicit`
@@ -1527,9 +1462,11 @@ mod tests {
     #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and a matching installed worker"]
     async fn same_project_checks_run_on_distinct_workers() {
         let root = worker_fixture();
-        let runtime =
-            ProjectRuntimeConfig::from_env_with_file(&crate::config_file::ConfigFile::load(Some(&root)).runtime, 2)
-                .unwrap();
+        let runtime = ProjectRuntimeConfig::from_env_with_file(
+            &crate::config_file::ConfigFile::load(Some(&root)).unwrap().runtime,
+            2,
+        )
+        .unwrap();
         let mut config = cfg(Some(root));
         config.max_workers = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
@@ -1620,12 +1557,20 @@ mod tests {
         broker.shutdown_all();
     }
 
-    fn env(max_workers: Option<&str>, per_project: Option<&str>, idle: Option<&str>) -> PoolEnv {
-        PoolEnv {
-            max_workers: max_workers.map(str::to_owned),
-            max_workers_per_project: per_project.map(str::to_owned),
-            max_lean_runs: None,
-            idle_timeout_secs: idle.map(str::to_owned),
+    /// An env lookup that sets the pool's worker, per-project and idle vars.
+    fn env(
+        max_workers: Option<&'static str>,
+        per_project: Option<&'static str>,
+        idle: Option<&'static str>,
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| {
+            match name {
+                "LEAN_HOST_MCP_MAX_WORKERS" => max_workers,
+                "LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT" => per_project,
+                "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS" => idle,
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
         }
     }
 
@@ -1636,12 +1581,14 @@ mod tests {
             max_workers_per_project: Some(2),
             ..BrokerFileConfig::default()
         };
-        let limits = |env: PoolEnv| {
-            let config = parse_pool_config(None, &env, &file).unwrap();
+        let limits = |env: Env<'_>| {
+            let config = parse_pool_config(None, env, &file).unwrap();
             (config.max_workers.get(), config.max_workers_per_project.get())
         };
-        assert_eq!(limits(env(None, None, None)), (3, 2));
-        assert_eq!(limits(env(Some("1"), Some("1"), None)), (1, 1));
+        assert_eq!(limits(&env(None, None, None)), (3, 2));
+        assert_eq!(limits(&env(Some("1"), Some("1"), None)), (1, 1));
+        // An empty env var counts as unset.
+        assert_eq!(limits(&env(Some(""), Some(" "), None)), (3, 2));
         assert!(parse_pool_config(None, &env(None, Some("0"), None), &file).is_err());
         assert!(parse_pool_config(None, &env(None, Some("bad"), None), &file).is_err());
     }
@@ -1659,7 +1606,7 @@ mod tests {
     #[test]
     fn parse_pool_config_uses_defaults_when_unset() {
         let empty = BrokerFileConfig::default();
-        let config = parse_pool_config(None, &PoolEnv::default(), &empty).unwrap();
+        let config = parse_pool_config(None, &|_| None, &empty).unwrap();
         assert_eq!(config.max_workers.get(), DEFAULT_MAX_WORKERS);
         assert_eq!(config.max_workers_per_project, NonZeroUsize::MIN);
         assert_eq!(config.idle_timeout, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
@@ -1777,7 +1724,7 @@ mod tests {
             ..BrokerFileConfig::default()
         };
         // Env unset -> file values used.
-        let config = parse_pool_config(None, &PoolEnv::default(), &file).unwrap();
+        let config = parse_pool_config(None, &|_| None, &file).unwrap();
         assert_eq!(config.max_workers.get(), 7);
         assert_eq!(config.idle_timeout, Duration::from_secs(45));
         // Env present -> env wins over the file value.
@@ -1792,7 +1739,7 @@ mod tests {
             max_workers: Some(0),
             ..BrokerFileConfig::default()
         };
-        assert!(parse_pool_config(None, &PoolEnv::default(), &file).is_err());
+        assert!(parse_pool_config(None, &|_| None, &file).is_err());
     }
     fn capacity_deadline() -> tokio::time::Instant {
         tokio::time::Instant::now().checked_add(Duration::from_secs(5)).unwrap()

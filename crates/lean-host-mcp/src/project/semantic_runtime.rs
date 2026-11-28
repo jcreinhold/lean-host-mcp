@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use lean_semantic_search_runtime::{SemanticSearchRuntime, SemanticSearchRuntimeBuild};
 use parking_lot::Mutex;
 
+use crate::config_file;
 use crate::error::{Result, ServerError};
 
 /// Opened semantic-search runtimes, one per `(toolchain label, Lean sysroot)`.
@@ -77,7 +78,7 @@ pub(crate) fn build_semantic_runtime(
     toolchain_label: &str,
     lean_sysroot: &Path,
 ) -> Result<SemanticSearchRuntime> {
-    let cache_root = match std::env::var_os(CACHE_DIR_ENV) {
+    let cache_root = match config_file::env_value(&config_file::process_env, CACHE_DIR_ENV) {
         Some(dir) => env_cache_dir(PathBuf::from(dir))?,
         None => cache_root.to_path_buf(),
     };
@@ -102,7 +103,7 @@ const CACHE_DIR_ENV: &str = "LEAN_HOST_MCP_SEMANTIC_CACHE_DIR";
 /// The semantic runtime cache: `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, a canonical
 /// path created if missing, else `semantic-runtimes` in the server's store.
 fn semantic_runtime_cache_root() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os(CACHE_DIR_ENV) {
+    if let Some(dir) = config_file::env_value(&config_file::process_env, CACHE_DIR_ENV) {
         return env_cache_dir(PathBuf::from(dir));
     }
     crate::store::process_store()

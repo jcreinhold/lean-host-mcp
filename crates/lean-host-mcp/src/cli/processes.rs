@@ -120,9 +120,10 @@ pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
         .lake_root
         .as_deref()
         .map(|root| {
-            root.canonicalize()
-                .map(|root| crate::store::store_dir(&root, None))
-                .with_context(|| format!("--lake-root {}", root.display()))
+            let root = root
+                .canonicalize()
+                .with_context(|| format!("--lake-root {}", root.display()))?;
+            crate::store::store_dir(&root, None).map_err(anyhow::Error::msg)
         })
         .transpose()?;
     let records = list_records(&registry_dir(store.as_deref())?)?;
@@ -213,7 +214,7 @@ fn list_records(dir: &Path) -> Result<Vec<ListedRecord>> {
 /// `processes` in the server store `store`, else `lean-host-mcp/processes`
 /// under the user cache directory.
 fn registry_dir(store: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os(REGISTRY_ENV) {
+    if let Some(path) = crate::config_file::env_value(&crate::config_file::process_env, REGISTRY_ENV) {
         return Ok(PathBuf::from(path));
     }
     if let Some(store) = store {

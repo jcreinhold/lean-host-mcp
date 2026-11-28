@@ -139,7 +139,10 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
         .transpose()?;
     // Find the toolchains where install found them, whatever `HOME` is now.
     if let Some(root) = lake_root.as_deref()
-        && let Some(home) = ConfigFile::load(Some(root)).install.elan_home(root)
+        && let Some(home) = ConfigFile::load(Some(root))
+            .map_err(anyhow::Error::msg)?
+            .install
+            .elan_home(root)
     {
         toolchain::use_recorded_elan_home(&home)?;
     }
@@ -151,7 +154,7 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     // changes; holding the root's store refuses while that server runs.
     let _held = lake_root
         .as_deref()
-        .map(|root| store::hold(&store::store_dir(root, None), root))
+        .map(|root| store::hold(&store::store_dir(root, None).map_err(anyhow::Error::msg)?, root))
         .transpose()?;
     if args.prune {
         return prune_in(&root);
@@ -178,11 +181,11 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
 /// `LEAN_HOST_MCP_WORKERS_DIR` must name it.
 fn workers_root(args: &InstallWorkerArgs, lake_root: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(root) = lake_root {
-        return Ok(toolchain::workers_dir(root, args.workers_dir.as_deref()));
+        return toolchain::workers_dir(root, args.workers_dir.as_deref()).map_err(anyhow::Error::msg);
     }
     args.workers_dir
         .clone()
-        .or_else(|| config_file::env_dir(WORKERS_DIR_ENV))
+        .or_else(|| config_file::env_value(&config_file::process_env, WORKERS_DIR_ENV).map(PathBuf::from))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no worker directory; pass --lake-root <project> or --workers-dir <dir>, or set {WORKERS_DIR_ENV}"

@@ -16,13 +16,12 @@
 //!   maps it into [`crate::error::ServerError::BadProject`] with the
 //!   [`install_fix`] command, so the fix flows through to the client.
 
-use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::config_file::{self, ConfigFile};
+use crate::config_file::{self, ConfigFile, Env};
 use crate::smoke::SmokeOutcome;
 
 /// Env var that names elan's home, as elan itself reads it.
@@ -58,7 +57,7 @@ pub fn use_recorded_elan_home(path: &Path) -> io::Result<()> {
 #[must_use]
 pub fn elan_home() -> Option<PathBuf> {
     elan_home_from(
-        std::env::var_os(ELAN_HOME_ENV),
+        &config_file::process_env,
         RECORDED_ELAN_HOME.get().map(PathBuf::as_path),
         dirs::home_dir(),
     )
@@ -73,8 +72,8 @@ pub(crate) fn pass_elan_home(command: &mut std::process::Command) {
 }
 
 /// [`elan_home`] with its inputs passed in. An empty `ELAN_HOME` counts as unset.
-pub(crate) fn elan_home_from(env: Option<OsString>, recorded: Option<&Path>, home: Option<PathBuf>) -> Option<PathBuf> {
-    env.filter(|value| !value.is_empty())
+pub(crate) fn elan_home_from(env: Env<'_>, recorded: Option<&Path>, home: Option<PathBuf>) -> Option<PathBuf> {
+    config_file::env_value(env, ELAN_HOME_ENV)
         .map(PathBuf::from)
         .or_else(|| recorded.map(Path::to_path_buf))
         .or_else(|| home.map(|home| home.join(".elan")))
@@ -99,17 +98,21 @@ pub const WORKERS_DIR_ENV: &str = "LEAN_HOST_MCP_WORKERS_DIR";
 ///
 /// `install`, `install-worker` and the server all pick the directory here, so
 /// the server looks where install put the worker.
-#[must_use]
-pub fn workers_dir(root: &Path, flag: Option<&Path>) -> PathBuf {
-    workers_dir_with(root, flag, std::env::var_os(WORKERS_DIR_ENV))
+///
+/// # Errors
+///
+/// Names the config file that cannot be read or parsed.
+pub fn workers_dir(root: &Path, flag: Option<&Path>) -> Result<PathBuf, String> {
+    workers_dir_with(root, flag, &config_file::process_env)
 }
 
-/// [`workers_dir`] with the env var's value passed in.
-pub(crate) fn workers_dir_with(root: &Path, flag: Option<&Path>, env: Option<OsString>) -> PathBuf {
+/// [`workers_dir`] with the env lookup passed in.
+pub(crate) fn workers_dir_with(root: &Path, flag: Option<&Path>, env: Env<'_>) -> Result<PathBuf, String> {
     config_file::pick_dir(
         flag,
         env,
-        || ConfigFile::load(Some(root)).install.workers_dir(root),
+        WORKERS_DIR_ENV,
+        || Ok(ConfigFile::load(Some(root))?.install.workers_dir(root)),
         || config_file::local_dir(root).join("workers"),
     )
 }
@@ -933,6 +936,7 @@ impl std::error::Error for ToolchainError {}
     reason = "test code uses unwrap/expect/panic to surface failure paths concisely"
 )]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
 
     use super::*;
@@ -942,27 +946,28 @@ mod tests {
 
     #[test]
     fn elan_home_prefers_the_env_then_the_recorded_path_then_home() {
-        let env = || Some(OsString::from("/env/elan"));
+        let env = |value: &'static str| move |name: &str| (name == ELAN_HOME_ENV).then(|| OsString::from(value));
+        let unset = |_: &str| None;
         let recorded = Some(Path::new("/recorded/elan"));
         let home = || Some(PathBuf::from("/home/user"));
         assert_eq!(
-            elan_home_from(env(), recorded, home()),
+            elan_home_from(&env("/env/elan"), recorded, home()),
             Some(PathBuf::from("/env/elan"))
         );
         assert_eq!(
-            elan_home_from(None, recorded, home()),
+            elan_home_from(&unset, recorded, home()),
             Some(PathBuf::from("/recorded/elan"))
         );
         assert_eq!(
-            elan_home_from(Some(OsString::new()), recorded, home()),
+            elan_home_from(&env(""), recorded, home()),
             Some(PathBuf::from("/recorded/elan")),
             "an empty ELAN_HOME counts as unset"
         );
         assert_eq!(
-            elan_home_from(None, None, home()),
+            elan_home_from(&unset, None, home()),
             Some(PathBuf::from("/home/user/.elan"))
         );
-        assert_eq!(elan_home_from(None, None, None), None);
+        assert_eq!(elan_home_from(&unset, None, None), None);
     }
 
     #[test]
@@ -1031,7 +1036,7 @@ mod tests {
     fn workers_dir_reads_the_lake_root_config() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let pick = |flag: Option<&Path>| workers_dir_with(root, flag, None);
+        let pick = |flag: Option<&Path>| workers_dir_with(root, flag, &|_| None).unwrap();
         assert_eq!(pick(None), root.join(".local/lean-host-mcp/workers"));
         fs::write(root.join("lean-host-mcp.toml"), "[install]\nworkers_dir = 'tracked'\n").unwrap();
         assert_eq!(pick(None), root.join("tracked"));
@@ -1042,8 +1047,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pick(None), Path::new("/local/workers"));
+        let env = |name: &str| (name == WORKERS_DIR_ENV).then(|| OsString::from("/env"));
         assert_eq!(
-            workers_dir_with(root, None, Some("/env".into())),
+            workers_dir_with(root, None, &env).unwrap(),
             Path::new("/env"),
             "the env var beats both files"
         );

@@ -105,7 +105,7 @@ impl BuildConfig {
     /// # Errors
     /// Names every unreadable file, unknown key and bad value.
     pub(crate) fn load(root: &std::path::Path) -> Result<Self, Vec<String>> {
-        let table = crate::config_file::load_strict(root).map_err(|error| vec![error])?;
+        let table = crate::config_file::load_table(root).map_err(|error| vec![error])?;
         Self::from_table(&table)
     }
 

@@ -90,7 +90,7 @@ fn check(root: &Path) -> Result<String, Vec<String>> {
         let state = if path.exists() { "read" } else { "absent" };
         let _ = writeln!(report, "{state}: {}", path.display());
     }
-    let table = config_file::load_strict(root).map_err(|error| vec![error])?;
+    let table = config_file::load_table(root).map_err(|error| vec![error])?;
     let mut problems = Vec::new();
     for (name, value) in &table {
         if name == "build" || name == "recipes" {
@@ -110,8 +110,8 @@ fn check(root: &Path) -> Result<String, Vec<String>> {
             }
         }
     }
-    if let Err(error) = toml::Value::Table(table.clone()).try_into::<ConfigFile>() {
-        problems.push(error.to_string().trim_end().to_owned());
+    if let Err(error) = ConfigFile::from_table(table.clone()) {
+        problems.push(error);
     }
     match BuildConfig::from_table(&table) {
         Ok(build) if problems.is_empty() => {

@@ -29,10 +29,7 @@ use lean_host_mcp::requests::{RequestRunner, RequestSettings};
 use lean_host_mcp::store;
 use lean_host_mcp::toolchain;
 use lean_host_mcp::tools::ToolContext;
-use lean_host_mcp::{
-    BrokerConfig, ConfigFile, LeanHostService, OutputBudgetOverrides, ProjectBroker, ProjectRuntimeConfig,
-    ResponseCarrier, TelemetryVerbosity, ToolConfig,
-};
+use lean_host_mcp::{BrokerConfig, ConfigFile, LeanHostService, ProjectBroker, ProjectRuntimeConfig, ToolConfig};
 
 /// MCP server, over stdio or Streamable HTTP, that runs Lean 4 in worker children.
 #[derive(Debug, Parser)]
@@ -185,7 +182,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .transpose()?;
     // The config files of the Lake root, local over tracked. They are the
     // layer beneath env/CLI: each knob is CLI > env > local > tracked > default.
-    let file = ConfigFile::load(lake_root.as_deref());
+    let file = ConfigFile::load(lake_root.as_deref()).map_err(anyhow::Error::msg)?;
     // Find the toolchain where install found it, whatever `HOME` is now.
     if let Some(home) = lake_root.as_deref().and_then(|root| file.install.elan_home(root)) {
         toolchain::use_recorded_elan_home(&home)?;
@@ -208,7 +205,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let broker_config = BrokerConfig::from_env_with_file(lake_root.clone(), &file.broker)?;
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, broker_config.max_workers.get())?;
-    let tool_config = resolve_tool_config(&file)?;
+    let tool_config = ToolConfig::from_env_with_file(&file).map_err(anyhow::Error::msg)?;
     let request_settings = RequestSettings::from_file(&file.requests).map_err(anyhow::Error::msg)?;
     // One server per store. Take it after the config checks, so a bad config
     // leaves the store alone, and before the broker, the process record and
@@ -216,7 +213,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // server started has exited.
     let store = lake_root
         .as_deref()
-        .map(|root| store::hold(&store::store_dir(root, None), root))
+        .map(|root| store::hold(&store::store_dir(root, None).map_err(anyhow::Error::msg)?, root))
         .transpose()?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -355,63 +352,6 @@ async fn wait_for_parent_loss(parent_pid: Option<u32>) {
 
 fn build_broker(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<ProjectBroker> {
     ProjectBroker::new_with_runtime_config(config, runtime_config)
-}
-
-/// Resolve the presentation knobs (response carrier, telemetry verbosity, output
-/// budgets) with the standard precedence: env var > config file > built-in
-/// default. Invalid enum or integer values fail startup loudly rather than
-/// silently falling back.
-fn resolve_tool_config(file: &ConfigFile) -> anyhow::Result<ToolConfig> {
-    let carrier =
-        match tool_env_string("LEAN_HOST_MCP_RESPONSE_CARRIER").or_else(|| file.server.response_carrier.clone()) {
-            Some(value) => ResponseCarrier::parse(&value)
-                .with_context(|| format!("invalid response carrier {value:?}; expected text, structured, or both"))?,
-            None => ResponseCarrier::default(),
-        };
-    let verbosity =
-        match tool_env_string("LEAN_HOST_MCP_TELEMETRY_VERBOSITY").or_else(|| file.telemetry.verbosity.clone()) {
-            Some(value) => TelemetryVerbosity::parse(&value)
-                .with_context(|| format!("invalid telemetry verbosity {value:?}; expected quiet or full"))?,
-            None => TelemetryVerbosity::default(),
-        };
-    let output = OutputBudgetOverrides {
-        max_field_bytes: tool_env_int("LEAN_HOST_MCP_OUTPUT_MAX_FIELD_BYTES")?.or(file.output.max_field_bytes),
-        max_total_bytes: tool_env_int("LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES")?.or(file.output.max_total_bytes),
-        heartbeat_limit: tool_env_int("LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT")?.or(file.output.heartbeat_limit),
-    };
-    let slow_call_warning_millis = tool_env_int::<u64>("LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS")?
-        .or(file.output.slow_call_warning_millis)
-        .unwrap_or(lean_host_mcp::tools::DEFAULT_SLOW_CALL_WARNING_MILLIS);
-    Ok(ToolConfig {
-        carrier,
-        verbosity,
-        output,
-        slow_call_warning_millis,
-    })
-}
-
-/// Read a non-empty environment variable as a trimmed `String`.
-fn tool_env_string(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
-/// Read an environment variable as an integer, failing startup on a malformed
-/// value. Returns `None` when the variable is unset.
-fn tool_env_int<T>(key: &str) -> anyhow::Result<Option<T>>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    match tool_env_string(key) {
-        Some(value) => value
-            .parse::<T>()
-            .map(Some)
-            .map_err(|err| anyhow::anyhow!("invalid {key}={value:?}: {err}")),
-        None => Ok(None),
-    }
 }
 
 fn http_config(

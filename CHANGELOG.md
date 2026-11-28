@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- A config file that does not parse, or a value of the wrong type, stops the server at startup with an error that names
+  the file or the key. Before, the server logged it and served with the defaults. `ConfigFile::load`, `store::store_dir`
+  and `toolchain::workers_dir` return that error.
+
+### Changed
+
+- An environment variable that is empty or holds only spaces counts as unset for every setting. Before, an empty broker
+  or runtime variable stopped startup while the others counted as unset. `ToolConfig::from_env_with_file` resolves the
+  presentation settings in the library.
+
 ## [0.18.0] - 2026-11-27
 
 ### Breaking

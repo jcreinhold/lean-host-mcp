@@ -30,6 +30,7 @@ pub mod semantic;
 pub(crate) mod source_input;
 
 use crate::broker::ProjectBroker;
+use crate::config_file::{self, ConfigFile, Env, setting};
 
 /// Which field of the MCP tool result carries the serialized envelope.
 ///
@@ -133,6 +134,56 @@ impl Default for ToolConfig {
     }
 }
 
+impl ToolConfig {
+    /// Read the presentation knobs: each is `env var > config file > default`.
+    ///
+    /// # Errors
+    ///
+    /// Names the env var or value that does not parse.
+    pub fn from_env_with_file(file: &ConfigFile) -> Result<Self, String> {
+        Self::resolve(&config_file::process_env, file)
+    }
+
+    /// [`Self::from_env_with_file`] with the env lookup passed in.
+    fn resolve(env: Env<'_>, file: &ConfigFile) -> Result<Self, String> {
+        let carrier = match setting(
+            env,
+            "LEAN_HOST_MCP_RESPONSE_CARRIER",
+            file.server.response_carrier.clone(),
+        )? {
+            Some(value) => ResponseCarrier::parse(&value)
+                .ok_or_else(|| format!("invalid response carrier {value:?}; expected text, structured, or both"))?,
+            None => ResponseCarrier::default(),
+        };
+        let verbosity = match setting(
+            env,
+            "LEAN_HOST_MCP_TELEMETRY_VERBOSITY",
+            file.telemetry.verbosity.clone(),
+        )? {
+            Some(value) => TelemetryVerbosity::parse(&value)
+                .ok_or_else(|| format!("invalid telemetry verbosity {value:?}; expected quiet or full"))?,
+            None => TelemetryVerbosity::default(),
+        };
+        let output = OutputBudgetOverrides {
+            max_field_bytes: setting(env, "LEAN_HOST_MCP_OUTPUT_MAX_FIELD_BYTES", file.output.max_field_bytes)?,
+            max_total_bytes: setting(env, "LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES", file.output.max_total_bytes)?,
+            heartbeat_limit: setting(env, "LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT", file.output.heartbeat_limit)?,
+        };
+        let slow_call_warning_millis = setting(
+            env,
+            "LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS",
+            file.output.slow_call_warning_millis,
+        )?
+        .unwrap_or(DEFAULT_SLOW_CALL_WARNING_MILLIS);
+        Ok(Self {
+            carrier,
+            verbosity,
+            output,
+            slow_call_warning_millis,
+        })
+    }
+}
+
 /// Shared state every tool handler reads.
 ///
 /// Holds the broker and the resolved presentation [`ToolConfig`]; each tool
@@ -162,5 +213,32 @@ pub(crate) fn session_imports(imports: Vec<String>) -> Vec<String> {
         out.push("Init".to_owned());
         out.extend(imports);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::*;
+
+    /// A set env var wins over the config file, and one set to the empty
+    /// string counts as unset.
+    #[test]
+    fn tool_config_takes_env_over_file_and_skips_an_empty_env_var() -> Result<(), String> {
+        let mut file = ConfigFile::default();
+        file.telemetry.verbosity = Some("full".to_owned());
+        file.output.max_field_bytes = Some(100);
+        let empty = |name: &str| (name == "LEAN_HOST_MCP_TELEMETRY_VERBOSITY").then(OsString::new);
+        assert_eq!(ToolConfig::resolve(&empty, &file)?.verbosity, TelemetryVerbosity::Full);
+        let set = |name: &str| match name {
+            "LEAN_HOST_MCP_TELEMETRY_VERBOSITY" => Some(OsString::from("quiet")),
+            "LEAN_HOST_MCP_OUTPUT_MAX_FIELD_BYTES" => Some(OsString::from("50")),
+            _ => None,
+        };
+        let config = ToolConfig::resolve(&set, &file)?;
+        assert_eq!(config.verbosity, TelemetryVerbosity::Quiet);
+        assert_eq!(config.output.max_field_bytes, Some(50));
+        Ok(())
     }
 }

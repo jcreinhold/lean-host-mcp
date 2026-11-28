@@ -34,9 +34,9 @@ The server reads two TOML files at its `--lake-root`, and no others:
 
 Keys in the local file win over the tracked file one key at a time, so each file need only set what it changes. The
 server does not look in its working directory, its parent directories or your home directory. Without `--lake-root` it
-reads no file. Missing files are ignored; parse failures are logged and skipped. A merged value with the wrong type
-causes the merged file configuration to be ignored. Tables the server does not know, such as an old `[launcher]`, are
-ignored.
+reads no file. A missing file is ignored. A file that does not parse, or a value of the wrong type, stops the server at
+startup with an error that names the file or the key; `lean-host-mcp config check --lake-root PROJECT` reports the same
+errors without starting it. Tables the server does not know, such as an old `[launcher]`, are ignored.
 
 Generate a commented tracked file with the current defaults:
 
@@ -49,8 +49,9 @@ lean-host-mcp config init --lake-root PROJECT   # PROJECT/lean-host-mcp.toml
 
 ## Configuration reference
 
-For each setting, precedence is **CLI flag > environment variable > local file > tracked file > built-in default**.
-Units are shown in the table; GiB figures in descriptions are explanatory, not literal setting values.
+For each setting, precedence is **CLI flag > environment variable > local file > tracked file > built-in default**. An
+environment variable that is empty or holds only spaces counts as unset. Units are shown in the table; GiB figures in
+descriptions are explanatory, not literal setting values.
 
 <!-- BEGIN GENERATED: do not edit by hand. Regenerate from `config_schema::render_reference_table`; the `operations_md_reference_table_is_in_sync` test fails when this block drifts. -->
 | Key | Type | Default | Override | Description |

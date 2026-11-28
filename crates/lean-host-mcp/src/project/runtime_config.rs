@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::config_file::RuntimeFileConfig;
+use crate::config_file::{self, Env, RuntimeFileConfig};
 use crate::error::{Result, ServerError};
 
 /// Room the sizing rules leave for the one import that may be in flight.
@@ -365,19 +365,7 @@ impl ProjectRuntimeConfig {
     /// [`ServerError::Internal`] when an env var is malformed, or a resolved
     /// value (from env or file) is zero where zero is unsafe.
     pub fn from_env_with_file(file: &RuntimeFileConfig, max_workers: usize) -> Result<Self> {
-        parse_runtime_config(
-            RuntimeEnv {
-                lean_max_memory_kib: runtime_env_var("LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB")?,
-                request_timeout_millis: runtime_env_var("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS")?,
-                project_mailbox_capacity: runtime_env_var("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY")?,
-                worker_restart_limit: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_LIMIT")?,
-                worker_restart_window_secs: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS")?,
-                worker_import_residue_budget_mib: runtime_env_var("LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB")?,
-                worker_session_pool_capacity: runtime_env_var("LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY")?,
-            },
-            file,
-            max_workers,
-        )
+        parse_runtime_config(&config_file::process_env, file, max_workers)
     }
 
     /// Unreclaimable import residue one worker child may retain before the
@@ -454,105 +442,61 @@ impl ProjectRuntimeConfig {
     }
 }
 
-#[derive(Debug, Default)]
-struct RuntimeEnv {
-    lean_max_memory_kib: Option<String>,
-    request_timeout_millis: Option<String>,
-    project_mailbox_capacity: Option<String>,
-    worker_restart_limit: Option<String>,
-    worker_restart_window_secs: Option<String>,
-    worker_import_residue_budget_mib: Option<String>,
-    worker_session_pool_capacity: Option<String>,
-}
-
-fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig, max_workers: usize) -> Result<ProjectRuntimeConfig> {
+/// [`ProjectRuntimeConfig::from_env_with_file`] with the env lookup passed in.
+fn parse_runtime_config(env: Env<'_>, file: &RuntimeFileConfig, max_workers: usize) -> Result<ProjectRuntimeConfig> {
     let defaults = ProjectRuntimeConfig::default_for_workers(max_workers);
+    let positive = |name: &str, file, default| {
+        config_file::positive_setting::<u64>(env, name, file, default).map_err(ServerError::Internal)
+    };
+    let positive_count = |name: &str, file, default| {
+        config_file::positive_setting::<usize>(env, name, file, default).map_err(ServerError::Internal)
+    };
     // Resolved before the heap ceiling, which defaults to a function of it:
     // an operator who raises the budget must get a ceiling that still sits
     // above it, or they have rebuilt the inversion `lean_max_memory_kib_for`
     // exists to prevent.
     // Configured in MiB because the value is gigabytes: a byte count here
     // would be a wall of zeros to get wrong.
-    let import_residue_budget_bytes = parse_nonzero_u64(
+    let import_residue_budget_bytes = positive(
         "LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB",
-        env.worker_import_residue_budget_mib.as_deref(),
         file.worker_import_residue_budget_mib,
         defaults.import_residue_budget_bytes / (1024 * 1024),
     )?
     .saturating_mul(1024 * 1024);
     let config = ProjectRuntimeConfig {
-        lean_max_memory_kib: parse_nonzero_u64(
+        lean_max_memory_kib: positive(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
-            env.lean_max_memory_kib.as_deref(),
             file.lean_max_memory_kib,
             lean_max_memory_kib_for(import_residue_budget_bytes),
         )?,
         import_residue_budget_bytes,
-        request_timeout_millis: parse_nonzero_u64(
+        request_timeout_millis: positive(
             "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
-            env.request_timeout_millis.as_deref(),
             file.request_timeout_millis,
             defaults.request_timeout_millis,
         )?,
-        mailbox_capacity: parse_nonzero_usize(
+        mailbox_capacity: positive_count(
             "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
-            env.project_mailbox_capacity.as_deref(),
             file.project_mailbox_capacity,
             defaults.mailbox_capacity,
         )?,
-        max_restarts_per_window: parse_nonzero_usize(
+        max_restarts_per_window: positive_count(
             "LEAN_HOST_MCP_WORKER_RESTART_LIMIT",
-            env.worker_restart_limit.as_deref(),
             file.worker_restart_limit,
             defaults.max_restarts_per_window,
         )?,
-        restart_window: Duration::from_secs(parse_nonzero_u64(
+        restart_window: Duration::from_secs(positive(
             "LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS",
-            env.worker_restart_window_secs.as_deref(),
             file.worker_restart_window_secs,
             defaults.restart_window.as_secs(),
         )?),
-        session_pool_capacity: parse_nonzero_usize(
+        session_pool_capacity: positive_count(
             "LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY",
-            env.worker_session_pool_capacity.as_deref(),
             file.worker_session_pool_capacity,
             defaults.session_pool_capacity,
         )?,
     };
     Ok(config)
-}
-
-fn runtime_env_var(name: &str) -> Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(err @ std::env::VarError::NotUnicode(_)) => {
-            Err(ServerError::Internal(format!("{name} is not valid unicode: {err}")))
-        }
-    }
-}
-
-/// Resolve a knob through `env > file > default` and reject a zero result
-/// whatever its source. `env` is the raw env-var string (parsed here); `file`
-/// is the already-typed config-file value; `default` is the built-in constant.
-fn parse_nonzero_u64(name: &str, env: Option<&str>, file: Option<u64>, default: u64) -> Result<u64> {
-    let value = match env {
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|e| ServerError::Internal(format!("{name}={raw:?} not a u64: {e}")))?,
-        None => file.unwrap_or(default),
-    };
-    if value == 0 {
-        return Err(ServerError::Internal(format!(
-            "{name} resolved to 0, which is not allowed"
-        )));
-    }
-    Ok(value)
-}
-
-fn parse_nonzero_usize(name: &str, env: Option<&str>, file: Option<usize>, default: usize) -> Result<usize> {
-    let parsed = parse_nonzero_u64(name, env, file.map(|v| v as u64), default as u64)?;
-    usize::try_from(parsed).map_err(|_| ServerError::Internal(format!("{name}={parsed} does not fit in usize")))
 }
 
 #[cfg(test)]
@@ -564,6 +508,11 @@ fn parse_nonzero_usize(name: &str, env: Option<&str>, file: Option<usize>, defau
 )]
 mod tests {
     use super::*;
+
+    /// An env lookup that sets each `(name, value)` of `vars`.
+    fn vars(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| vars.iter().find(|(key, _)| *key == name).map(|(_, value)| value.into())
+    }
 
     #[test]
     fn budget_sizing_estimate_is_debug_only_and_logged_once_at_startup() {
@@ -607,15 +556,15 @@ mod tests {
     fn runtime_config_parses_runtime_policy_without_env_reads() {
         // Distinct values so a field routed to the wrong knob is visible.
         let config = parse_runtime_config(
-            RuntimeEnv {
-                lean_max_memory_kib: Some("5".to_owned()),
-                request_timeout_millis: Some("37".to_owned()),
-                project_mailbox_capacity: Some("23".to_owned()),
-                worker_restart_limit: Some("29".to_owned()),
-                worker_restart_window_secs: Some("31".to_owned()),
-                worker_import_residue_budget_mib: Some("41".to_owned()),
-                worker_session_pool_capacity: Some("43".to_owned()),
-            },
+            &vars(&[
+                ("LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB", "5"),
+                ("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS", "37"),
+                ("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY", "23"),
+                ("LEAN_HOST_MCP_WORKER_RESTART_LIMIT", "29"),
+                ("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS", "31"),
+                ("LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB", "41"),
+                ("LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY", "43"),
+            ]),
             &RuntimeFileConfig::default(),
             crate::broker::DEFAULT_MAX_WORKERS,
         )
@@ -656,10 +605,7 @@ mod tests {
     fn pool_capacity_and_the_residue_budget_are_independent_knobs() {
         // The bug this replaced: one constant serving as both the restart bound
         // and the pool capacity made the child's eviction path unreachable.
-        let env = RuntimeEnv {
-            worker_session_pool_capacity: Some("2".to_owned()),
-            ..RuntimeEnv::default()
-        };
+        let env = &vars(&[("LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY", "2")]);
         let config =
             parse_runtime_config(env, &RuntimeFileConfig::default(), crate::broker::DEFAULT_MAX_WORKERS).unwrap();
         assert_eq!(config.session_pool_capacity(), 2);
@@ -676,13 +622,10 @@ mod tests {
             worker_import_residue_budget_mib: Some(4_096),
             ..RuntimeFileConfig::default()
         };
-        let config = parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
+        let config = parse_runtime_config(&|_| None, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
         assert_eq!(config.import_residue_budget_bytes(), 4_096 * 1024 * 1024);
 
-        let env = RuntimeEnv {
-            worker_import_residue_budget_mib: Some("2048".to_owned()),
-            ..RuntimeEnv::default()
-        };
+        let env = &vars(&[("LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB", "2048")]);
         let config = parse_runtime_config(env, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
         assert_eq!(config.import_residue_budget_bytes(), 2_048 * 1024 * 1024);
     }
@@ -694,18 +637,19 @@ mod tests {
             ..RuntimeFileConfig::default()
         };
         // Env unset -> file value is used.
-        let config = parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
+        let config = parse_runtime_config(&|_| None, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
         assert_eq!(config.request_timeout_millis(), 45_000);
         // Env set -> env wins over the file.
-        let env = RuntimeEnv {
-            request_timeout_millis: Some("90000".to_owned()),
-            ..RuntimeEnv::default()
-        };
+        let env = &vars(&[("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS", "90000")]);
         let config = parse_runtime_config(env, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
         assert_eq!(config.request_timeout_millis(), 90_000);
+        // Env empty -> unset, so the file value is used.
+        let env = &vars(&[("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS", "")]);
+        let config = parse_runtime_config(env, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
+        assert_eq!(config.request_timeout_millis(), 45_000);
         // Neither -> built-in default (120 s).
         let config = parse_runtime_config(
-            RuntimeEnv::default(),
+            &|_| None,
             &RuntimeFileConfig::default(),
             crate::broker::DEFAULT_MAX_WORKERS,
         )
@@ -715,13 +659,10 @@ mod tests {
 
     #[test]
     fn request_timeout_zero_is_rejected() {
-        // A zero deadline would time every call out instantly; parse_nonzero_u64
+        // A zero deadline would time every call out instantly, so the resolver
         // must reject it.
         let err = parse_runtime_config(
-            RuntimeEnv {
-                request_timeout_millis: Some("0".to_owned()),
-                ..RuntimeEnv::default()
-            },
+            &vars(&[("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS", "0")]),
             &RuntimeFileConfig::default(),
             crate::broker::DEFAULT_MAX_WORKERS,
         )
@@ -742,18 +683,15 @@ mod tests {
             ..RuntimeFileConfig::default()
         };
         // Env unset -> file value is used.
-        let config = parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
+        let config = parse_runtime_config(&|_| None, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
         assert_eq!(config.lean_max_memory_kib(), 8_388_608);
         // Env set -> env wins over the file.
-        let env = RuntimeEnv {
-            lean_max_memory_kib: Some("6291456".to_owned()),
-            ..RuntimeEnv::default()
-        };
+        let env = &vars(&[("LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB", "6291456")]);
         let config = parse_runtime_config(env, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
         assert_eq!(config.lean_max_memory_kib(), 6_291_456);
         // Neither -> built-in default.
         let config = parse_runtime_config(
-            RuntimeEnv::default(),
+            &|_| None,
             &RuntimeFileConfig::default(),
             crate::broker::DEFAULT_MAX_WORKERS,
         )
@@ -778,8 +716,7 @@ mod tests {
                 worker_import_residue_budget_mib: Some(budget_mib),
                 ..RuntimeFileConfig::default()
             };
-            let config =
-                parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
+            let config = parse_runtime_config(&|_| None, &file, crate::broker::DEFAULT_MAX_WORKERS).unwrap();
             assert_eq!(config.import_residue_budget_bytes(), budget_mib * 1024 * 1024);
             assert!(
                 config.lean_max_memory_kib().saturating_mul(1024) > config.import_residue_budget_bytes(),
@@ -873,8 +810,8 @@ mod tests {
             ProjectRuntimeConfig::default_for_workers(1).import_residue_budget_bytes(),
             import_residue_budget_for(ram, 1)
         );
-        let one = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default(), 1).unwrap();
-        let four = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default(), 4).unwrap();
+        let one = parse_runtime_config(&|_| None, &RuntimeFileConfig::default(), 1).unwrap();
+        let four = parse_runtime_config(&|_| None, &RuntimeFileConfig::default(), 4).unwrap();
         assert!(one.import_residue_budget_bytes() >= four.import_residue_budget_bytes());
         assert!(one.lean_max_memory_kib() >= four.lean_max_memory_kib());
     }
@@ -888,7 +825,7 @@ mod tests {
             lean_max_memory_kib: Some(0),
             ..RuntimeFileConfig::default()
         };
-        let err = parse_runtime_config(RuntimeEnv::default(), &zero, crate::broker::DEFAULT_MAX_WORKERS).unwrap_err();
+        let err = parse_runtime_config(&|_| None, &zero, crate::broker::DEFAULT_MAX_WORKERS).unwrap_err();
         let ServerError::Internal(message) = err else {
             panic!("expected Internal config error");
         };

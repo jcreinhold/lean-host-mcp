@@ -990,7 +990,7 @@ struct ActorConfig {
 /// with the command that fixes it.
 pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf, Vec<String>)> {
     let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
-    let dir = crate::toolchain::workers_dir(&meta.canonical_root, None);
+    let dir = crate::toolchain::workers_dir(&meta.canonical_root, None).map_err(ServerError::BadProject)?;
     let fix = crate::toolchain::install_fix(&meta.canonical_root);
     let worker = format!("worker for leanprover/lean4:{toolchain_id} in {}", dir.display());
     let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready(&toolchain_id, &dir, &fix) {

@@ -19,7 +19,6 @@
 //! `<root>/.local/lean-host-mcp/config.toml`, the ignored local config file. It
 //! never writes a tracked file.
 
-use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -29,7 +28,7 @@ use anyhow::Context as _;
 use clap::Args;
 
 use super::install_worker::{self, Freshness};
-use crate::config_file;
+use crate::config_file::{self, Env};
 use crate::store;
 use crate::toolchain::{self, ToolchainId, shell_word};
 
@@ -80,14 +79,9 @@ struct Plan {
 }
 
 impl Plan {
-    /// Resolve the plan for `args`, with the worker and store env vars'
-    /// values and elan's home passed in.
-    fn resolve(
-        args: &InstallArgs,
-        workers_env: Option<OsString>,
-        store_env: Option<OsString>,
-        elan_home: Option<PathBuf>,
-    ) -> anyhow::Result<Self> {
+    /// Resolve the plan for `args`, with the env lookup and elan's home
+    /// passed in.
+    fn resolve(args: &InstallArgs, env: Env<'_>, elan_home: Option<PathBuf>) -> anyhow::Result<Self> {
         let root = args
             .lake_root
             .canonicalize()
@@ -99,8 +93,9 @@ impl Plan {
         };
         // `--dir` is a CLI flag and beats the env vars and the config files.
         let flag = |name: &str| args.dir.as_ref().map(|_| dir.join(name));
-        let workers_dir = toolchain::workers_dir_with(&root, flag("workers").as_deref(), workers_env);
-        let store_dir = store::store_dir_with(&root, flag("store").as_deref(), store_env);
+        let workers_dir =
+            toolchain::workers_dir_with(&root, flag("workers").as_deref(), env).map_err(anyhow::Error::msg)?;
+        let store_dir = store::store_dir_with(&root, flag("store").as_deref(), env).map_err(anyhow::Error::msg)?;
         Ok(Self {
             bin: dir.join("bin"),
             workers_dir: std::path::absolute(workers_dir)?,
@@ -126,12 +121,7 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("cannot find this executable")?;
     // Nothing recorded the elan home in this process, so this is `ELAN_HOME`,
     // else `$HOME/.elan`: the elan of the shell that runs install.
-    let plan = Plan::resolve(
-        args,
-        std::env::var_os(toolchain::WORKERS_DIR_ENV),
-        std::env::var_os(store::STORE_DIR_ENV),
-        toolchain::elan_home(),
-    )?;
+    let plan = Plan::resolve(args, &config_file::process_env, toolchain::elan_home())?;
     // Install writes what a server reads, so it holds the store as a server
     // does: it refuses while one serves, and waits for the processes a dead
     // one started.
@@ -312,7 +302,7 @@ mod tests {
 
     /// Install with a fake worker build that records its inputs.
     fn run_install(args: &InstallArgs, exe: &Path) -> anyhow::Result<(Plan, Vec<(PathBuf, String)>)> {
-        let plan = Plan::resolve(args, None, None, Some(PathBuf::from(ELAN_HOME)))?;
+        let plan = Plan::resolve(args, &|_| None, Some(PathBuf::from(ELAN_HOME)))?;
         let mut builds = Vec::new();
         install(&plan, args, exe, |workers, id| {
             builds.push((workers.to_path_buf(), id.to_string()));
@@ -342,7 +332,7 @@ mod tests {
         assert_eq!(builds, [(local.join("workers"), "v4.36.0".to_owned())]);
         let text = fs::read_to_string(config_file::local_file(root))?;
         assert!(text.starts_with(LOCAL_FILE_HEADER), "{text}");
-        let config = ConfigFile::load(Some(root));
+        let config = ConfigFile::load(Some(root)).map_err(anyhow::Error::msg)?;
         let install = &config.install;
         assert_eq!(
             install.binary.as_deref(),
@@ -391,14 +381,16 @@ mod tests {
         assert_eq!(plan.binary(), dir.join("bin/lean-host-mcp"));
         assert_eq!(builds.len(), 1);
         assert_eq!(builds.first().map(|build| build.0.clone()), Some(dir.join("workers")));
-        let install = ConfigFile::load(Some(&fixture.root)).install;
+        let install = ConfigFile::load(Some(&fixture.root))
+            .map_err(anyhow::Error::msg)?
+            .install;
         assert_eq!(install.workers_dir(&fixture.root), Some(dir.join("workers")));
         assert_eq!(install.store_dir(&fixture.root), Some(dir.join("store")));
         assert!(config_file::local_file(&fixture.root).is_file());
 
         // Without `--dir`, a reinstall uses the recorded worker and store paths,
         // as the server does.
-        let again = Plan::resolve(&args(&fixture, None), None, None, None)?;
+        let again = Plan::resolve(&args(&fixture, None), &|_| None, None)?;
         assert_eq!(again.workers_dir, dir.join("workers"));
         assert_eq!(again.store_dir, dir.join("store"));
         assert_eq!(again.bin, config_file::local_dir(&fixture.root).join("bin"));
@@ -413,7 +405,8 @@ mod tests {
         let Err(error) = run_install(&args(&fixture, None), &fixture.exe) else {
             anyhow::bail!("install rewrote a broken local file");
         };
-        assert!(error.to_string().contains("is not valid TOML"), "{error}");
+        let path = config_file::local_file(&fixture.root);
+        assert!(error.to_string().contains(&path.display().to_string()), "{error}");
         assert_eq!(
             fs::read_to_string(config_file::local_file(&fixture.root))?,
             "[runtime\n"

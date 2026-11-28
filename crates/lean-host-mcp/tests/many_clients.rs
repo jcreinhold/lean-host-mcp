@@ -252,7 +252,7 @@ async fn on_running_server(url: String) -> TestResult {
         return Err("name at least one file and one module".into());
     }
     // The sampler finds builds through the server's store: the default one.
-    let sampler = Sampler::start(&lean_host_mcp::store::store_dir(&work.root, None), 0);
+    let sampler = Sampler::start(&lean_host_mcp::store::store_dir(&work.root, None)?, 0);
     let control = Client::new(&work.url, "pool")?;
     let stop = Arc::new(AtomicBool::new(false));
     let watched = Arc::clone(&stop);

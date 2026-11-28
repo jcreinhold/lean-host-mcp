@@ -122,7 +122,7 @@ fn assert_clean(response: &SemanticResponse<Value>) -> TestResult {
 
 /// Wait until the log of a build in `root` holds `needle`.
 async fn wait_for_log(root: &Path, needle: &str) -> TestResult {
-    let logs = lean_host_mcp::store::store_dir(root, None).join("logs");
+    let logs = lean_host_mcp::store::store_dir(root, None)?.join("logs");
     let header = format!(" in {}]", root.display());
     let found = tokio::time::timeout(PATIENCE, async {
         loop {
