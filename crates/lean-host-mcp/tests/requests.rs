@@ -590,9 +590,9 @@ impl LeanRuns {
     }
 }
 
-/// Check each of [`SLOW_FILES`] as a named request on `server`, both at
-/// once, while a thread lists the processes every 20 ms. Returns each row's
-/// start and end and what the thread saw.
+/// Check each of [`SLOW_FILES`] as a named request on `server`, each from its
+/// own client and both at once, while a thread lists the processes every
+/// 20 ms. Returns each row's start and end and what the thread saw.
 async fn checks_at_once(server: &Server) -> TestResult<(Vec<(i64, i64)>, LeanRuns)> {
     let stop = Arc::new(AtomicBool::new(false));
     let since = Instant::now();
@@ -621,15 +621,18 @@ async fn checks_at_once(server: &Server) -> TestResult<(Vec<(i64, i64)>, LeanRun
             runs
         }
     });
-    let client = Client::new(&server.url, "checks")?;
+    let clients = [
+        Client::new(&server.url, "checks-one")?,
+        Client::new(&server.url, "checks-two")?,
+    ];
     let ids = ["lean-runs-one-0001", "lean-runs-two-0001"];
-    for (id, file) in ids.into_iter().zip(SLOW_FILES) {
+    for ((client, id), file) in clients.iter().zip(ids).zip(SLOW_FILES) {
         client
             .run(id, "lean_status", &json!({"kind": "file_diagnostics", "file": file}))
             .await?;
     }
     let mut spans = Vec::new();
-    for id in ids {
+    for (client, id) in clients.iter().zip(ids) {
         let reply = client.ended(id, PATIENCE).await?;
         assert_eq!(http::state(&reply), Some("done"), "{reply}");
         assert_eq!(reply.pointer("/result/isError"), Some(&json!(false)), "{reply}");
@@ -651,9 +654,10 @@ fn slow_chain() -> TestResult<Chain> {
     Ok(chain)
 }
 
-/// Two file checks on one project, sent at once, run Lean at once under the
-/// default `broker.max_lean_runs` of 2: each Lean process holds Lean for two
-/// seconds, and the samples see both run together for more than one second.
+/// Two file checks on one project, sent at once from two clients, run Lean at
+/// once under the default `broker.max_lean_runs` of 2: each Lean process holds
+/// Lean for two seconds, and the samples see both run together for more than
+/// one second.
 /// File checks need an installed worker's shim deployment.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
